@@ -5,7 +5,7 @@ Scalable PyTorch data loaders for OME-NGFF zarr datasets, powered by TensorStore
 ## Installation
 
 ```bash
-pip install -e .
+pip install miao-io
 ```
 
 ## Usage
