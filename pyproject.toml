@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "miao"
+name = "miao-io"
 version = "0.1.0"
 description = "Scalable PyTorch data loaders for OME-NGFF zarr datasets"
 requires-python = ">=3.10"
