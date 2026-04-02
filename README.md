@@ -59,6 +59,7 @@ loader = DataLoader(
 for batch in loader:
     img = batch["img"]        # (B, L, X, Y, Z)
     label = batch["label"]    # (B, L, X, Y, Z) or None
+    bbox = batch["bbox"]      # (B, L, 2, ndim) # bbox per level in physical coordinates
     meta = batch["meta"]      # dict with volume name, coordinate, scale levels
 ```
 
