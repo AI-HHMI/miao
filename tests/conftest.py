@@ -151,7 +151,8 @@ def sample_config(zarr2_volume: Path) -> dict:
                 "label_key": "labels/seg",
             }
         ],
-        "output_axes": "zyx",
+        "n_scales": 3,
+        "output_axes": "lzyx",
         "patch_size": [8, 8, 8],
         "samples_per_epoch": 10,
     }

@@ -22,13 +22,13 @@ class TestVolumeDataset:
         assert "label" in sample
         assert "meta" in sample
 
-        # img shape: (1, L, Z, Y, X) = (1, 3, 8, 8, 8)
-        assert sample["img"].shape == (1, 3, 8, 8, 8)
+        # output_axes="lzyx" → img shape: (1, L, Z, Y, X) = (1, 3, 8, 8, 8)
+        assert sample["img"].shape == (3, 8, 8, 8)
         assert sample["img"].dtype == torch.float32
 
         # label shape: same as img
         assert sample["label"] is not None
-        assert sample["label"].shape == (1, 3, 8, 8, 8)
+        assert sample["label"].shape == (3, 8, 8, 8)
 
     def test_no_labels(self, zarr2_volume: Path):
         cfg = MiaoConfig(
@@ -40,14 +40,15 @@ class TestVolumeDataset:
                     "scales": [0, 1],
                 }
             ],
-            output_axes="zyx",
+            n_scales=2,
+            output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
         )
         ds = VolumeDataset(cfg)
         sample = ds[0]
 
-        assert sample["img"].shape == (1, 2, 8, 8, 8)
+        assert sample["img"].shape == (2, 8, 8, 8)
         assert sample["label"] is None
 
     def test_axis_reorientation(self, zarr2_volume: Path):
@@ -61,15 +62,38 @@ class TestVolumeDataset:
                     "scales": [0],
                 }
             ],
-            output_axes="xyz",
+            n_scales=1,
+            output_axes="lxyz",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
         )
         ds = VolumeDataset(cfg)
         sample = ds[0]
 
-        # Shape should follow output_axes: (1, L, X, Y, Z)
-        assert sample["img"].shape == (1, 1, 8, 8, 8)
+        # output_axes="lxyz" → (1, L, X, Y, Z)
+        assert sample["img"].shape == (1, 8, 8, 8)
+
+    def test_level_dim_placement(self, zarr2_volume: Path):
+        """Test that 'l' can be placed at different positions."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0, 1],
+                }
+            ],
+            n_scales=2,
+            output_axes="xyzl",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+
+        # output_axes="xyzl" → (1, X, Y, Z, L) = (1, 8, 8, 8, 2)
+        assert sample["img"].shape == (8, 8, 8, 2)
 
     def test_meta_contents(self, sample_config: dict):
         cfg = MiaoConfig(**sample_config)
@@ -103,7 +127,8 @@ class TestVolumeDataset:
                     "weight": 0.01,
                 },
             ],
-            output_axes="zyx",
+            n_scales=1,
+            output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=100,
         )
@@ -127,10 +152,45 @@ class TestVolumeDataset:
                     "scales": [0],
                 }
             ],
-            output_axes="zyx",
+            n_scales=1,
+            output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
         )
         ds = VolumeDataset(cfg)
         sample = ds[0]
-        assert sample["img"].shape == (1, 1, 8, 8, 8)
+        assert sample["img"].shape == (1, 8, 8, 8)
+
+    def test_scales_length_mismatch(self, zarr2_volume: Path):
+        """Test that mismatched n_scales raises an error."""
+        with pytest.raises(ValueError, match="2 scales.*n_scales=3"):
+            MiaoConfig(
+                volumes=[
+                    {
+                        "name": "test",
+                        "path": str(zarr2_volume),
+                        "image_key": "raw",
+                        "scales": [0, 1],
+                    }
+                ],
+                n_scales=3,
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_missing_l_in_output_axes(self, zarr2_volume: Path):
+        """Test that output_axes without 'l' raises an error."""
+        with pytest.raises(ValueError, match="must contain 'l'"):
+            MiaoConfig(
+                volumes=[
+                    {
+                        "name": "test",
+                        "path": str(zarr2_volume),
+                        "image_key": "raw",
+                        "scales": [0],
+                    }
+                ],
+                n_scales=1,
+                output_axes="zyx",
+                patch_size=[8, 8, 8],
+            )

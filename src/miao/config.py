@@ -34,6 +34,7 @@ class MiaoConfig(BaseModel):
     """Top-level configuration for miaio dataset."""
 
     volumes: list[VolumeConfig]
+    n_scales: int
     output_axes: str
     patch_size: list[int]
     samples_per_epoch: int = 1000
@@ -42,13 +43,17 @@ class MiaoConfig(BaseModel):
     @field_validator("output_axes")
     @classmethod
     def validate_output_axes(cls, v: str) -> str:
-        valid_chars = set("txyzc")
+        valid_chars = set("ltxyzc")
         if not set(v).issubset(valid_chars):
             raise ValueError(
-                f"output_axes must only contain characters from {{t, x, y, z, c}}, got {v!r}"
+                f"output_axes must only contain characters from {{l, t, x, y, z, c}}, got {v!r}"
             )
         if len(v) != len(set(v)):
             raise ValueError(f"output_axes must not contain duplicates, got {v!r}")
+        if "l" not in v:
+            raise ValueError(
+                f"output_axes must contain 'l' (scale level dimension), got {v!r}"
+            )
         return v
 
     @model_validator(mode="after")
@@ -61,6 +66,16 @@ class MiaoConfig(BaseModel):
                 f"patch_size has {len(self.patch_size)} elements but "
                 f"output_axes {self.output_axes!r} has {n_spatial} spatial dimensions"
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_scales_length(self) -> "MiaoConfig":
+        for vol in self.volumes:
+            if len(vol.scales) != self.n_scales:
+                raise ValueError(
+                    f"Volume {vol.name!r} has {len(vol.scales)} scales "
+                    f"but n_scales={self.n_scales}"
+                )
         return self
 
     @model_validator(mode="after")
