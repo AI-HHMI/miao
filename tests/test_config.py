@@ -12,31 +12,10 @@ class TestVolumeConfig:
             name="raw",
             path="/data/test.zarr",
             image_key="raw",
-            axes="zyx",
             scales=[0, 1],
         )
         assert v.weight == 1.0
         assert v.label_key is None
-
-    def test_invalid_axes_chars(self):
-        with pytest.raises(ValueError, match="characters from"):
-            VolumeConfig(
-                name="raw",
-                path="/data/test.zarr",
-                image_key="raw",
-                axes="abc",
-                scales=[0],
-            )
-
-    def test_duplicate_axes(self):
-        with pytest.raises(ValueError, match="duplicate"):
-            VolumeConfig(
-                name="raw",
-                path="/data/test.zarr",
-                image_key="raw",
-                axes="zzy",
-                scales=[0],
-            )
 
     def test_negative_weight(self):
         with pytest.raises(ValueError, match="positive"):
@@ -44,7 +23,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                axes="zyx",
                 scales=[0],
                 weight=-1.0,
             )
@@ -55,11 +33,6 @@ class TestMiaoConfig:
         cfg = MiaoConfig(**sample_config)
         assert len(cfg.volumes) == 1
         assert cfg.samples_per_epoch == 10
-
-    def test_axes_mismatch(self, sample_config: dict):
-        sample_config["volumes"][0]["axes"] = "xy"
-        with pytest.raises(ValueError, match="permutation"):
-            MiaoConfig(**sample_config)
 
     def test_patch_size_dim_mismatch(self, sample_config: dict):
         sample_config["patch_size"] = [8, 8]

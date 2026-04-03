@@ -147,7 +147,6 @@ def sample_config(zarr2_volume: Path) -> dict:
                 "name": "test_raw",
                 "path": str(zarr2_volume),
                 "image_key": "raw",
-                "axes": "zyx",
                 "scales": [0, 1, 2],
                 "label_key": "labels/seg",
             }

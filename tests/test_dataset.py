@@ -37,7 +37,6 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "axes": "zyx",
                     "scales": [0, 1],
                 }
             ],
@@ -59,7 +58,6 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "axes": "zyx",
                     "scales": [0],
                 }
             ],
@@ -94,7 +92,6 @@ class TestVolumeDataset:
                     "name": "vol_a",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "axes": "zyx",
                     "scales": [0],
                     "weight": 0.99,
                 },
@@ -102,7 +99,6 @@ class TestVolumeDataset:
                     "name": "vol_b",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "axes": "zyx",
                     "scales": [0],
                     "weight": 0.01,
                 },
@@ -128,7 +124,6 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "axes": "zyx",
                     "scales": [0],
                 }
             ],
