@@ -4,6 +4,21 @@ from __future__ import annotations
 
 import numpy as np
 
+SPATIAL_CHARS = set("xyzt")
+
+
+def spatial_axes(axes: str) -> str:
+    """Return only the spatial axis characters, preserving order.
+
+    Example: "zyxc" -> "zyx", "czyx" -> "zyx", "xyz" -> "xyz"
+    """
+    return "".join(c for c in axes if c in SPATIAL_CHARS)
+
+
+def spatial_indices(axes: str) -> list[int]:
+    """Return indices of spatial dimensions in the axes string."""
+    return [i for i, c in enumerate(axes) if c in SPATIAL_CHARS]
+
 
 def compute_permutation(input_axes: str, output_axes: str) -> tuple[int, ...]:
     """Return the permutation tuple to reorder dimensions from input to output order.

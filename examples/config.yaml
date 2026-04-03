@@ -2,7 +2,6 @@ volumes:
   - name: "Jiefu Cerebellum FIB-SEM"
     path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem.zarr"
     image_key: "raw"
-    axes: "zyx"
     zarr_version: "zarr2"
     scales: [0, 1, 2]
     label_key: "labels/agglom_seg"
@@ -13,7 +12,6 @@ volumes:
   - name: "H01 Human Cortex"
     path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
     image_key: "raw"
-    axes: "xyz"
     zarr_version: "zarr3"
     scales: [0, 1, 2]
     weight: 0.5

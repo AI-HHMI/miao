@@ -15,25 +15,12 @@ class VolumeConfig(BaseModel):
     name: str
     path: str
     image_key: str
-    axes: str
     scales: list[int]
     zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
     label_key: Optional[str] = None
     weight: float = 1.0
     normalize: bool = True  # auto-normalize images to [0, 1] based on source dtype
     bounding_box: Optional[list[list[int]]] = None  # [[min_0, max_0], [min_1, max_1], ...] in finest-scale voxels, storage axis order
-
-    @field_validator("axes")
-    @classmethod
-    def validate_axes(cls, v: str) -> str:
-        valid_chars = set("txyzc")
-        if not set(v).issubset(valid_chars):
-            raise ValueError(
-                f"axes must only contain characters from {{t, x, y, z, c}}, got {v!r}"
-            )
-        if len(v) != len(set(v)):
-            raise ValueError(f"axes must not contain duplicates, got {v!r}")
-        return v
 
     @field_validator("weight")
     @classmethod
@@ -65,21 +52,14 @@ class MiaoConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def validate_axes_compatibility(self) -> "MiaoConfig":
-        for vol in self.volumes:
-            if set(vol.axes) != set(self.output_axes):
-                raise ValueError(
-                    f"Volume {vol.name!r} axes {vol.axes!r} must be a "
-                    f"permutation of output_axes {self.output_axes!r}"
-                )
-        return self
-
-    @model_validator(mode="after")
     def validate_patch_size_dims(self) -> "MiaoConfig":
-        if len(self.patch_size) != len(self.output_axes):
+        from miao.axes import spatial_axes
+
+        n_spatial = len(spatial_axes(self.output_axes))
+        if len(self.patch_size) != n_spatial:
             raise ValueError(
                 f"patch_size has {len(self.patch_size)} elements but "
-                f"output_axes {self.output_axes!r} has {len(self.output_axes)} dimensions"
+                f"output_axes {self.output_axes!r} has {n_spatial} spatial dimensions"
             )
         return self
 
