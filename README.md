@@ -88,8 +88,9 @@ Each sample:
 | `volumes[].weight` | Sampling probability weight (default: equal across volumes) |
 | `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`) |
 | `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis to restrict sampling (finest-scale voxels, storage axis order) |
-| `output_axes` | Spatial axis order of output tensors (e.g. `"xyz"`) |
+| `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
 | `patch_size` | Voxel count per crop, in `output_axes` spatial order |
+| `bbox_mode` | `"absolute"` (world coords) or `"relative"` (relative to finest-level crop origin). Default: `"absolute"` |
 | `samples_per_epoch` | Number of samples per epoch |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
 

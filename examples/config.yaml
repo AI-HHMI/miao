@@ -21,5 +21,6 @@ volumes:
 n_scales: 3
 output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
 patch_size: [128, 128, 32]
+bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
 samples_per_epoch: 1000
 cache_bytes: 1073741824

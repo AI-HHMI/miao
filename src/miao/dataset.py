@@ -38,6 +38,8 @@ class VolumeInfo:
     lbl_spatial_idx: list[int] | None
     # Source image dtype (for normalization)
     image_dtype: np.dtype
+    # Finest-scale absolute spatial voxel size (physical units, e.g., nanometers)
+    finest_voxel_size: np.ndarray
     # Per-scale: spatial-only scale factors relative to image finest scale
     relative_scale_factors: dict[int, np.ndarray]
     # Per-scale: label spatial-only scale factors relative to image finest scale
@@ -225,6 +227,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             img_spatial_idx=img_sp_idx,
             lbl_spatial_idx=lbl_sp_idx,
             image_dtype=image_meta.scales[finest_scale].dtype,
+            finest_voxel_size=finest_spatial_factors,
             relative_scale_factors=relative_scale_factors,
             label_relative_scale_factors=label_relative_scale_factors,
             min_center=min_center,
@@ -348,11 +351,14 @@ class VolumeDataset(torch.utils.data.Dataset):
             center_at_level = np.floor(center / rel_factors).astype(np.int64)
             origin = center_at_level - half_patch
 
-            # Compute world-coordinate bbox (spatial only, in output spatial order)
-            world_min = (origin * rel_factors).astype(np.float64)
-            world_max = ((origin + read_shape) * rel_factors).astype(np.float64)
+            # Compute physical-coordinate bbox (spatial only, in output spatial order)
+            # origin and read_shape are in finest-voxel space after * rel_factors
+            # Multiply by finest voxel size to get physical units (e.g., nanometers)
+            voxel_size = vol_info.finest_voxel_size
+            phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
+            phys_max = ((origin + read_shape) * rel_factors * voxel_size).astype(np.float64)
             bbox = np.stack(
-                [world_min[list(spatial_perm)], world_max[list(spatial_perm)]]
+                [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
             )
             bboxes.append(bbox)
 
@@ -389,8 +395,13 @@ class VolumeDataset(torch.utils.data.Dataset):
             if label_crops else None
         )
 
-        # Stack bboxes: (L, 2, Nd_spatial) in output spatial order
-        bbox_tensor = torch.from_numpy(np.stack(bboxes)).float()
+        # Stack bboxes: (L, 2, Nd_spatial) in output spatial order, physical units
+        bbox_arr = np.stack(bboxes)
+        if self.config.bbox_mode == "relative":
+            # Make relative to the center of the finest-level crop
+            finest_center = (bbox_arr[0, 0] + bbox_arr[0, 1]) / 2.0
+            bbox_arr = bbox_arr - finest_center
+        bbox_tensor = torch.from_numpy(bbox_arr).float()
 
         return {
             "img": img_tensor,
