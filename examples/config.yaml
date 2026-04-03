@@ -18,7 +18,8 @@ volumes:
     label_key: "labels/c3_seg"
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
 
-output_axes: "xyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
+n_scales: 3
+output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
 patch_size: [128, 128, 32]
 samples_per_epoch: 1000
 cache_bytes: 1073741824

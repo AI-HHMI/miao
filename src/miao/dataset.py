@@ -114,10 +114,8 @@ class VolumeDataset(torch.utils.data.Dataset):
             if vi.config.normalize:
                 lines.append(f"    normalize: {vi.image_dtype} -> [0, 1]")
             print("\n".join(lines))
-        output_spatial = spatial_axes(self.config.output_axes)
-        has_c = "c" in self.config.output_axes
-        shape_desc = f"(1, L, {', '.join(output_spatial.upper())}{''.join(', C' if has_c else '')})"
-        print(f"  output: axes={self.config.output_axes!r}, tensor_shape={shape_desc}")
+        dims = ", ".join(c.upper() for c in self.config.output_axes)
+        print(f"  output: axes={self.config.output_axes!r}, tensor_shape=({dims})")
 
     def _resolve_volume(self, vol_cfg: VolumeConfig) -> VolumeInfo:
         """Read OME-NGFF metadata and precompute sampling bounds for a volume."""
@@ -290,27 +288,6 @@ class VolumeDataset(torch.utils.data.Dataset):
                 slices.append(slice(None))  # channel dim: take all
         return tuple(slices)
 
-    def _reorient_img(self, patch: np.ndarray, vol_info: VolumeInfo) -> np.ndarray:
-        """Reorient image patch to output axes order.
-
-        If image has channel but output_axes doesn't, squeeze channel after read.
-        """
-        output_spatial = spatial_axes(self.config.output_axes)
-        has_img_channel = "c" in vol_info.img_axes
-        wants_channel = "c" in self.config.output_axes
-
-        if has_img_channel and not wants_channel:
-            # Squeeze channel dim, then reorient spatial only
-            c_idx = vol_info.img_axes.index("c")
-            patch = np.squeeze(patch, axis=c_idx)
-            return reorient(patch, vol_info.img_spatial_axes, output_spatial)
-        elif has_img_channel and wants_channel:
-            # Reorient full axes including channel
-            return reorient(patch, vol_info.img_axes, self.config.output_axes)
-        else:
-            # No channel anywhere, reorient spatial only
-            return reorient(patch, vol_info.img_spatial_axes, output_spatial)
-
     def __getitem__(self, idx: int) -> dict:
         stores = self._get_stores()
 
@@ -319,6 +296,36 @@ class VolumeDataset(torch.utils.data.Dataset):
         vol_info = self._volumes[vol_idx]
         vol_stores = stores[vol_info.config.name]
         output_spatial = spatial_axes(self.config.output_axes)
+        spatial_perm = compute_permutation(vol_info.img_spatial_axes, output_spatial)
+
+        # Determine image intermediate axes after stacking: "l" + img_axes
+        # Handle channel mismatch:
+        #   - img has c, output doesn't: squeeze c before stacking
+        #   - img lacks c, output has c: unsqueeze c after stacking
+        #   - both have or neither has c: direct permute
+        has_img_channel = "c" in vol_info.img_axes
+        wants_channel = "c" in self.config.output_axes
+        squeeze_channel = has_img_channel and not wants_channel
+        add_channel = not has_img_channel and wants_channel
+
+        if squeeze_channel:
+            img_intermediate = "l" + vol_info.img_spatial_axes
+        else:
+            img_intermediate = "l" + vol_info.img_axes
+
+        # If we need to add a channel dim, we'll unsqueeze after stacking
+        # and insert 'c' into the intermediate string at the end
+        if add_channel:
+            img_intermediate_for_perm = img_intermediate + "c"
+        else:
+            img_intermediate_for_perm = img_intermediate
+        img_perm = compute_permutation(img_intermediate_for_perm, self.config.output_axes)
+
+        # Label intermediate: "l" + lbl_axes, output = output_axes minus "c"
+        lbl_output_axes = self.config.output_axes.replace("c", "")
+        if vol_info.lbl_axes is not None:
+            lbl_intermediate = "l" + vol_info.lbl_axes
+            lbl_perm = compute_permutation(lbl_intermediate, lbl_output_axes)
 
         # Pick a random center coordinate at finest scale (spatial dims, image spatial order)
         center = np.array(
@@ -330,9 +337,8 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         read_shape = np.array(vol_info.read_shape)
         half_patch = read_shape // 2
-        spatial_perm = compute_permutation(vol_info.img_spatial_axes, output_spatial)
-        img_crops: list[torch.Tensor] = []
-        label_crops: list[torch.Tensor] = []
+        img_crops: list[np.ndarray] = []
+        label_crops: list[np.ndarray] = []
         bboxes: list[np.ndarray] = []
 
         for level in vol_info.config.scales:
@@ -342,7 +348,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             center_at_level = np.floor(center / rel_factors).astype(np.int64)
             origin = center_at_level - half_patch
 
-            # Compute world-coordinate bbox (spatial only, in output order)
+            # Compute world-coordinate bbox (spatial only, in output spatial order)
             world_min = (origin * rel_factors).astype(np.float64)
             world_max = ((origin + read_shape) * rel_factors).astype(np.float64)
             bbox = np.stack(
@@ -352,9 +358,12 @@ class VolumeDataset(torch.utils.data.Dataset):
 
             # Read image crop (spatial dims get crop, channel gets slice(None))
             img_slices = self._build_img_slices(origin, read_shape, vol_info)
-            patch = vol_stores["img"][level][img_slices].read().result()
-            patch = self._reorient_img(np.asarray(patch), vol_info)
-            img_crops.append(torch.from_numpy(patch.copy()))
+            patch = np.asarray(vol_stores["img"][level][img_slices].read().result())
+            # Squeeze channel if output doesn't want it
+            if has_img_channel and not wants_channel:
+                c_idx = vol_info.img_axes.index("c")
+                patch = np.squeeze(patch, axis=c_idx)
+            img_crops.append(patch.copy())
 
             # Read label crop (labels are spatial-only)
             if vol_info.config.label_key and level in vol_stores["label"]:
@@ -365,18 +374,19 @@ class VolumeDataset(torch.utils.data.Dataset):
                     slice(int(o), int(o + s))
                     for o, s in zip(lbl_origin, read_shape)
                 )
-                lbl = vol_stores["label"][level][lbl_slices].read().result()
-                lbl = reorient(
-                    np.asarray(lbl), vol_info.lbl_spatial_axes, output_spatial
-                )
-                label_crops.append(torch.from_numpy(lbl.copy()))
+                lbl = np.asarray(vol_stores["label"][level][lbl_slices].read().result())
+                label_crops.append(lbl.copy())
 
-        # Stack scales: (L, *dims) -> (1, L, *dims)
-        img_tensor = torch.stack(img_crops).unsqueeze(0).float()
+        # Stack across levels → (L, *storage_axes), then permute to output_axes
+        img_stacked = torch.from_numpy(np.stack(img_crops))
+        if add_channel:
+            img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
+        img_tensor = img_stacked.permute(img_perm).float()
         if vol_info.config.normalize and np.issubdtype(vol_info.image_dtype, np.integer):
             img_tensor = img_tensor / float(np.iinfo(vol_info.image_dtype).max)
         label_tensor = (
-            torch.stack(label_crops).unsqueeze(0).long() if label_crops else None
+            torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
+            if label_crops else None
         )
 
         # Stack bboxes: (L, 2, Nd_spatial) in output spatial order
