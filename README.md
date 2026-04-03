@@ -29,10 +29,11 @@ volumes:
     path: "/data/sample_B.zarr"
     image_key: "predictions"
     zarr_version: "zarr3"
-    scales: [0, 1]
+    scales: [0, 1, 2]
     weight: 0.3
 
-output_axes: "xyz"
+n_scales: 3 # number of scales per dataset (each dataset must have this number of scales)
+output_axes: "lcxyz" # layer, channels, X, Y, Z. Shuffle as you please!!!
 patch_size: [64, 64, 64]
 samples_per_epoch: 1000
 cache_bytes: 1073741824       # 1 GB tensorstore cache
