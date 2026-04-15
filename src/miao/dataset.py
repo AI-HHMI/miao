@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import tensorstore as ts
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 
 from miao.axes import (
@@ -50,6 +51,8 @@ class VolumeInfo:
     max_center: np.ndarray
     # Patch size in image spatial axis order
     read_shape: list[int]
+    # Per-scale: spatial read shape for isotropic mode (None if isotropic=False)
+    iso_read_shapes: dict[int, np.ndarray] | None
 
 
 class VolumeDataset(torch.utils.data.Dataset):
@@ -105,7 +108,12 @@ class VolumeDataset(torch.utils.data.Dataset):
                 sf = vi.image_meta.scales[level].scale_factors
                 sp_sf = [sf[i] for i in vi.img_spatial_idx]
                 unit_label = f" {unit_str}" if unit_str else ""
-                lines.append(f"    scale {level}: voxel_size={sp_sf}{unit_label}")
+                iso_info = ""
+                if vi.iso_read_shapes is not None:
+                    iso_target = min(sp_sf)
+                    iso_voxel = [iso_target] * len(sp_sf)
+                    iso_info = f" -> iso {iso_voxel} (read {vi.iso_read_shapes[level].tolist()})"
+                lines.append(f"    scale {level}: voxel_size={sp_sf}{unit_label}{iso_info}")
             if vi.label_meta is not None:
                 lbl_meta = vi.label_meta.scales[finest]
                 lines.append(
@@ -177,6 +185,18 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl_all[lbl_sp_idx] / finest_spatial_factors
                 )
 
+        # Compute per-level isotropic read shapes if requested
+        iso_read_shapes: dict[int, np.ndarray] | None = None
+        if self.config.isotropic:
+            iso_read_shapes = {}
+            for level in vol_cfg.scales:
+                rf = relative_scale_factors[level]
+                level_voxel = rf * finest_spatial_factors  # absolute voxel size at this level
+                target_iso = level_voxel.min()
+                iso_read_shapes[level] = np.ceil(
+                    np.array(read_shape, dtype=np.float64) * target_iso / level_voxel
+                ).astype(np.int64)
+
         # Compute valid center coordinate range (spatial dims only)
         finest_all_shape = np.array(image_meta.scales[finest_scale].shape)
         finest_spatial_shape = finest_all_shape[img_sp_idx]
@@ -192,9 +212,17 @@ class VolumeDataset(torch.utils.data.Dataset):
                 image_meta.scales[level].shape, dtype=np.float64
             )
             img_sp_shape = img_all_shape[img_sp_idx]
-            min_center = np.maximum(min_center, rf * half_patch)
+
+            # Use per-level isotropic read shape if enabled
+            if iso_read_shapes is not None:
+                eff_shape = iso_read_shapes[level].astype(np.float64)
+            else:
+                eff_shape = read_shape_arr
+            eff_half = np.floor(eff_shape / 2)
+
+            min_center = np.maximum(min_center, rf * eff_half)
             max_center = np.minimum(
-                max_center, rf * (img_sp_shape - read_shape_arr + half_patch)
+                max_center, rf * (img_sp_shape - eff_shape + eff_half)
             )
 
             if label_meta is not None and label_relative_scale_factors is not None and lbl_sp_idx is not None:
@@ -203,9 +231,9 @@ class VolumeDataset(torch.utils.data.Dataset):
                     label_meta.scales[level].shape, dtype=np.float64
                 )
                 lbl_sp_shape = lbl_all_shape[lbl_sp_idx]
-                min_center = np.maximum(min_center, lrf * half_patch)
+                min_center = np.maximum(min_center, lrf * eff_half)
                 max_center = np.minimum(
-                    max_center, lrf * (lbl_sp_shape - read_shape_arr + half_patch)
+                    max_center, lrf * (lbl_sp_shape - eff_shape + eff_half)
                 )
 
         # Apply optional bounding box constraint
@@ -234,6 +262,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             min_center=min_center,
             max_center=max_center,
             read_shape=read_shape,
+            iso_read_shapes=iso_read_shapes,
         )
 
     def _get_worker_id(self) -> int:
@@ -341,6 +370,7 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         read_shape = np.array(vol_info.read_shape)
         half_patch = read_shape // 2
+        target_size = tuple(int(s) for s in read_shape)  # interpolation target
         img_crops: list[np.ndarray] = []
         label_crops: list[np.ndarray] = []
         bboxes: list[np.ndarray] = []
@@ -354,26 +384,35 @@ class VolumeDataset(torch.utils.data.Dataset):
             for level in vol_info.config.scales:
                 rel_factors = vol_info.relative_scale_factors[level]
                 center_at_level = np.floor(center / rel_factors).astype(np.int64)
-                origin = center_at_level - half_patch
+
+                # Use per-level isotropic read shape if enabled
+                if vol_info.iso_read_shapes is not None:
+                    eff_shape = vol_info.iso_read_shapes[level]
+                    eff_half = eff_shape // 2
+                else:
+                    eff_shape = read_shape
+                    eff_half = half_patch
+
+                origin = center_at_level - eff_half
 
                 voxel_size = vol_info.finest_voxel_size
                 phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
-                phys_max = ((origin + read_shape) * rel_factors * voxel_size).astype(np.float64)
+                phys_max = ((origin + eff_shape) * rel_factors * voxel_size).astype(np.float64)
                 bbox = np.stack(
                     [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
                 )
                 bboxes.append(bbox)
 
-                img_slices = self._build_img_slices(origin, read_shape, vol_info)
+                img_slices = self._build_img_slices(origin, eff_shape, vol_info)
                 img_futures.append(vol_stores["img"][level][img_slices].read(batch=batch))
 
                 if vol_info.config.label_key and level in vol_stores["label"]:
                     lbl_rel_factors = vol_info.label_relative_scale_factors[level]
                     lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
-                    lbl_origin = lbl_center - half_patch
+                    lbl_origin = lbl_center - eff_half
                     lbl_slices = tuple(
                         slice(int(o), int(o + s))
-                        for o, s in zip(lbl_origin, read_shape)
+                        for o, s in zip(lbl_origin, eff_shape)
                     )
                     lbl_futures.append(vol_stores["label"][level][lbl_slices].read(batch=batch))
                 else:
@@ -385,10 +424,49 @@ class VolumeDataset(torch.utils.data.Dataset):
             if has_img_channel and not wants_channel:
                 c_idx = vol_info.img_axes.index("c")
                 patch = np.squeeze(patch, axis=c_idx)
+
+            # Interpolate to target patch_size if isotropic mode changed the read shape
+            if vol_info.iso_read_shapes is not None:
+                has_channel_in_patch = has_img_channel and not squeeze_channel
+                if has_channel_in_patch:
+                    sp_shape = tuple(patch.shape[i] for i in vol_info.img_spatial_idx)
+                else:
+                    sp_shape = tuple(patch.shape)
+
+                if sp_shape != target_size:
+                    patch_t = torch.from_numpy(patch).float()
+                    if has_channel_in_patch:
+                        # Rearrange to (C, spatial...) so F.interpolate sees (N,C,D,H,W)
+                        c_pos = vol_info.img_axes.index("c")
+                        perm = [c_pos] + list(vol_info.img_spatial_idx)
+                        inv_perm = [0] * len(perm)
+                        for i, p in enumerate(perm):
+                            inv_perm[p] = i
+                        patch_t = patch_t.permute(perm)
+                        patch_t = F.interpolate(
+                            patch_t.unsqueeze(0),
+                            size=target_size, mode="trilinear", align_corners=False,
+                        ).squeeze(0)
+                        patch_t = patch_t.permute(inv_perm)
+                    else:
+                        # Spatial only — add batch + channel dims
+                        patch_t = F.interpolate(
+                            patch_t.unsqueeze(0).unsqueeze(0),
+                            size=target_size, mode="trilinear", align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                    patch = patch_t.numpy()
+
             img_crops.append(patch)
 
             if lbl_future is not None:
                 lbl = np.asarray(lbl_future.result())
+                # Interpolate labels with nearest-neighbor to preserve integer IDs
+                if vol_info.iso_read_shapes is not None and tuple(lbl.shape[-len(target_size):]) != target_size:
+                    lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
+                    lbl_t = F.interpolate(
+                        lbl_t, size=target_size, mode="nearest",
+                    ).squeeze(0).squeeze(0)
+                    lbl = lbl_t.numpy().astype(np.int64)
                 label_crops.append(lbl)
 
         # Stack across levels → (L, *storage_axes), then permute to output_axes
