@@ -40,6 +40,7 @@ class MiaoConfig(BaseModel):
     bbox_mode: Literal["absolute", "relative"] = "absolute"
     samples_per_epoch: int = 1000
     cache_bytes: int = 1 << 30  # 1 GB
+    file_io_concurrency: int = 64
 
     @field_validator("output_axes")
     @classmethod

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import tensorstore as ts
 import torch
 import torch.utils.data
 
@@ -243,7 +244,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         """Lazily create tensorstore handles for the current worker."""
         worker_id = self._get_worker_id()
         if worker_id not in self._worker_stores:
-            ctx = create_context(self.config.cache_bytes)
+            ctx = create_context(self.config.cache_bytes, self.config.file_io_concurrency)
             stores: dict = {}
             for vol_info in self._volumes:
                 vol_name = vol_info.config.name
@@ -344,44 +345,51 @@ class VolumeDataset(torch.utils.data.Dataset):
         label_crops: list[np.ndarray] = []
         bboxes: list[np.ndarray] = []
 
-        for level in vol_info.config.scales:
-            rel_factors = vol_info.relative_scale_factors[level]
+        # Phase 1: Compute slices and issue all reads concurrently via ts.Batch
+        level_info: list[dict] = []
+        img_futures: list[ts.Future] = []
+        lbl_futures: list[ts.Future | None] = []
 
-            # Convert center to this scale level, then compute crop origin
-            center_at_level = np.floor(center / rel_factors).astype(np.int64)
-            origin = center_at_level - half_patch
+        with ts.Batch() as batch:
+            for level in vol_info.config.scales:
+                rel_factors = vol_info.relative_scale_factors[level]
+                center_at_level = np.floor(center / rel_factors).astype(np.int64)
+                origin = center_at_level - half_patch
 
-            # Compute physical-coordinate bbox (spatial only, in output spatial order)
-            # origin and read_shape are in finest-voxel space after * rel_factors
-            # Multiply by finest voxel size to get physical units (e.g., nanometers)
-            voxel_size = vol_info.finest_voxel_size
-            phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
-            phys_max = ((origin + read_shape) * rel_factors * voxel_size).astype(np.float64)
-            bbox = np.stack(
-                [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
-            )
-            bboxes.append(bbox)
+                voxel_size = vol_info.finest_voxel_size
+                phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
+                phys_max = ((origin + read_shape) * rel_factors * voxel_size).astype(np.float64)
+                bbox = np.stack(
+                    [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
+                )
+                bboxes.append(bbox)
 
-            # Read image crop (spatial dims get crop, channel gets slice(None))
-            img_slices = self._build_img_slices(origin, read_shape, vol_info)
-            patch = np.asarray(vol_stores["img"][level][img_slices].read().result())
-            # Squeeze channel if output doesn't want it
+                img_slices = self._build_img_slices(origin, read_shape, vol_info)
+                img_futures.append(vol_stores["img"][level][img_slices].read(batch=batch))
+
+                if vol_info.config.label_key and level in vol_stores["label"]:
+                    lbl_rel_factors = vol_info.label_relative_scale_factors[level]
+                    lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
+                    lbl_origin = lbl_center - half_patch
+                    lbl_slices = tuple(
+                        slice(int(o), int(o + s))
+                        for o, s in zip(lbl_origin, read_shape)
+                    )
+                    lbl_futures.append(vol_stores["label"][level][lbl_slices].read(batch=batch))
+                else:
+                    lbl_futures.append(None)
+
+        # Phase 2: Collect results (all reads already completed when batch exited)
+        for img_future, lbl_future in zip(img_futures, lbl_futures):
+            patch = np.asarray(img_future.result())
             if has_img_channel and not wants_channel:
                 c_idx = vol_info.img_axes.index("c")
                 patch = np.squeeze(patch, axis=c_idx)
-            img_crops.append(patch.copy())
+            img_crops.append(patch)
 
-            # Read label crop (labels are spatial-only)
-            if vol_info.config.label_key and level in vol_stores["label"]:
-                lbl_rel_factors = vol_info.label_relative_scale_factors[level]
-                lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
-                lbl_origin = lbl_center - half_patch
-                lbl_slices = tuple(
-                    slice(int(o), int(o + s))
-                    for o, s in zip(lbl_origin, read_shape)
-                )
-                lbl = np.asarray(vol_stores["label"][level][lbl_slices].read().result())
-                label_crops.append(lbl.copy())
+            if lbl_future is not None:
+                lbl = np.asarray(lbl_future.result())
+                label_crops.append(lbl)
 
         # Stack across levels → (L, *storage_axes), then permute to output_axes
         img_stacked = torch.from_numpy(np.stack(img_crops))
