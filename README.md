@@ -32,11 +32,12 @@ volumes:
     scales: [0, 1, 2]
     weight: 0.3
 
-n_scales: 3 # number of scales per dataset (each dataset must have this number of scales)
-output_axes: "lcxyz" # layer, channels, X, Y, Z. Shuffle as you please!!!
+n_scales: 3                     # number of scales per dataset (each dataset must have this number of scales)
+output_axes: "lcxyz"            # layer, channels, X, Y, Z. Shuffle as you please!!!
 patch_size: [64, 64, 64]
+isotropic: false                # if true, the image (linearly) and labels (nearest) will be upsampled. 
 samples_per_epoch: 1000
-cache_bytes: 1073741824       # 1 GB tensorstore cache
+cache_bytes: 1073741824         # 1 GB tensorstore cache
 ```
 
 ### 2. Create a dataset
@@ -92,6 +93,7 @@ Each sample:
 | `patch_size` | Voxel count per crop, in `output_axes` spatial order |
 | `bbox_mode` | `"absolute"` (world coords, e.g. nm) or `"relative"` (relative to finest-level crop origin). Default: `"absolute"` |
 | `samples_per_epoch` | Number of samples per epoch |
+| `isotropic` | Flag to determine if images and labels should be upsampled to be isotropic |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
 
 Input axes are auto-detected from OME-NGFF metadata (`multiscales.axes`).
