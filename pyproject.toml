@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "miao-io"
-version = "0.1.4"
+version = "0.1.5"
 description = "Scalable PyTorch data loaders for OME-NGFF zarr datasets"
 requires-python = ">=3.10"
 dependencies = [
