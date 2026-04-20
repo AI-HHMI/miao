@@ -396,8 +396,19 @@ class VolumeDataset(torch.utils.data.Dataset):
                 origin = center_at_level - eff_half
 
                 voxel_size = vol_info.finest_voxel_size
-                phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
-                phys_max = ((origin + eff_shape) * rel_factors * voxel_size).astype(np.float64)
+                if vol_info.iso_read_shapes is not None:
+                    # Anchor bbox to the finest-level center so it stays symmetric
+                    # across axes; integer rounding of center_at_level would otherwise
+                    # shift coarse levels by up to 0.5 * level_voxel per axis.
+                    level_voxel = rel_factors * voxel_size
+                    target_iso = level_voxel.min()
+                    phys_center = center.astype(np.float64) * voxel_size
+                    iso_half_extent = np.array(read_shape, dtype=np.float64) * target_iso / 2.0
+                    phys_min = (phys_center - iso_half_extent).astype(np.float64)
+                    phys_max = (phys_center + iso_half_extent).astype(np.float64)
+                else:
+                    phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
+                    phys_max = ((origin + eff_shape) * rel_factors * voxel_size).astype(np.float64)
                 bbox = np.stack(
                     [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
                 )
