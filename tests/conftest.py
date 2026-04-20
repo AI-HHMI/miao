@@ -83,21 +83,28 @@ def _create_ome_ngff_zarr2(
 
 
 @pytest.fixture
-def zarr2_volume(tmp_path: Path) -> Path:
+def zarr2_volume(tmp_path: Path, request: pytest.FixtureRequest) -> Path:
     """Create a zarr2 OME-NGFF volume with 'raw' image and 'labels/seg' groups."""
+    params = getattr(request, "param", {})
+    image_dtype = params.get("dtype", "float32")
+    image_fill_value = params.get("fill_value")
+    image_num_scales = params.get("num_scales", 3)
+    image_base_shape = params.get("base_shape", (64, 64, 64))
+
     zarr_path = tmp_path / "test_volume.zarr"
 
     _create_ome_ngff_zarr2(
         zarr_path,
         group_key="raw",
-        base_shape=(64, 64, 64),
-        num_scales=3,
+        base_shape=image_base_shape,
+        num_scales=image_num_scales,
         axes=[
             {"name": "z", "type": "space", "unit": "micrometer"},
             {"name": "y", "type": "space", "unit": "micrometer"},
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
-        dtype="float32",
+        dtype=image_dtype,
+        fill_value=image_fill_value,
     )
 
     _create_ome_ngff_zarr2(

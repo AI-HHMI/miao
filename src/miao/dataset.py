@@ -23,6 +23,27 @@ from miao.store import create_context, open_store
 from miao.zarr_meta import OmeMetadata, ScaleMetadata, read_ome_metadata
 
 
+def _normalize_image_tensor(
+    img_tensor: torch.Tensor,
+    *,
+    normalize: bool,
+    normalize_min: float | None,
+    normalize_max: float | None,
+    image_dtype: np.dtype,
+) -> torch.Tensor:
+    """Scale image values to approximately [0, 1] for training."""
+    if not normalize:
+        return img_tensor
+    if normalize_min is not None and normalize_max is not None:
+        lo = float(normalize_min)
+        hi = float(normalize_max)
+        img_tensor = img_tensor.clamp(lo, hi)
+        return (img_tensor - lo) / (hi - lo)
+    if np.issubdtype(image_dtype, np.integer):
+        return img_tensor / float(np.iinfo(image_dtype).max)
+    return img_tensor
+
+
 @dataclass
 class VolumeInfo:
     """Resolved metadata for a single volume, ready for sampling."""
@@ -123,7 +144,23 @@ class VolumeDataset(torch.utils.data.Dataset):
             lines.append(f"    sampling: weight={prob:.2f}, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
             if vi.config.normalize:
-                lines.append(f"    normalize: {vi.image_dtype} -> [0, 1]")
+                if (
+                    vi.config.normalize_min is not None
+                    and vi.config.normalize_max is not None
+                ):
+                    lines.append(
+                        "    normalize: "
+                        f"clamp [{vi.config.normalize_min}, {vi.config.normalize_max}] -> [0, 1]"
+                    )
+                elif np.issubdtype(vi.image_dtype, np.integer):
+                    lines.append(
+                        f"    normalize: {vi.image_dtype} -> [0, 1] (divide by dtype max)"
+                    )
+                else:
+                    lines.append(
+                        "    normalize: float dtype unchanged "
+                        "(set normalize_min and normalize_max to scale)"
+                    )
             print("\n".join(lines))
         dims = ", ".join(c.upper() for c in self.config.output_axes)
         print(f"  output: axes={self.config.output_axes!r}, tensor_shape=({dims})")
@@ -474,8 +511,13 @@ class VolumeDataset(torch.utils.data.Dataset):
         if add_channel:
             img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
         img_tensor = img_stacked.permute(img_perm).float()
-        if vol_info.config.normalize and np.issubdtype(vol_info.image_dtype, np.integer):
-            img_tensor = img_tensor / float(np.iinfo(vol_info.image_dtype).max)
+        img_tensor = _normalize_image_tensor(
+            img_tensor,
+            normalize=vol_info.config.normalize,
+            normalize_min=vol_info.config.normalize_min,
+            normalize_max=vol_info.config.normalize_max,
+            image_dtype=vol_info.image_dtype,
+        )
         label_tensor = (
             torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
             if label_crops else None
