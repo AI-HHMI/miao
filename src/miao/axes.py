@@ -39,6 +39,14 @@ def compute_permutation(input_axes: str, output_axes: str) -> tuple[int, ...]:
     return tuple(input_index[char] for char in output_axes)
 
 
+def invert_permutation(perm: tuple[int, ...] | list[int]) -> list[int]:
+    """Return the inverse permutation: inv[perm[i]] == i for all i."""
+    inv = [0] * len(perm)
+    for i, p in enumerate(perm):
+        inv[p] = i
+    return inv
+
+
 def reorient(array: np.ndarray, input_axes: str, output_axes: str) -> np.ndarray:
     """Transpose array from input axis order to output axis order."""
     if input_axes == output_axes:
@@ -59,6 +67,6 @@ def map_patch_size_to_input(
     """
     if input_axes == output_axes:
         return list(patch_size)
-    # Inverse permutation: for each position in input, find where it ends up in output
     perm = compute_permutation(output_axes, input_axes)
-    return [patch_size[perm.index(i)] for i in range(len(patch_size))]
+    inv = invert_permutation(perm)
+    return [patch_size[i] for i in inv]

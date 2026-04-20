@@ -29,6 +29,24 @@ class VolumeConfig(BaseModel):
             raise ValueError(f"weight must be positive, got {v}")
         return v
 
+    @field_validator("bounding_box")
+    @classmethod
+    def validate_bounding_box(
+        cls, v: Optional[list[list[int]]]
+    ) -> Optional[list[list[int]]]:
+        if v is None:
+            return v
+        for i, pair in enumerate(v):
+            if len(pair) != 2:
+                raise ValueError(
+                    f"bounding_box axis {i} must be [min, max]; got {pair}"
+                )
+            if pair[0] > pair[1]:
+                raise ValueError(
+                    f"bounding_box axis {i}: min ({pair[0]}) > max ({pair[1]})"
+                )
+        return v
+
 
 class MiaoConfig(BaseModel):
     """Top-level configuration for miaio dataset."""
