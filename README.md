@@ -87,7 +87,7 @@ Each sample:
 | `volumes[].scales` | Which multiscale levels to extract (e.g. `[0, 1, 2]`) |
 | `volumes[].label_key` | Optional group key for labels in the same zarr |
 | `volumes[].weight` | Sampling probability weight (default: equal across volumes) |
-| `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`) |
+| `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`). Also see `normalize_min` / `normalize_max` to set upper and lower normalization bounds|
 | `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis to restrict sampling (finest-scale voxels, storage axis order) |
 | `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
 | `patch_size` | Voxel count per crop, in `output_axes` spatial order |
