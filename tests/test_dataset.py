@@ -49,7 +49,34 @@ class TestVolumeDataset:
         sample = ds[0]
 
         assert sample["img"].shape == (2, 8, 8, 8)
-        assert sample["label"] is None
+        assert isinstance(sample["label"], torch.Tensor)
+        assert sample["label"].dtype == torch.long
+        assert sample["label"].numel() == 0
+
+    def test_no_labels_with_dataloader(self, zarr2_volume: Path):
+        """Default collate should batch unlabeled samples without error."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0, 1],
+                }
+            ],
+            n_scales=2,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        dl = torch.utils.data.DataLoader(ds, batch_size=2, num_workers=0)
+        batch = next(iter(dl))
+
+        assert batch["img"].shape == (2, 2, 8, 8, 8)
+        assert isinstance(batch["label"], torch.Tensor)
+        assert batch["label"].shape == (2, 0)
+        assert batch["label"].dtype == torch.long
 
     def test_axis_reorientation(self, zarr2_volume: Path):
         """Test that output axes are correctly reoriented."""

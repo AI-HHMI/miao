@@ -83,7 +83,8 @@ class VolumeDataset(torch.utils.data.Dataset):
     1. Randomly picks one volume (weighted sampling).
     2. Picks a random coordinate in that volume's finest-scale space.
     3. Extracts patch_size voxels from each requested scale level.
-    4. Returns {"img": Tensor, "label": Tensor | None, "bbox": Tensor, "meta": dict}.
+    4. Returns {"img": Tensor, "label": Tensor, "bbox": Tensor, "meta": dict}.
+       If labels are unavailable, "label" is an empty long tensor.
 
     Tensor shapes are (1, L, *output_axes_dims) where L = number of scale levels.
     Input axes are auto-detected from OME-NGFF metadata.
@@ -391,10 +392,16 @@ class VolumeDataset(torch.utils.data.Dataset):
             img_intermediate_for_perm = img_intermediate
         img_perm = compute_permutation(img_intermediate_for_perm, self.config.output_axes)
 
-        # Label intermediate: "l" + lbl_axes, output = output_axes minus "c"
+        # Label intermediate/output handling:
+        # - labels are returned without channel axis
+        # - if label storage has 'c', squeeze it before stacking/permuting
         lbl_output_axes = self.config.output_axes.replace("c", "")
+        has_lbl_channel = vol_info.lbl_axes is not None and "c" in vol_info.lbl_axes
         if vol_info.lbl_axes is not None:
-            lbl_intermediate = "l" + vol_info.lbl_axes
+            if has_lbl_channel:
+                lbl_intermediate = "l" + spatial_axes(vol_info.lbl_axes)
+            else:
+                lbl_intermediate = "l" + vol_info.lbl_axes
             lbl_perm = compute_permutation(lbl_intermediate, lbl_output_axes)
 
         # Pick a random center coordinate at finest scale (spatial dims, image spatial order)
@@ -443,15 +450,29 @@ class VolumeDataset(torch.utils.data.Dataset):
                 img_slices = self._build_img_slices(origin, eff_shape, vol_info)
                 img_futures.append(vol_stores["img"][level][img_slices].read(batch=batch))
 
-                if vol_info.config.label_key and level in vol_stores["label"]:
+                if (
+                    vol_info.config.label_key
+                    and level in vol_stores["label"]
+                    and vol_info.label_relative_scale_factors is not None
+                    and vol_info.lbl_axes is not None
+                    and vol_info.lbl_spatial_idx is not None
+                ):
                     lbl_rel_factors = vol_info.label_relative_scale_factors[level]
                     lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
                     lbl_origin = lbl_center - eff_half
-                    lbl_slices = tuple(
-                        slice(int(o), int(o + s))
-                        for o, s in zip(lbl_origin, eff_shape)
-                    )
-                    lbl_futures.append(vol_stores["label"][level][lbl_slices].read(batch=batch))
+                    # Build label slices from label axes metadata:
+                    # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
+                    lbl_slices = []
+                    sp_i = 0
+                    for dim_i, _ax_char in enumerate(vol_info.lbl_axes):
+                        if dim_i in vol_info.lbl_spatial_idx:
+                            lbl_slices.append(
+                                slice(int(lbl_origin[sp_i]), int(lbl_origin[sp_i] + eff_shape[sp_i]))
+                            )
+                            sp_i += 1
+                        else:
+                            lbl_slices.append(slice(None))
+                    lbl_futures.append(vol_stores["label"][level][tuple(lbl_slices)].read(batch=batch))
                 else:
                     lbl_futures.append(None)
 
@@ -497,13 +518,24 @@ class VolumeDataset(torch.utils.data.Dataset):
 
             if lbl_future is not None:
                 lbl = np.asarray(lbl_future.result())
+
+                if has_lbl_channel and vol_info.lbl_axes is not None:
+                    c_idx = vol_info.lbl_axes.index("c")
+                    lbl = np.squeeze(lbl, axis=c_idx)
+
                 # Interpolate labels with nearest-neighbor to preserve integer IDs
-                if vol_info.iso_read_shapes is not None and tuple(lbl.shape[-len(target_size):]) != target_size:
-                    lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
-                    lbl_t = F.interpolate(
-                        lbl_t, size=target_size, mode="nearest",
-                    ).squeeze(0).squeeze(0)
-                    lbl = lbl_t.numpy().astype(np.int64)
+                if vol_info.iso_read_shapes is not None:
+                    if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
+                        # After squeeze, spatial indices shift left past removed channel.
+                        c_idx = vol_info.lbl_axes.index("c")
+                        shifted_spatial_idx = [i if i < c_idx else i - 1 for i in vol_info.lbl_spatial_idx]
+                        lbl_spatial_shape = tuple(int(lbl.shape[i]) for i in shifted_spatial_idx)
+                    else:
+                        lbl_spatial_shape = tuple(int(s) for s in lbl.shape)
+                    if lbl_spatial_shape != target_size:
+                        lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
+                        lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0).squeeze(0)
+                        lbl = lbl_t.numpy().astype(np.int64)
                 label_crops.append(lbl)
 
         # Stack across levels → (L, *storage_axes), then permute to output_axes
@@ -518,10 +550,11 @@ class VolumeDataset(torch.utils.data.Dataset):
             normalize_max=vol_info.config.normalize_max,
             image_dtype=vol_info.image_dtype,
         )
-        label_tensor = (
-            torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
-            if label_crops else None
-        )
+        if label_crops:
+            label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
+        else:
+            # Keep output collate-friendly for default PyTorch DataLoader.
+            label_tensor = torch.empty(0, dtype=torch.long)
 
         # Stack bboxes: (L, 2, Nd_spatial) in output spatial order, physical units
         bbox_arr = np.stack(bboxes)
