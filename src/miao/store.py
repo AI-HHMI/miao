@@ -37,7 +37,7 @@ def open_store(
         "kvstore": {"driver": "file", "path": str(path)},
     }
 
-    kwargs: dict[str, object] = {"open": True}
+    kwargs: dict = {"open": True}
     if context is not None:
         kwargs["context"] = context
 

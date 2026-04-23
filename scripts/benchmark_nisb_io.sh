@@ -1,1 +1,0 @@
-python benchmarks/benchmark.py --config examples/nisb_base.yaml --num_samples 3600 --num_workers 0,4,8,16 --batch_size 128

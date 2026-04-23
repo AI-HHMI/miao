@@ -19,7 +19,11 @@ class VolumeConfig(BaseModel):
     zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
     label_key: Optional[str] = None
     weight: float = 1.0
-    normalize: bool = True  # auto-normalize images to [0, 1] based on source dtype
+    normalize: bool = True  # scale images to [0, 1]; see normalize_min / normalize_max
+    # If both set: clip to [normalize_min, normalize_max] then linear map to [0, 1].
+    # If both omitted: integer images use [0, dtype_max]; float images are unchanged.
+    normalize_min: Optional[float] = None
+    normalize_max: Optional[float] = None
     bounding_box: Optional[list[list[int]]] = None  # [[min_0, max_0], [min_1, max_1], ...] in finest-scale voxels, storage axis order
 
     @field_validator("weight")
@@ -29,23 +33,19 @@ class VolumeConfig(BaseModel):
             raise ValueError(f"weight must be positive, got {v}")
         return v
 
-    @field_validator("bounding_box")
-    @classmethod
-    def validate_bounding_box(
-        cls, v: Optional[list[list[int]]]
-    ) -> Optional[list[list[int]]]:
-        if v is None:
-            return v
-        for i, pair in enumerate(v):
-            if len(pair) != 2:
+    @model_validator(mode="after")
+    def validate_normalize_range(self) -> "VolumeConfig":
+        lo, hi = self.normalize_min, self.normalize_max
+        if (lo is None) ^ (hi is None):
+            raise ValueError(
+                "normalize_min and normalize_max must both be set or both omitted"
+            )
+        if lo is not None and hi is not None:
+            if hi <= lo:
                 raise ValueError(
-                    f"bounding_box axis {i} must be [min, max]; got {pair}"
+                    f"normalize_max must be greater than normalize_min, got {lo} and {hi}"
                 )
-            if pair[0] > pair[1]:
-                raise ValueError(
-                    f"bounding_box axis {i}: min ({pair[0]}) > max ({pair[1]})"
-                )
-        return v
+        return self
 
 
 class MiaoConfig(BaseModel):

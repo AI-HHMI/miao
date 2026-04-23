@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +53,11 @@ def detect_zarr_version(path: Path | str) -> ZarrVersion:
         if "multiscales" in attrs:
             ds_path = attrs["multiscales"][0]["datasets"][0]["path"]
             return detect_zarr_version(path / ds_path)
+
+    # Zarr3 group-level check
+    zarr_json = path / "zarr.json"
+    if zarr_json.exists():
+        return "zarr3"
 
     raise ValueError(f"Cannot detect zarr version at {path}")
 

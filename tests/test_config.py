@@ -27,6 +27,35 @@ class TestVolumeConfig:
                 weight=-1.0,
             )
 
+    def test_normalize_range_both_required(self):
+        with pytest.raises(ValueError, match="both be set or both omitted"):
+            VolumeConfig(
+                name="raw",
+                path="/data/test.zarr",
+                image_key="raw",
+                scales=[0],
+                normalize_min=0.0,
+            )
+        with pytest.raises(ValueError, match="both be set or both omitted"):
+            VolumeConfig(
+                name="raw",
+                path="/data/test.zarr",
+                image_key="raw",
+                scales=[0],
+                normalize_max=1.0,
+            )
+
+    def test_normalize_max_must_exceed_min(self):
+        with pytest.raises(ValueError, match="greater than normalize_min"):
+            VolumeConfig(
+                name="raw",
+                path="/data/test.zarr",
+                image_key="raw",
+                scales=[0],
+                normalize_min=1.0,
+                normalize_max=1.0,
+            )
+
 
 class TestMiaoConfig:
     def test_valid(self, sample_config: dict):

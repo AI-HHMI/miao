@@ -49,7 +49,34 @@ class TestVolumeDataset:
         sample = ds[0]
 
         assert sample["img"].shape == (2, 8, 8, 8)
-        assert sample["label"] is None
+        assert isinstance(sample["label"], torch.Tensor)
+        assert sample["label"].dtype == torch.long
+        assert sample["label"].numel() == 0
+
+    def test_no_labels_with_dataloader(self, zarr2_volume: Path):
+        """Default collate should batch unlabeled samples without error."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0, 1],
+                }
+            ],
+            n_scales=2,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        dl = torch.utils.data.DataLoader(ds, batch_size=2, num_workers=0)
+        batch = next(iter(dl))
+
+        assert batch["img"].shape == (2, 2, 8, 8, 8)
+        assert isinstance(batch["label"], torch.Tensor)
+        assert batch["label"].shape == (2, 0)
+        assert batch["label"].dtype == torch.long
 
     def test_axis_reorientation(self, zarr2_volume: Path):
         """Test that output axes are correctly reoriented."""
@@ -194,3 +221,91 @@ class TestVolumeDataset:
                 output_axes="zyx",
                 patch_size=[8, 8, 8],
             )
+
+    @pytest.mark.parametrize(
+        "zarr2_volume",
+        [{"dtype": "uint8", "fill_value": 150, "num_scales": 1, "base_shape": (32, 32, 32)}],
+        indirect=True,
+    )
+    def test_normalize_custom_min_max(self, zarr2_volume: Path):
+        """Clip to [min, max] then linear map to [0, 1]."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0],
+                    "normalize": True,
+                    "normalize_min": 100,
+                    "normalize_max": 200,
+                }
+            ],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=1,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        expected = (150.0 - 100.0) / (200.0 - 100.0)
+        assert torch.allclose(sample["img"], torch.full_like(sample["img"], expected))
+
+    @pytest.mark.parametrize(
+        "zarr2_volume",
+        [{"dtype": "uint8", "fill_value": 255, "num_scales": 1, "base_shape": (32, 32, 32)}],
+        indirect=True,
+    )
+    def test_normalize_clips_outside_range(self, zarr2_volume: Path):
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0],
+                    "normalize": True,
+                    "normalize_min": 0,
+                    "normalize_max": 128,
+                }
+            ],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=1,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        # 255 clipped to 128 → 1.0
+        assert torch.allclose(sample["img"], torch.ones_like(sample["img"]))
+
+    @pytest.mark.parametrize(
+        "zarr2_volume",
+        [{"dtype": "float32", "fill_value": 10.0, "num_scales": 1, "base_shape": (32, 32, 32)}],
+        indirect=True,
+    )
+    def test_normalize_float_with_explicit_range(self, zarr2_volume: Path):
+        """Explicit range must scale floats; legacy float path leaves raw values unchanged."""
+        raw_value = 10.0
+        lo, hi = 0.0, 100.0
+        expected = (raw_value - lo) / (hi - lo)
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "scales": [0],
+                    "normalize": True,
+                    "normalize_min": lo,
+                    "normalize_max": hi,
+                }
+            ],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=1,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert torch.allclose(sample["img"], torch.full_like(sample["img"], expected))
