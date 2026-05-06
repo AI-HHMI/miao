@@ -95,8 +95,34 @@ Each sample:
 | `samples_per_epoch` | Number of samples per epoch |
 | `isotropic` | Flag to determine if images and labels should be upsampled to be isotropic |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
+| `sampling` | `"random"` (default) or `"sequential"` — see below |
+| `overlap` | Voxels of overlap between adjacent patches in sequential mode (default: `0`). Integer (same for all axes) or list in `output_axes` spatial order, e.g. `[16, 16, 8]` |
 
 Input axes are auto-detected from OME-NGFF metadata (`multiscales.axes`).
+
+### Sequential sampling (inference / evaluation)
+
+Set `sampling: "sequential"` to iterate over the entire volume in a deterministic grid instead of random sampling. Useful for dense inference and evaluation.
+
+```yaml
+sampling: "sequential"
+overlap: 16              # or per-axis list e.g. [16, 16, 8]
+```
+
+```python
+dataset = VolumeDataset(config)
+# len(dataset) = total grid positions across all volumes
+
+loader = DataLoader(dataset, batch_size=4, shuffle=False)  # shuffle=False required
+
+for batch in loader:
+    img  = batch["img"]
+    meta = batch["meta"]
+    # meta["grid_index"]: tuple e.g. (2, 0, 3) = position in the grid per axis
+    # use grid_index to stitch patch predictions back into a full-volume output
+```
+
+In sequential mode `samples_per_epoch` and per-volume `weight` are ignored. For multiple volumes, all positions of volume 0 are yielded before volume 1.
 
 ## Requirements
 
