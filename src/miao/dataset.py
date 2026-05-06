@@ -102,6 +102,11 @@ class VolumeDataset(torch.utils.data.Dataset):
         for vol_cfg in config.volumes:
             self._volumes.append(self._resolve_volume(vol_cfg))
 
+        # Build sequential grid before printing summary (summary reports grid size)
+        self._grid: list[tuple[int, np.ndarray, tuple]] = []
+        if config.sampling == "sequential":
+            self._build_sequential_grid()
+
         # Print summary
         self._print_summary()
 
@@ -110,8 +115,13 @@ class VolumeDataset(torch.utils.data.Dataset):
 
     def _print_summary(self) -> None:
         """Print a summary of detected metadata for all volumes."""
+        if self.config.sampling == "sequential":
+            ov = self.config.overlap
+            mode_str = f"sequential, {len(self._grid)} total positions, overlap={ov}"
+        else:
+            mode_str = f"random, {self.config.samples_per_epoch} samples/epoch"
         print(f"VolumeDataset: {len(self._volumes)} volume(s), "
-              f"{self.config.samples_per_epoch} samples/epoch, "
+              f"{mode_str}, "
               f"patch_size={self.config.patch_size}")
         for vi in self._volumes:
             finest = min(vi.config.scales)
@@ -303,6 +313,49 @@ class VolumeDataset(torch.utils.data.Dataset):
             iso_read_shapes=iso_read_shapes,
         )
 
+    def _build_sequential_grid(self) -> None:
+        """Precompute flat list of (vol_idx, center, grid_index) for sequential sampling.
+
+        center is in image spatial axis order (matching min_center/max_center).
+        grid_index is a tuple of per-axis position indices within the grid for that volume,
+        useful for stitching patch predictions back into a full-volume output.
+        """
+        from itertools import product as iproduct
+
+        output_spatial = spatial_axes(self.config.output_axes)
+        ov = self.config.overlap
+        if isinstance(ov, int):
+            ov = [ov] * len(self.config.patch_size)
+
+        for vol_idx, vol_info in enumerate(self._volumes):
+            # Map overlap from output_axes spatial order → input (storage) spatial order,
+            # matching the convention used by vol_info.read_shape.
+            overlap_input = map_patch_size_to_input(
+                ov, vol_info.img_spatial_axes, output_spatial
+            )
+            stride = np.array(vol_info.read_shape) - np.array(overlap_input)
+
+            # Generate valid center positions per spatial axis
+            ranges: list[list[int]] = []
+            for i in range(len(vol_info.read_shape)):
+                lo = int(vol_info.min_center[i])
+                hi = int(vol_info.max_center[i])
+                positions = list(range(lo, hi + 1, int(stride[i])))
+                if not positions:
+                    raise ValueError(
+                        f"Volume {vol_info.config.name!r}: no valid center positions along "
+                        f"spatial axis {i} (min_center={lo} > max_center={hi}). "
+                        f"Volume may be too small for the requested patch_size."
+                    )
+                if positions[-1] < hi:
+                    positions.append(hi)
+                ranges.append(positions)
+
+            # Cartesian product → flat list; last axis varies fastest
+            for grid_idx in iproduct(*[range(len(r)) for r in ranges]):
+                center = np.array([ranges[ax][grid_idx[ax]] for ax in range(len(ranges))])
+                self._grid.append((vol_idx, center, grid_idx))
+
     def _get_worker_id(self) -> int:
         worker_info = torch.utils.data.get_worker_info()
         return worker_info.id if worker_info is not None else 0
@@ -343,6 +396,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         return self._worker_stores[worker_id]
 
     def __len__(self) -> int:
+        if self.config.sampling == "sequential":
+            return len(self._grid)
         return self.config.samples_per_epoch
 
     def _build_img_slices(
@@ -362,8 +417,12 @@ class VolumeDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict:
         stores = self._get_stores()
 
-        # Pick a volume based on sampling weights
-        vol_idx = np.random.choice(len(self._volumes), p=self._probabilities)
+        # Pick volume (and center in sequential mode) based on sampling strategy
+        grid_index: tuple | None = None
+        if self.config.sampling == "sequential":
+            vol_idx, center, grid_index = self._grid[idx]
+        else:
+            vol_idx = np.random.choice(len(self._volumes), p=self._probabilities)
         vol_info = self._volumes[vol_idx]
         vol_stores = stores[vol_info.config.name]
         output_spatial = spatial_axes(self.config.output_axes)
@@ -404,13 +463,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                 lbl_intermediate = "l" + vol_info.lbl_axes
             lbl_perm = compute_permutation(lbl_intermediate, lbl_output_axes)
 
-        # Pick a random center coordinate at finest scale (spatial dims, image spatial order)
-        center = np.array(
-            [
-                np.random.randint(lo, hi + 1)
-                for lo, hi in zip(vol_info.min_center, vol_info.max_center)
-            ]
-        )
+        # Pick center coordinate (random mode only; sequential already set center above)
+        if self.config.sampling == "random":
+            center = np.array(
+                [
+                    np.random.randint(lo, hi + 1)
+                    for lo, hi in zip(vol_info.min_center, vol_info.max_center)
+                ]
+            )
 
         read_shape = np.array(vol_info.read_shape)
         half_patch = read_shape // 2
@@ -572,5 +632,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 "volume": vol_info.config.name,
                 "coordinate": center.tolist(),
                 "scale_levels": vol_info.config.scales,
+                # grid_index only present in sequential mode; None breaks DataLoader collation
+                **({"grid_index": grid_index} if grid_index is not None else {}),
             },
         }
