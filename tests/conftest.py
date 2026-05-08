@@ -19,10 +19,12 @@ def _create_ome_ngff_zarr2(
     axes: list[dict] | None = None,
     dtype: str = "float32",
     fill_value: float | None = None,
+    base_scale_factors: list[float] | None = None,
 ) -> None:
     """Create an OME-NGFF compliant zarr2 multiscale group.
 
     Each scale level is downsampled by 2x in all dimensions.
+    base_scale_factors sets the voxel size at level 0 (e.g., [5, 1, 1] for anisotropic).
     """
     if axes is None:
         ndim = len(base_shape)
@@ -42,7 +44,10 @@ def _create_ome_ngff_zarr2(
     for level in range(num_scales):
         scale_factor = 2**level
         level_shape = tuple(s // scale_factor for s in base_shape)
-        scale_factors = [float(scale_factor)] * len(base_shape)
+        if base_scale_factors is not None:
+            scale_factors = [sf * scale_factor for sf in base_scale_factors]
+        else:
+            scale_factors = [float(scale_factor)] * len(base_shape)
 
         # Create array with deterministic data
         rng = np.random.RandomState(42 + level)
@@ -140,6 +145,32 @@ def zarr2_volume_xyz(tmp_path: Path) -> Path:
             {"name": "z", "type": "space", "unit": "micrometer"},
         ],
         dtype="float32",
+    )
+
+    return zarr_path
+
+
+@pytest.fixture
+def zarr2_volume_anisotropic(tmp_path: Path) -> Path:
+    """Create a zarr2 OME-NGFF volume with anisotropic voxel sizes.
+
+    Shape: (20, 100, 100) in ZYX, voxel sizes [5, 1, 1] (Z is 5x coarser).
+    In isotropic space at 1-unit resolution, the volume is 100x100x100.
+    """
+    zarr_path = tmp_path / "test_volume_aniso.zarr"
+
+    _create_ome_ngff_zarr2(
+        zarr_path,
+        group_key="raw",
+        base_shape=(20, 100, 100),
+        num_scales=1,
+        axes=[
+            {"name": "z", "type": "space", "unit": "nanometer"},
+            {"name": "y", "type": "space", "unit": "nanometer"},
+            {"name": "x", "type": "space", "unit": "nanometer"},
+        ],
+        dtype="uint8",
+        base_scale_factors=[5.0, 1.0, 1.0],
     )
 
     return zarr_path

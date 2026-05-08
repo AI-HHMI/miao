@@ -489,3 +489,106 @@ class TestVolumeDataset:
         ds = VolumeDataset(cfg)
         # Z: stride=4 → 15 positions; Y,X: stride=8 → 8 positions each
         assert len(ds) == 15 * 8 * 8
+
+    # ── Isotropic + sequential sampling ──────────────────────────────────────
+
+    def test_sequential_isotropic_grid_size(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: grid is built in isotropic space, giving more positions."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        # Anisotropic volume: 20×100×100 storage, voxel [5,1,1]
+        # Isotropic space: 100×100×100 at 1-unit resolution
+        # iso_read_shape = ceil([10,10,10]*[1/5,1,1]) = [2,10,10]
+        # min_center=[1,5,5], max_center=[19,95,95]
+        # iso_min=[5,5,5], iso_max=[95,95,95], iso_stride=[10,10,10]
+        # positions per axis: [5,15,25,...,95] = 10
+        assert len(ds) == 10 ** 3
+
+    def test_sequential_isotropic_coordinates(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: meta has both coordinate and isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert "isotropic_coordinate" in sample["meta"]
+        assert "coordinate" in sample["meta"]
+        # First position: iso=[5,5,5], storage=[1,5,5]
+        assert sample["meta"]["isotropic_coordinate"] == [5, 5, 5]
+        assert sample["meta"]["coordinate"] == [1, 5, 5]
+
+    def test_sequential_isotropic_output_shape(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: output tensor matches patch_size (after interpolation)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert sample["img"].shape == (1, 10, 10, 10)
+
+    def test_random_isotropic_has_isotropic_coordinate(self, zarr2_volume_anisotropic: Path):
+        """Random + isotropic: meta includes isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            isotropic=True,
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert "isotropic_coordinate" in sample["meta"]
+        iso = sample["meta"]["isotropic_coordinate"]
+        storage = sample["meta"]["coordinate"]
+        # Z axis has zoom=5, Y and X have zoom=1
+        assert iso[0] == storage[0] * 5.0
+        assert iso[1] == float(storage[1])
+        assert iso[2] == float(storage[2])
+
+    def test_non_isotropic_no_isotropic_coordinate(self, zarr2_volume: Path):
+        """Non-isotropic mode: meta does not contain isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        assert "isotropic_coordinate" not in ds[0]["meta"]
+
+    def test_sequential_isotropic_on_isotropic_volume(self, zarr2_volume: Path):
+        """When volume is already isotropic, iso grid size matches non-iso grid size."""
+        base = dict(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds_no_iso = VolumeDataset(MiaoConfig(**base))
+        ds_iso = VolumeDataset(MiaoConfig(**base, isotropic=True))
+        # Zoom factors are [1,1,1] on isotropic volume → same grid
+        assert len(ds_no_iso) == len(ds_iso)
