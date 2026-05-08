@@ -124,6 +124,27 @@ for batch in loader:
 
 In sequential mode `samples_per_epoch` and per-volume `weight` are ignored. For multiple volumes, all positions of volume 0 are yielded before volume 1.
 
+### Isotropic + sequential sampling
+
+When `isotropic: true` and `sampling: "sequential"` are used together, the grid is built in **isotropic output space** rather than storage space. This ensures full coverage of the isotropic output volume with no gaps, even when the source data is anisotropic.
+
+For example, with voxel sizes 9×9×20 nm (Z is ~2.2× coarser), the grid produces ~2.2× more positions along Z than it would in storage space — matching the interpolated output resolution.
+
+```yaml
+isotropic: true
+sampling: "sequential"
+overlap: 16
+```
+
+Two coordinate fields are available in `meta`:
+
+| Field | Space | Use case |
+|---|---|---|
+| `meta["coordinate"]` | Storage voxels | Debugging, cross-referencing with on-disk data |
+| `meta["isotropic_coordinate"]` | Isotropic output voxels | Stitching inference predictions into a dense volume |
+
+`isotropic_coordinate` is present whenever `isotropic: true` (both random and sequential modes) and absent when `isotropic: false`.
+
 ## Requirements
 
 - Python >= 3.10
