@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 import yaml
 from pydantic import BaseModel, field_validator, model_validator
@@ -60,6 +60,8 @@ class MiaoConfig(BaseModel):
     samples_per_epoch: int = 1000
     cache_bytes: int = 1 << 30  # 1 GB
     file_io_concurrency: int = 64
+    sampling: Literal["random", "sequential"] = "random"
+    overlap: Union[int, list[int]] = 0  # voxels; in output_axes spatial order (same as patch_size)
 
     @field_validator("output_axes")
     @classmethod
@@ -104,6 +106,25 @@ class MiaoConfig(BaseModel):
         names = [v.name for v in self.volumes]
         if len(names) != len(set(names)):
             raise ValueError("Volume names must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def validate_overlap(self) -> "MiaoConfig":
+        if self.sampling != "sequential":
+            return self
+        ov = self.overlap if isinstance(self.overlap, list) else [self.overlap] * len(self.patch_size)
+        if len(ov) != len(self.patch_size):
+            raise ValueError(
+                f"overlap has {len(ov)} elements but patch_size has {len(self.patch_size)} — "
+                "they must match (both in output_axes spatial order)"
+            )
+        for i, (o, p) in enumerate(zip(ov, self.patch_size)):
+            if o < 0:
+                raise ValueError(f"overlap[{i}]={o} must be >= 0")
+            if o >= p:
+                raise ValueError(
+                    f"overlap[{i}]={o} must be < patch_size[{i}]={p} (stride would be <= 0)"
+                )
         return self
 
 

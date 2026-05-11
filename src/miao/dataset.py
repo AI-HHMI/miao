@@ -74,6 +74,9 @@ class VolumeInfo:
     read_shape: list[int]
     # Per-scale: spatial read shape for isotropic mode (None if isotropic=False)
     iso_read_shapes: dict[int, np.ndarray] | None
+    # Per-axis zoom factor from storage to isotropic space (None if isotropic=False)
+    # e.g., [5, 1, 1] for voxel sizes [40, 8, 8] nm (Z is 5x coarser)
+    iso_zoom_factors: np.ndarray | None = None
 
 
 class VolumeDataset(torch.utils.data.Dataset):
@@ -102,6 +105,12 @@ class VolumeDataset(torch.utils.data.Dataset):
         for vol_cfg in config.volumes:
             self._volumes.append(self._resolve_volume(vol_cfg))
 
+        # Build sequential grid before printing summary (summary reports grid size)
+        self._grid: list[tuple[int, np.ndarray, tuple]] = []
+        self._grid_iso_centers: list[np.ndarray] = []
+        if config.sampling == "sequential":
+            self._build_sequential_grid()
+
         # Print summary
         self._print_summary()
 
@@ -110,8 +119,14 @@ class VolumeDataset(torch.utils.data.Dataset):
 
     def _print_summary(self) -> None:
         """Print a summary of detected metadata for all volumes."""
+        if self.config.sampling == "sequential":
+            ov = self.config.overlap
+            iso_tag = " (isotropic grid)" if self.config.isotropic else ""
+            mode_str = f"sequential, {len(self._grid)} total positions, overlap={ov}{iso_tag}"
+        else:
+            mode_str = f"random, {self.config.samples_per_epoch} samples/epoch"
         print(f"VolumeDataset: {len(self._volumes)} volume(s), "
-              f"{self.config.samples_per_epoch} samples/epoch, "
+              f"{mode_str}, "
               f"patch_size={self.config.patch_size}")
         for vi in self._volumes:
             finest = min(vi.config.scales)
@@ -223,8 +238,9 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl_all[lbl_sp_idx] / finest_spatial_factors
                 )
 
-        # Compute per-level isotropic read shapes if requested
+        # Compute per-level isotropic read shapes and zoom factors if requested
         iso_read_shapes: dict[int, np.ndarray] | None = None
+        iso_zoom_factors: np.ndarray | None = None
         if self.config.isotropic:
             iso_read_shapes = {}
             for level in vol_cfg.scales:
@@ -234,6 +250,9 @@ class VolumeDataset(torch.utils.data.Dataset):
                 iso_read_shapes[level] = np.ceil(
                     np.array(read_shape, dtype=np.float64) * target_iso / level_voxel
                 ).astype(np.int64)
+            # Zoom factor: how many isotropic voxels per storage voxel, per axis
+            target_iso_voxel = finest_spatial_factors.min()
+            iso_zoom_factors = finest_spatial_factors / target_iso_voxel
 
         # Compute valid center coordinate range (spatial dims only)
         finest_all_shape = np.array(image_meta.scales[finest_scale].shape)
@@ -301,7 +320,97 @@ class VolumeDataset(torch.utils.data.Dataset):
             max_center=max_center,
             read_shape=read_shape,
             iso_read_shapes=iso_read_shapes,
+            iso_zoom_factors=iso_zoom_factors,
         )
+
+    def _build_sequential_grid(self) -> None:
+        """Precompute flat list of (vol_idx, center, grid_index) for sequential sampling.
+
+        center is in image spatial axis order (matching min_center/max_center).
+        grid_index is a tuple of per-axis position indices within the grid for that volume,
+        useful for stitching patch predictions back into a full-volume output.
+
+        When isotropic=True, the grid is built in isotropic output space so that
+        stride and overlap semantics match the isotropic output tensor. Grid positions
+        are converted back to storage coordinates for reading. Isotropic centers are
+        stored in self._grid_iso_centers for inclusion in meta["isotropic_coordinate"].
+        """
+        from itertools import product as iproduct
+
+        output_spatial = spatial_axes(self.config.output_axes)
+        ov = self.config.overlap
+        if isinstance(ov, int):
+            ov = [ov] * len(self.config.patch_size)
+
+        for vol_idx, vol_info in enumerate(self._volumes):
+            # Map overlap from output_axes spatial order → input (storage) spatial order
+            overlap_input = map_patch_size_to_input(
+                ov, vol_info.img_spatial_axes, output_spatial
+            )
+
+            if vol_info.iso_zoom_factors is not None:
+                # --- Isotropic mode: build grid in isotropic output space ---
+                zoom = vol_info.iso_zoom_factors
+                iso_min = vol_info.min_center * zoom
+                iso_max = vol_info.max_center * zoom
+
+                # patch_size mapped to input (storage) axis order — this is the
+                # isotropic output size per axis (what the caller gets after interpolation)
+                patch_input = map_patch_size_to_input(
+                    self.config.patch_size, vol_info.img_spatial_axes, output_spatial
+                )
+                iso_stride = np.array(patch_input) - np.array(overlap_input)
+
+                ranges: list[list[int]] = []
+                for i in range(len(patch_input)):
+                    lo = int(iso_min[i])
+                    hi = int(iso_max[i])
+                    positions = list(range(lo, hi + 1, int(iso_stride[i])))
+                    if not positions:
+                        raise ValueError(
+                            f"Volume {vol_info.config.name!r}: no valid center positions "
+                            f"along spatial axis {i} in isotropic space "
+                            f"(iso_min={lo} > iso_max={hi}). "
+                            f"Volume may be too small for the requested patch_size."
+                        )
+                    if positions[-1] < hi:
+                        positions.append(hi)
+                    ranges.append(positions)
+
+                for grid_idx in iproduct(*[range(len(r)) for r in ranges]):
+                    iso_center = np.array(
+                        [ranges[ax][grid_idx[ax]] for ax in range(len(ranges))]
+                    )
+                    storage_center = np.round(iso_center / zoom).astype(np.int64)
+                    storage_center = np.clip(
+                        storage_center, vol_info.min_center, vol_info.max_center
+                    )
+                    self._grid.append((vol_idx, storage_center, grid_idx))
+                    self._grid_iso_centers.append(iso_center)
+            else:
+                # --- Non-isotropic: build grid in storage space ---
+                stride = np.array(vol_info.read_shape) - np.array(overlap_input)
+
+                ranges: list[list[int]] = []
+                for i in range(len(vol_info.read_shape)):
+                    lo = int(vol_info.min_center[i])
+                    hi = int(vol_info.max_center[i])
+                    positions = list(range(lo, hi + 1, int(stride[i])))
+                    if not positions:
+                        raise ValueError(
+                            f"Volume {vol_info.config.name!r}: no valid center positions "
+                            f"along spatial axis {i} (min_center={lo} > max_center={hi}). "
+                            f"Volume may be too small for the requested patch_size."
+                        )
+                    if positions[-1] < hi:
+                        positions.append(hi)
+                    ranges.append(positions)
+
+                for grid_idx in iproduct(*[range(len(r)) for r in ranges]):
+                    center = np.array(
+                        [ranges[ax][grid_idx[ax]] for ax in range(len(ranges))]
+                    )
+                    self._grid.append((vol_idx, center, grid_idx))
 
     def _get_worker_id(self) -> int:
         worker_info = torch.utils.data.get_worker_info()
@@ -343,6 +452,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         return self._worker_stores[worker_id]
 
     def __len__(self) -> int:
+        if self.config.sampling == "sequential":
+            return len(self._grid)
         return self.config.samples_per_epoch
 
     def _build_img_slices(
@@ -362,8 +473,12 @@ class VolumeDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict:
         stores = self._get_stores()
 
-        # Pick a volume based on sampling weights
-        vol_idx = np.random.choice(len(self._volumes), p=self._probabilities)
+        # Pick volume (and center in sequential mode) based on sampling strategy
+        grid_index: tuple | None = None
+        if self.config.sampling == "sequential":
+            vol_idx, center, grid_index = self._grid[idx]
+        else:
+            vol_idx = np.random.choice(len(self._volumes), p=self._probabilities)
         vol_info = self._volumes[vol_idx]
         vol_stores = stores[vol_info.config.name]
         output_spatial = spatial_axes(self.config.output_axes)
@@ -404,13 +519,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                 lbl_intermediate = "l" + vol_info.lbl_axes
             lbl_perm = compute_permutation(lbl_intermediate, lbl_output_axes)
 
-        # Pick a random center coordinate at finest scale (spatial dims, image spatial order)
-        center = np.array(
-            [
-                np.random.randint(lo, hi + 1)
-                for lo, hi in zip(vol_info.min_center, vol_info.max_center)
-            ]
-        )
+        # Pick center coordinate (random mode only; sequential already set center above)
+        if self.config.sampling == "random":
+            center = np.array(
+                [
+                    np.random.randint(lo, hi + 1)
+                    for lo, hi in zip(vol_info.min_center, vol_info.max_center)
+                ]
+            )
 
         read_shape = np.array(vol_info.read_shape)
         half_patch = read_shape // 2
@@ -564,6 +680,15 @@ class VolumeDataset(torch.utils.data.Dataset):
             bbox_arr = bbox_arr - finest_center
         bbox_tensor = torch.from_numpy(bbox_arr).float()
 
+        # Compute isotropic coordinate if applicable
+        iso_coord = None
+        if vol_info.iso_zoom_factors is not None:
+            if self.config.sampling == "sequential" and self._grid_iso_centers:
+                iso_coord = self._grid_iso_centers[idx].tolist()
+            else:
+                # Random mode: convert storage center to isotropic space
+                iso_coord = (center.astype(np.float64) * vol_info.iso_zoom_factors).tolist()
+
         return {
             "img": img_tensor,
             "label": label_tensor,
@@ -572,5 +697,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 "volume": vol_info.config.name,
                 "coordinate": center.tolist(),
                 "scale_levels": vol_info.config.scales,
+                **({"isotropic_coordinate": iso_coord} if iso_coord is not None else {}),
+                # grid_index only present in sequential mode; None breaks DataLoader collation
+                **({"grid_index": grid_index} if grid_index is not None else {}),
             },
         }

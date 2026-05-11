@@ -95,8 +95,55 @@ Each sample:
 | `samples_per_epoch` | Number of samples per epoch |
 | `isotropic` | Flag to determine if images and labels should be upsampled to be isotropic |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
+| `sampling` | `"random"` (default) or `"sequential"` — see below |
+| `overlap` | Voxels of overlap between adjacent patches in sequential mode (default: `0`). Integer (same for all axes) or list in `output_axes` spatial order, e.g. `[16, 16, 8]` |
 
 Input axes are auto-detected from OME-NGFF metadata (`multiscales.axes`).
+
+### Sequential sampling (inference / evaluation)
+
+Set `sampling: "sequential"` to iterate over the entire volume in a deterministic grid instead of random sampling. Useful for dense inference and evaluation.
+
+```yaml
+sampling: "sequential"
+overlap: 16              # or per-axis list e.g. [16, 16, 8]
+```
+
+```python
+dataset = VolumeDataset(config)
+# len(dataset) = total grid positions across all volumes
+
+loader = DataLoader(dataset, batch_size=4, shuffle=False)  # shuffle=False required
+
+for batch in loader:
+    img  = batch["img"]
+    meta = batch["meta"]
+    # meta["grid_index"]: tuple e.g. (2, 0, 3) = position in the grid per axis
+    # use grid_index to stitch patch predictions back into a full-volume output
+```
+
+In sequential mode `samples_per_epoch` and per-volume `weight` are ignored. For multiple volumes, all positions of volume 0 are yielded before volume 1.
+
+### Isotropic + sequential sampling
+
+When `isotropic: true` and `sampling: "sequential"` are used together, the grid is built in **isotropic output space** rather than storage space. This ensures full coverage of the isotropic output volume with no gaps, even when the source data is anisotropic.
+
+For example, with voxel sizes 9×9×20 nm (Z is ~2.2× coarser), the grid produces ~2.2× more positions along Z than it would in storage space — matching the interpolated output resolution.
+
+```yaml
+isotropic: true
+sampling: "sequential"
+overlap: 16
+```
+
+Two coordinate fields are available in `meta`:
+
+| Field | Space | Use case |
+|---|---|---|
+| `meta["coordinate"]` | Storage voxels | Debugging, cross-referencing with on-disk data |
+| `meta["isotropic_coordinate"]` | Isotropic output voxels | Stitching inference predictions into a dense volume |
+
+`isotropic_coordinate` is present whenever `isotropic: true` (both random and sequential modes) and absent when `isotropic: false`.
 
 ## Requirements
 

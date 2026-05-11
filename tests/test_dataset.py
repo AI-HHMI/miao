@@ -1,6 +1,7 @@
 """Tests for VolumeDataset."""
 
 from pathlib import Path
+from itertools import product as iproduct
 
 import numpy as np
 import pytest
@@ -309,3 +310,285 @@ class TestVolumeDataset:
         ds = VolumeDataset(cfg)
         sample = ds[0]
         assert torch.allclose(sample["img"], torch.full_like(sample["img"], expected))
+
+    # ── Random mode: grid_index is None ──────────────────────────────────────
+
+    def test_random_mode_no_grid_index(self, zarr2_volume: Path):
+        """Random mode: meta does not contain 'grid_index' (avoids DataLoader collation issues)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(5):
+            assert "grid_index" not in ds[i]["meta"]
+
+    # ── Sequential sampling ───────────────────────────────────────────────────
+
+    def test_sequential_basic(self, zarr2_volume: Path):
+        """Sequential: __len__ equals precomputed grid size; sample shape is correct."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds = VolumeDataset(cfg)
+        # 64^3 volume, patch 8^3, overlap 0, stride 8
+        # min_center=4, max_center=60 per axis → positions [4,12,...,60] = 8 per axis
+        assert len(ds) == 8 ** 3
+        sample = ds[0]
+        assert sample["img"].shape == (1, 8, 8, 8)
+        assert sample["img"].dtype == torch.float32
+
+    def test_sequential_deterministic(self, zarr2_volume: Path):
+        """Same idx always returns the same coordinate and grid_index."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds = VolumeDataset(cfg)
+        for idx in [0, 7, 63, 511]:
+            s1 = ds[idx]
+            s2 = ds[idx]
+            assert s1["meta"]["coordinate"] == s2["meta"]["coordinate"]
+            assert s1["meta"]["grid_index"] == s2["meta"]["grid_index"]
+
+    def test_sequential_grid_index_in_meta(self, zarr2_volume: Path):
+        """Sequential mode: meta['grid_index'] is a tuple; first is (0,0,0)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds = VolumeDataset(cfg)
+        first = ds[0]
+        last = ds[len(ds) - 1]
+        assert isinstance(first["meta"]["grid_index"], tuple)
+        assert first["meta"]["grid_index"] == (0, 0, 0)
+        assert last["meta"]["grid_index"] == (7, 7, 7)
+
+    def test_sequential_full_coverage(self, zarr2_volume: Path):
+        """Every voxel in the volume is covered by at least one patch."""
+        vol_shape = (64, 64, 64)
+        patch_size = [8, 8, 8]
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=patch_size,
+            sampling="sequential",
+        )
+        ds = VolumeDataset(cfg)
+        covered = np.zeros(vol_shape, dtype=bool)
+        half = [p // 2 for p in patch_size]  # [4, 4, 4]
+        for i in range(len(ds)):
+            z, y, x = ds[i]["meta"]["coordinate"]  # center in ZYX order
+            covered[z - half[0]: z + half[0], y - half[1]: y + half[1], x - half[2]: x + half[2]] = True
+        assert covered.all(), "Some voxels not covered by any patch"
+
+    def test_sequential_zero_overlap_stride_equals_patch(self, zarr2_volume: Path):
+        """overlap=0: consecutive patches are exactly patch_size apart (no overlap, no gap)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+            overlap=0,
+        )
+        ds = VolumeDataset(cfg)
+        # grid[0] = (z0, y0, x0), grid[1] = (z0, y0, x1) — last axis varies fastest
+        c0 = ds._grid[0][1]  # center of first patch
+        c1 = ds._grid[1][1]  # center of second patch (next x position)
+        assert abs(int(c1[-1]) - int(c0[-1])) == 8  # stride = patch_size - overlap = 8
+
+    def test_sequential_overlap(self, zarr2_volume: Path):
+        """overlap=4: stride=4, consecutive patch centers are 4 apart; grid is larger."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+            overlap=4,
+        )
+        ds = VolumeDataset(cfg)
+        # stride=4, positions per axis: range(4, 61, 4) → [4,8,...,60] = 15 positions
+        assert len(ds) == 15 ** 3
+        c0 = ds._grid[0][1]
+        c1 = ds._grid[1][1]
+        assert abs(int(c1[-1]) - int(c0[-1])) == 4
+
+    def test_sequential_multi_volume(self, zarr2_volume: Path):
+        """Multi-volume: all volumes are iterated; grid_index resets per volume."""
+        cfg = MiaoConfig(
+            volumes=[
+                {"name": "vol_a", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]},
+                {"name": "vol_b", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]},
+            ],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds = VolumeDataset(cfg)
+        per_vol = 8 ** 3  # 512 per volume
+        assert len(ds) == 2 * per_vol
+        # vol_a fills first half, vol_b fills second half
+        assert ds[0]["meta"]["volume"] == "vol_a"
+        assert ds[per_vol - 1]["meta"]["volume"] == "vol_a"
+        assert ds[per_vol]["meta"]["volume"] == "vol_b"
+        # grid_index resets at volume boundary
+        assert ds[0]["meta"]["grid_index"] == (0, 0, 0)
+        assert ds[per_vol]["meta"]["grid_index"] == (0, 0, 0)
+
+    def test_sequential_overlap_too_large_raises(self, zarr2_volume: Path):
+        """overlap >= patch_size raises ValueError at config creation time."""
+        with pytest.raises(ValueError, match="overlap"):
+            MiaoConfig(
+                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+                n_scales=1,
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+                sampling="sequential",
+                overlap=8,  # equal to patch_size → stride=0
+            )
+
+    def test_sequential_overlap_negative_raises(self, zarr2_volume: Path):
+        """Negative overlap raises ValueError."""
+        with pytest.raises(ValueError, match="overlap"):
+            MiaoConfig(
+                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+                n_scales=1,
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+                sampling="sequential",
+                overlap=-1,
+            )
+
+    def test_sequential_per_axis_overlap(self, zarr2_volume: Path):
+        """Per-axis overlap list: each axis uses its own overlap value."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+            overlap=[4, 0, 0],  # only Z has overlap; in output ZYX order
+        )
+        ds = VolumeDataset(cfg)
+        # Z: stride=4 → 15 positions; Y,X: stride=8 → 8 positions each
+        assert len(ds) == 15 * 8 * 8
+
+    # ── Isotropic + sequential sampling ──────────────────────────────────────
+
+    def test_sequential_isotropic_grid_size(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: grid is built in isotropic space, giving more positions."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        # Anisotropic volume: 20×100×100 storage, voxel [5,1,1]
+        # Isotropic space: 100×100×100 at 1-unit resolution
+        # iso_read_shape = ceil([10,10,10]*[1/5,1,1]) = [2,10,10]
+        # min_center=[1,5,5], max_center=[19,95,95]
+        # iso_min=[5,5,5], iso_max=[95,95,95], iso_stride=[10,10,10]
+        # positions per axis: [5,15,25,...,95] = 10
+        assert len(ds) == 10 ** 3
+
+    def test_sequential_isotropic_coordinates(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: meta has both coordinate and isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert "isotropic_coordinate" in sample["meta"]
+        assert "coordinate" in sample["meta"]
+        # First position: iso=[5,5,5], storage=[1,5,5]
+        assert sample["meta"]["isotropic_coordinate"] == [5, 5, 5]
+        assert sample["meta"]["coordinate"] == [1, 5, 5]
+
+    def test_sequential_isotropic_output_shape(self, zarr2_volume_anisotropic: Path):
+        """Isotropic sequential: output tensor matches patch_size (after interpolation)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            sampling="sequential",
+            isotropic=True,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert sample["img"].shape == (1, 10, 10, 10)
+
+    def test_random_isotropic_has_isotropic_coordinate(self, zarr2_volume_anisotropic: Path):
+        """Random + isotropic: meta includes isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
+                       "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[10, 10, 10],
+            isotropic=True,
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert "isotropic_coordinate" in sample["meta"]
+        iso = sample["meta"]["isotropic_coordinate"]
+        storage = sample["meta"]["coordinate"]
+        # Z axis has zoom=5, Y and X have zoom=1
+        assert iso[0] == storage[0] * 5.0
+        assert iso[1] == float(storage[1])
+        assert iso[2] == float(storage[2])
+
+    def test_non_isotropic_no_isotropic_coordinate(self, zarr2_volume: Path):
+        """Non-isotropic mode: meta does not contain isotropic_coordinate."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        assert "isotropic_coordinate" not in ds[0]["meta"]
+
+    def test_sequential_isotropic_on_isotropic_volume(self, zarr2_volume: Path):
+        """When volume is already isotropic, iso grid size matches non-iso grid size."""
+        base = dict(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+        ds_no_iso = VolumeDataset(MiaoConfig(**base))
+        ds_iso = VolumeDataset(MiaoConfig(**base, isotropic=True))
+        # Zoom factors are [1,1,1] on isotropic volume → same grid
+        assert len(ds_no_iso) == len(ds_iso)
