@@ -5,9 +5,9 @@ volumes:
     zarr_version: "zarr2"
     scales: [0, 1, 2]
     label_key: "labels/agglom_seg"
-    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (in voxels in storage axes order)
+    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]
     weight: 0.5
-    normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
+    normalize: true
 
   - name: "H01 Human Cortex"
     path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
@@ -16,12 +16,12 @@ volumes:
     scales: [0, 1, 2]
     weight: 0.5
     label_key: "labels/c3_seg"
-    normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
+    normalize: true
 
 n_scales: 3
-output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
+output_axes: "lcxyz"
 patch_size: [128, 128, 32]
-bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
+bbox_mode: "relative"
 samples_per_epoch: 1000
 cache_bytes: 1073741824
 isotropic: true
