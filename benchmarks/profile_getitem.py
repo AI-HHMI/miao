@@ -719,14 +719,37 @@ def save_dataloader_csv(dl_results: dict[int, dict], path: str, batch_size: int)
             ])
 
 
+def save_batch_sweep_csv(bs_results: dict[int, dict], path: str, num_workers: int) -> None:
+    """Save batch size sweep results to CSV."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "batch_size", "num_workers",
+            "mean_ms", "median_ms", "p95_ms",
+            "samples_per_sec", "n_batches",
+        ])
+        for bs in sorted(bs_results.keys()):
+            stats = bs_results[bs]
+            writer.writerow([
+                bs, num_workers,
+                f"{stats['mean_ms']:.2f}",
+                f"{stats['median_ms']:.2f}",
+                f"{stats['p95_ms']:.2f}",
+                f"{stats['samples_per_sec']:.2f}",
+                stats["n_batches"],
+            ])
+
+
 def save_metadata_json(path: str, config: MiaoConfig, startup_ms: float,
-                       num_samples: int, label: str) -> None:
+                       num_samples: int, label: str,
+                       batch_sweep: bool = False) -> None:
     """Save run metadata (config, startup cost) as JSON for the report generator."""
     meta = {
         "label": label,
         "timestamp": datetime.now().isoformat(),
         "num_samples": num_samples,
         "startup_ms": startup_ms,
+        "batch_sweep": batch_sweep,
         "config": {
             "volumes": [v.name for v in config.volumes],
             "patch_size": config.patch_size,
@@ -776,6 +799,21 @@ def main():
         help="Run profiling twice: cold cache (fresh dataset) then warm cache "
              "(populated TensorStore cache). Saves results_{label}_cold.csv and "
              "results_{label}_warm.csv"
+    )
+    parser.add_argument(
+        "--batch_sweep", action="store_true",
+        help="Sweep batch sizes instead of worker counts. Measures DataLoader "
+             "throughput at each batch size with a fixed worker count. "
+             "Saves results_{label}_batch_sweep.csv"
+    )
+    parser.add_argument(
+        "--batch_sizes", default="1,2,4,8,16",
+        help="Comma-separated batch sizes for batch sweep (default: '1,2,4,8,16')"
+    )
+    parser.add_argument(
+        "--batch_sweep_workers", default="4",
+        help="Comma-separated worker counts for batch sweep (default: '4'). "
+             "Each worker count produces a separate latency curve."
     )
     args = parser.parse_args()
 
@@ -879,8 +917,60 @@ def main():
     save_dataloader_csv(dl_results, str(dl_csv), args.batch_size)
     print(f"DataLoader throughput saved to: {dl_csv}")
 
+    # === Batch size sweep (optional) ===
+    if args.batch_sweep:
+        batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
+        sweep_workers = [int(w) for w in args.batch_sweep_workers.split(",")]
+        bs_csv = output_dir / f"results_{label}_batch_sweep.csv"
+
+        # Collect results for all (worker_count, batch_size) combinations
+        all_bs_results: dict[int, dict[int, dict]] = {}  # nw -> bs -> stats
+        for nw in sweep_workers:
+            print(f"\n{'=' * 60}")
+            print(f"Batch Size Sweep (num_workers={nw})")
+            print(f"{'=' * 60}")
+            print(f"{'Batch Size':<12s} {'Mean':>10s} {'Median':>10s} {'P95':>10s} {'Samp/sec':>12s}")
+            print(f"{'-' * 12} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 12}")
+
+            all_bs_results[nw] = {}
+            for bs in batch_sizes:
+                stats = benchmark_dataloader_throughput(
+                    dataset, args.num_samples, nw, batch_size=bs
+                )
+                all_bs_results[nw][bs] = stats
+                print(
+                    f"{bs:<12d} "
+                    f"{stats['mean_ms']:>9.1f}ms "
+                    f"{stats['median_ms']:>9.1f}ms "
+                    f"{stats['p95_ms']:>9.1f}ms "
+                    f"{stats['samples_per_sec']:>11.1f}"
+                )
+            print()
+
+        # Save all results to a single CSV
+        with open(str(bs_csv), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "batch_size", "num_workers",
+                "mean_ms", "median_ms", "p95_ms",
+                "samples_per_sec", "n_batches",
+            ])
+            for nw in sorted(all_bs_results.keys()):
+                for bs in sorted(all_bs_results[nw].keys()):
+                    stats = all_bs_results[nw][bs]
+                    writer.writerow([
+                        bs, nw,
+                        f"{stats['mean_ms']:.2f}",
+                        f"{stats['median_ms']:.2f}",
+                        f"{stats['p95_ms']:.2f}",
+                        f"{stats['samples_per_sec']:.2f}",
+                        stats["n_batches"],
+                    ])
+        print(f"Batch size sweep saved to: {bs_csv}")
+
     # Save run metadata
-    save_metadata_json(str(meta_json), config, startup_ms, args.num_samples, label)
+    save_metadata_json(str(meta_json), config, startup_ms, args.num_samples, label,
+                       batch_sweep=args.batch_sweep)
     print(f"Run metadata saved to: {meta_json}")
 
     # Hint for report generation

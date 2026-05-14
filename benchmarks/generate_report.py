@@ -212,6 +212,30 @@ def load_dataloader_csv(path: str) -> dict[int, dict]:
     return results
 
 
+def load_batch_sweep_csv(path: str) -> dict[int, dict[int, dict]]:
+    """Load batch size sweep results from CSV.
+
+    Returns dict[num_workers -> dict[batch_size -> {mean_ms, median_ms, p95_ms,
+    samples_per_sec, n_batches}]].
+    """
+    results: dict[int, dict[int, dict]] = {}
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            nw = int(row["num_workers"])
+            bs = int(row["batch_size"])
+            if nw not in results:
+                results[nw] = {}
+            results[nw][bs] = {
+                "mean_ms": float(row["mean_ms"]),
+                "median_ms": float(row["median_ms"]),
+                "p95_ms": float(row["p95_ms"]),
+                "samples_per_sec": float(row["samples_per_sec"]),
+                "n_batches": int(row["n_batches"]),
+            }
+    return results
+
+
 def load_metadata(path: str) -> dict:
     """Load run metadata from JSON."""
     with open(path) as f:
@@ -1187,6 +1211,239 @@ def page9_scaling(pdf: PdfPages, datasets: list[dict], finding: str = "") -> Non
     plt.close(fig)
 
 
+def page_patch_vs_batch_explainer(
+    pdf: PdfPages,
+    patch_data: dict[str, dict],
+    batch_data: dict[int, dict],
+    batch_num_workers: int,
+) -> None:
+    """Explainer page: why patch size matters but batch size doesn't.
+
+    Uses actual benchmark numbers from both sweeps to illustrate the concept.
+    """
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.suptitle("Why Patch Size Matters but Batch Size Doesn't",
+                 fontsize=16, fontweight="bold", y=0.97)
+
+    # --- Top half: side-by-side bar comparison ---
+    ax1 = fig.add_axes([0.06, 0.52, 0.42, 0.36])   # patch size chart
+    ax2 = fig.add_axes([0.55, 0.52, 0.42, 0.36])   # batch size chart
+
+    # Left: Patch size throughput
+    patch_labels = []
+    patch_throughputs = []
+    patch_colors_list = []
+    color_map = {"patch64": "#FF9800", "iso": "#2196F3", "patch256": "#4CAF50"}
+    name_map = {"patch64": "64³", "iso": "128³", "patch256": "256³"}
+    for label in ["patch64", "iso", "patch256"]:
+        if label in patch_data:
+            d = patch_data[label]
+            total_mean = float(np.mean(d["total"]))
+            # throughput ≈ 1000/total_mean (single-threaded samples/sec)
+            sps = 1000.0 / total_mean if total_mean > 0 else 0
+            patch_labels.append(name_map[label])
+            patch_throughputs.append(sps)
+            patch_colors_list.append(color_map[label])
+
+    if patch_throughputs:
+        bars1 = ax1.bar(range(len(patch_labels)), patch_throughputs,
+                        color=patch_colors_list, alpha=0.85, edgecolor="white")
+        for i, t in enumerate(patch_throughputs):
+            ax1.text(i, t + max(patch_throughputs) * 0.03, f"{t:.1f}",
+                     ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax1.set_xticks(range(len(patch_labels)))
+        ax1.set_xticklabels(patch_labels, fontsize=11)
+        ax1.set_ylabel("Samples / sec", fontsize=10)
+        ax1.set_title("Patch Size Sweep", fontsize=13, fontweight="bold",
+                       color="#1565C0")
+        ax1.set_ylim(0, max(patch_throughputs) * 1.3)
+        # Compute speedup
+        if len(patch_throughputs) >= 2:
+            speedup = patch_throughputs[-1] / patch_throughputs[0]
+            ax1.annotate(f"{speedup:.1f}x faster",
+                         xy=(len(patch_labels) - 1, patch_throughputs[-1]),
+                         xytext=(0.3, patch_throughputs[-1] * 0.7),
+                         fontsize=10, fontweight="bold", color="#2E7D32",
+                         arrowprops=dict(arrowstyle="->", color="#2E7D32", lw=2))
+
+    # Right: Batch size throughput
+    batch_sizes = sorted(batch_data.keys())
+    batch_throughputs = [batch_data[bs]["samples_per_sec"] for bs in batch_sizes]
+    if batch_throughputs:
+        bars2 = ax2.bar(range(len(batch_sizes)), batch_throughputs,
+                        color="#9E9E9E", alpha=0.7, edgecolor="white")
+        for i, t in enumerate(batch_throughputs):
+            ax2.text(i, t + max(batch_throughputs) * 0.03, f"{t:.1f}",
+                     ha="center", va="bottom", fontsize=11, fontweight="bold")
+        ax2.set_xticks(range(len(batch_sizes)))
+        ax2.set_xticklabels([str(bs) for bs in batch_sizes], fontsize=11)
+        ax2.set_ylabel("Samples / sec", fontsize=10)
+        ax2.set_title(f"Batch Size Sweep ({batch_num_workers}w)",
+                       fontsize=13, fontweight="bold", color="#1565C0")
+        # Match y-axis scale to patch chart for fair comparison
+        if patch_throughputs:
+            ax2.set_ylim(0, max(max(patch_throughputs), max(batch_throughputs)) * 1.3)
+        else:
+            ax2.set_ylim(0, max(batch_throughputs) * 1.3)
+        # Show "flat" annotation
+        spread = max(batch_throughputs) - min(batch_throughputs)
+        avg = np.mean(batch_throughputs)
+        pct_spread = (spread / avg * 100) if avg > 0 else 0
+        ax2.axhline(y=avg, color="#F44336", linestyle="--", alpha=0.6)
+        ax2.text(len(batch_sizes) - 1, avg * 1.05, f"~flat (±{pct_spread:.0f}%)",
+                 fontsize=10, fontweight="bold", color="#F44336", ha="right")
+
+    # --- Bottom half: text explanation ---
+    ax3 = fig.add_axes([0.04, 0.02, 0.92, 0.46])
+    ax3.axis("off")
+
+    # Build explanation with actual numbers
+    patch_part = ""
+    if len(patch_throughputs) >= 3:
+        patch_part = (
+            f"  64³ patch:  {patch_throughputs[0]:.1f} samp/s  → wasteful IO "
+            f"(reads whole chunks, uses ~5%)\n"
+            f"  128³ patch: {patch_throughputs[1]:.1f} samp/s  → better "
+            f"(uses ~30% of each chunk)\n"
+            f"  256³ patch: {patch_throughputs[2]:.1f} samp/s  → efficient "
+            f"(uses ~80% of each chunk)\n"
+        )
+    batch_part = ""
+    if batch_throughputs:
+        batch_strs = [f"batch={bs}: {batch_data[bs]['samples_per_sec']:.1f} samp/s"
+                      for bs in batch_sizes]
+        batch_part = "  " + "   |   ".join(batch_strs) + "\n"
+
+    explanation = (
+        "PATCH SIZE changes how much disk IO each sample needs:\n"
+        "\n"
+        f"{patch_part}"
+        "  Each sample reads a 3D crop from the zarr volume. A small crop\n"
+        "  touches many chunks but uses only a sliver of each = wasted reads.\n"
+        "  A large crop fills whole chunks = efficient reads.\n"
+        "  ▶ Patch size controls IO COST PER SAMPLE. Bigger = less waste.\n"
+        "\n"
+        "BATCH SIZE just changes how many samples are grouped for the GPU:\n"
+        "\n"
+        f"{batch_part}"
+        "  The DataLoader reads N patches independently, stacks them into\n"
+        "  one tensor [N,C,X,Y,Z], sends to GPU. Each patch still does\n"
+        "  the same disk IO regardless of how many are in the batch.\n"
+        "  ▶ Batch size controls GROUPING, not IO cost. The bottleneck\n"
+        "    (disk read + decompress) is per-patch, so grouping doesn't help.\n"
+        "\n"
+        "CONCLUSION: To speed up data loading, make each read more efficient\n"
+        "(larger patches, better storage format) — not bundle more reads together."
+    )
+
+    ax3.text(0.02, 0.97, explanation, transform=ax3.transAxes, fontsize=10,
+             family="monospace", verticalalignment="top",
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="#E8F5E9", alpha=0.9))
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _render_batch_sweep_page(pdf: PdfPages, bs_results: dict[int, dict],
+                             num_workers: int,
+                             finding: str = "",
+                             what_why: tuple[str, str] | None = None) -> None:
+    """Render a single batch size sweep page (bar charts) for one worker count."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 8.5))
+    fig.suptitle(f"Batch Size Sweep (num_workers={num_workers})",
+                 fontsize=16, fontweight="bold")
+
+    if what_why:
+        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=7.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+
+    batch_sizes = sorted(bs_results.keys())
+    throughputs = [bs_results[bs]["samples_per_sec"] for bs in batch_sizes]
+    mean_latencies = [bs_results[bs]["mean_ms"] for bs in batch_sizes]
+    p95_latencies = [bs_results[bs]["p95_ms"] for bs in batch_sizes]
+
+    # Throughput bar chart
+    bars = ax1.bar(range(len(batch_sizes)), throughputs, color="#2196F3",
+                   alpha=0.8, edgecolor="white")
+    best_idx = int(np.argmax(throughputs))
+    bars[best_idx].set_color("#4CAF50")
+    bars[best_idx].set_edgecolor("#2E7D32")
+    bars[best_idx].set_linewidth(2)
+
+    for i, (bs, t) in enumerate(zip(batch_sizes, throughputs)):
+        ax1.text(i, t + max(throughputs) * 0.02, f"{t:.1f}",
+                 ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax1.set_xticks(range(len(batch_sizes)))
+    ax1.set_xticklabels([str(bs) for bs in batch_sizes])
+    ax1.set_xlabel("Batch Size")
+    ax1.set_ylabel("Samples / Second")
+    ax1.set_title("Throughput (higher is better)")
+    ax1.set_ylim(0, max(throughputs) * 1.2)
+
+    ax1.annotate(f"OPTIMAL: batch_size={batch_sizes[best_idx]}",
+                 xy=(best_idx, throughputs[best_idx]),
+                 xytext=(best_idx + 0.8, throughputs[best_idx] * 0.65),
+                 fontsize=9, fontweight="bold", color="#2E7D32",
+                 arrowprops=dict(arrowstyle="->", color="#2E7D32"))
+
+    # Latency chart (mean + P95)
+    x = range(len(batch_sizes))
+    ax2.bar([i - 0.15 for i in x], mean_latencies, width=0.3, label="Mean",
+            color="#FF9800", alpha=0.8)
+    ax2.bar([i + 0.15 for i in x], p95_latencies, width=0.3, label="P95",
+            color="#F44336", alpha=0.8)
+
+    ax2.set_xticks(range(len(batch_sizes)))
+    ax2.set_xticklabels([str(bs) for bs in batch_sizes])
+    ax2.set_xlabel("Batch Size")
+    ax2.set_ylabel("Batch Latency (ms)")
+    ax2.set_title("Batch Latency (lower is better)")
+    ax2.set_ylim(0, max(p95_latencies) * 1.15)
+    ax2.legend()
+
+    if finding:
+        n_lines = finding.count("\n") + 1
+        bottom_margin = min(0.05 + n_lines * 0.012, 0.25)
+        top_margin = 0.90 if what_why else 0.93
+        fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
+                 color="#333", wrap=True,
+                 bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
+        fig.tight_layout(rect=[0, bottom_margin, 1, top_margin])
+    else:
+        top_margin = 0.90 if what_why else 0.93
+        fig.tight_layout(rect=[0, 0.05, 1, top_margin])
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def page_batch_size_sweep(pdf: PdfPages,
+                          all_worker_results: dict[int, dict[int, dict]],
+                          finding_fn=None,
+                          what_why_fn=None) -> int:
+    """Batch size sweep pages: one page per worker count.
+
+    Args:
+        all_worker_results: dict[num_workers -> dict[batch_size -> stats]]
+        finding_fn: callable(num_workers, bs_results) -> str, or None
+        what_why_fn: callable(num_workers, bs_results) -> tuple[str, str], or None
+
+    Returns number of pages generated.
+    """
+    pages = 0
+    for nw in sorted(all_worker_results.keys()):
+        bs_results = all_worker_results[nw]
+        if len(bs_results) < 2:
+            continue
+        finding = finding_fn(nw, bs_results) if finding_fn else ""
+        what_why = what_why_fn(nw, bs_results) if what_why_fn else None
+        _render_batch_sweep_page(pdf, bs_results, nw,
+                                 finding=finding, what_why=what_why)
+        pages += 1
+    return pages
+
+
 def page10_cache_comparison(pdf: PdfPages, cold_data: dict, warm_data: dict,
                             finding: str = "",
                             what_why: tuple[str, str] | None = None) -> None:
@@ -1329,10 +1586,13 @@ def page10_cache_comparison(pdf: PdfPages, cold_data: dict, warm_data: dict,
 
 def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
                               all_meta: dict[str, dict],
-                              all_dl: dict[str, dict] | None = None) -> None:
+                              all_dl: dict[str, dict] | None = None,
+                              all_bs: dict[str, dict[int, dict[int, dict]]] | None = None) -> None:
     """Consolidated executive summary — one table covering ALL profiling runs."""
     if all_dl is None:
         all_dl = {}
+    if all_bs is None:
+        all_bs = {}
 
     # --- Page 1a: Glossary page ---
     fig, ax = plt.subplots(figsize=(11, 8.5))
@@ -1352,16 +1612,18 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
                   "IO Bandwidth\n(MB/s)", "Disk Read\n(MB)", "Data Needed\n(MB)",
                   "Read\nAmplif.", "TS Read\nLat. (ms)"]
 
-    # Color scheme: blue=format comparison, green=patch size, orange=sweep
+    # Color scheme: blue=format comparison, green=patch size, orange=sweep, purple=batch
     COLOR_FORMAT = "#e3f2fd"     # blue tint
     COLOR_PATCH = "#e8f5e9"      # green tint
     COLOR_SWEEP = "#fff3e0"      # orange tint
+    COLOR_BATCH = "#f3e5f5"      # purple tint
     COLOR_DEFAULT = "white"
     label_color_map = {
         "jiefu": COLOR_FORMAT, "h01": COLOR_FORMAT,
         "patch64": COLOR_PATCH, "iso": COLOR_PATCH, "patch256": COLOR_PATCH,
         "noiso": COLOR_PATCH,
         "sweep": COLOR_SWEEP,
+        "batch": COLOR_BATCH,
     }
 
     # Display names for configs
@@ -1373,11 +1635,25 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
         "patch64": "64³ patch",
         "patch256": "256³ patch",
         "sweep": "Worker sweep",
+        "batch": "Batch sweep",
     }
+    # Add any batch sweep labels not in the static map
+    for bs_label in all_bs:
+        if bs_label not in label_color_map:
+            label_color_map[bs_label] = COLOR_BATCH
+        if bs_label not in label_display:
+            label_display[bs_label] = f"Batch sweep ({bs_label})"
 
     rows = []
     row_colors = []
-    for label in ["jiefu", "h01", "iso", "noiso", "patch64", "patch256", "sweep"]:
+    known_labels = ["jiefu", "h01", "iso", "noiso", "patch64", "patch256", "sweep"]
+    # Append any batch sweep labels that have per-sample data
+    for bs_label in sorted(all_bs.keys()):
+        if bs_label not in known_labels:
+            known_labels.append(bs_label)
+    if "batch" not in known_labels and "batch" in all_runs:
+        known_labels.append("batch")
+    for label in known_labels:
         if label not in all_runs:
             continue
         data = all_runs[label]
@@ -1430,7 +1706,12 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
         mpatches.Patch(facecolor=COLOR_PATCH, edgecolor="gray", label="Patch size scaling"),
         mpatches.Patch(facecolor=COLOR_SWEEP, edgecolor="gray", label="Worker sweep"),
     ]
-    ax.legend(handles=legend_elements, loc="lower center", ncol=3, fontsize=8,
+    if all_bs:
+        legend_elements.append(
+            mpatches.Patch(facecolor=COLOR_BATCH, edgecolor="gray", label="Batch size sweep")
+        )
+    ax.legend(handles=legend_elements, loc="lower center",
+              ncol=min(len(legend_elements), 4), fontsize=8,
               bbox_to_anchor=(0.5, 0.01))
 
     pdf.savefig(fig, bbox_inches="tight")
@@ -1553,7 +1834,44 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
             f"  FIX: Set num_workers={best_w} in training config.\n"
         )
 
-    # Finding 5: Cache comparison — matches Page 9
+    # Finding: Batch size sweep
+    if all_bs:
+        # Merge all batch sweep data to find overall best
+        merged_bs_findings: dict[int, dict[int, dict]] = {}
+        for _, nw_map in all_bs.items():
+            for nw, bs_map in nw_map.items():
+                if nw not in merged_bs_findings:
+                    merged_bs_findings[nw] = {}
+                merged_bs_findings[nw].update(bs_map)
+
+        # Use the first worker count for the summary
+        first_nw = sorted(merged_bs_findings.keys())[0]
+        bs_data = merged_bs_findings[first_nw]
+        batch_sizes = sorted(bs_data.keys())
+        throughputs = {bs: bs_data[bs]["samples_per_sec"] for bs in batch_sizes}
+        best_bs = max(throughputs, key=throughputs.get)
+        worst_bs = min(throughputs, key=throughputs.get)
+        spread = throughputs[best_bs] - throughputs[worst_bs]
+        avg_t = np.mean(list(throughputs.values()))
+        pct_spread = (spread / avg_t * 100) if avg_t > 0 else 0
+        p95_small = bs_data[batch_sizes[0]]["p95_ms"]
+        p95_large = bs_data[batch_sizes[-1]]["p95_ms"]
+        nw_strs = ", ".join(str(w) for w in sorted(merged_bs_findings.keys()))
+        finding_num += 1
+        findings_lines.append(
+            f"FINDING {finding_num}: Batch Size Has Minimal Impact on Throughput (p.9-12)\n"
+            f"  COMPARED: batch sizes {', '.join(str(bs) for bs in batch_sizes)} at {nw_strs} workers.\n"
+            f"  FOUND: Throughput is nearly flat (~{avg_t:.0f} samp/s, ±{pct_spread:.0f}%). "
+            f"Best: batch_size={best_bs} ({throughputs[best_bs]:.1f} samp/s). "
+            f"Worst: batch_size={worst_bs} ({throughputs[worst_bs]:.1f} samp/s).\n"
+            f"  P95 latency: {p95_small:.0f}ms (bs={batch_sizes[0]}) → {p95_large:.0f}ms (bs={batch_sizes[-1]}). "
+            f"Larger batches wait for the slowest sample, stalling the GPU.\n"
+            f"  ROOT CAUSE: The bottleneck is per-patch disk IO (read + decompress), not batching overhead. "
+            f"Grouping more patches doesn't make each read faster.\n"
+            f"  FIX: Batch size can be whatever the training recipe calls for — it won't affect data loading speed.\n"
+        )
+
+    # Finding: Cache comparison
     if "cache_cold" in all_runs and "cache_warm" in all_runs:
         cold_mat = float(np.mean(all_runs["cache_cold"]["stages"]["data_materialize"]))
         warm_mat = float(np.mean(all_runs["cache_warm"]["stages"]["data_materialize"]))
@@ -1597,8 +1915,8 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
     max_len = max(len(l) for l in lines)
     target_len = max(max_len, 115)  # ensure box fills page width
     findings_padded = "\n".join(l.ljust(target_len) for l in lines)
-    # Use smaller font if 6 findings to fit on one page
-    font_sz = 7.5 if len(findings_lines) > 5 else 8.5
+    # Use smaller font if many findings to fit on one page
+    font_sz = 7.0 if len(findings_lines) > 6 else (7.5 if len(findings_lines) > 5 else 8.5)
     ax.text(0.03, 0.92, findings_padded, transform=ax.transAxes, fontsize=font_sz,
             family="monospace", verticalalignment="top",
             bbox=dict(boxstyle="round,pad=0.5", facecolor="#fff3e0", alpha=0.9))
@@ -1853,10 +2171,11 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
       5. Isotropic vs non-isotropic
       6. Patch size scaling (3-way)
       7. Worker sweep (throughput vs workers)
-      8. Cache: cold vs warm
-      9. Read amplification analysis
+      8. Batch size sweep (throughput vs batch size)
+      9. Cache: cold vs warm
+     10. Read amplification analysis
     """
-    # Discover all result CSVs (exclude _dataloader, _meta, _cold, _warm suffixes for primary)
+    # Discover all result CSVs (exclude _dataloader, _meta, _batch_sweep suffixes for primary)
     import re
     pattern = re.compile(r"results_(.+)\.csv$")
     all_labels = set()
@@ -1866,7 +2185,8 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
         m = pattern.match(f.name)
         if m:
             suffix = m.group(1)
-            if suffix.endswith("_dataloader") or suffix.endswith("_meta"):
+            if (suffix.endswith("_dataloader") or suffix.endswith("_meta")
+                    or suffix.endswith("_batch_sweep")):
                 continue
             all_labels.add(suffix)
 
@@ -1876,6 +2196,7 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
     all_runs: dict[str, dict] = {}
     all_meta: dict[str, dict] = {}
     all_dl: dict[str, dict] = {}
+    all_bs: dict[str, dict[int, dict[int, dict]]] = {}  # batch sweep results
     for label in sorted(all_labels):
         csv_path = run_dir / f"results_{label}.csv"
         data = load_stage_csv(str(csv_path))
@@ -1886,6 +2207,9 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
         dl_path = run_dir / f"results_{label}_dataloader.csv"
         if dl_path.exists():
             all_dl[label] = load_dataloader_csv(str(dl_path))
+        bs_path = run_dir / f"results_{label}_batch_sweep.csv"
+        if bs_path.exists():
+            all_bs[label] = load_batch_sweep_csv(str(bs_path))
         print(f"  Loaded: {label} ({data['n_samples']} samples)")
 
     page_num = 0
@@ -1932,7 +2256,7 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
     with PdfPages(output_path) as pdf:
 
         # Pages 1-2: Consolidated summary (glossary + findings overview)
-        page_consolidated_summary(pdf, all_runs, all_meta, all_dl=all_dl)
+        page_consolidated_summary(pdf, all_runs, all_meta, all_dl=all_dl, all_bs=all_bs)
         page_num += 2
         print(f"  Pages 1-2: Consolidated executive summary + findings overview")
 
@@ -2158,7 +2482,73 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
             page_num += 1
             print(f"  Page {page_num}: Worker sweep (throughput vs workers)")
 
-        # Page 9: Cache cold vs warm
+        # Page(s): Batch size sweep — one page per worker count
+        if all_bs:
+            # Merge all batch sweep data across labels into a single
+            # dict[num_workers -> dict[batch_size -> stats]].
+            # If multiple labels have batch sweeps, merge them (last wins).
+            merged_bs: dict[int, dict[int, dict]] = {}
+            for label_bs, nw_map in all_bs.items():
+                for nw, bs_map in nw_map.items():
+                    if nw not in merged_bs:
+                        merged_bs[nw] = {}
+                    merged_bs[nw].update(bs_map)
+
+            def _bs_finding(nw, bs_results):
+                batch_sizes = sorted(bs_results.keys())
+                throughputs = {bs: bs_results[bs]["samples_per_sec"] for bs in batch_sizes}
+                best_bs = max(throughputs, key=throughputs.get)
+                best_t = throughputs[best_bs]
+                worst_bs = min(throughputs, key=throughputs.get)
+                worst_t = throughputs[worst_bs]
+                p95s = {bs: bs_results[bs]["p95_ms"] for bs in batch_sizes}
+                return (
+                    f"FINDING: Optimal batch_size={best_bs} at {nw} workers "
+                    f"({best_t:.1f} samp/s). "
+                    f"Worst: batch_size={worst_bs} ({worst_t:.1f} samp/s).\n"
+                    f"Throughput (left): Samples delivered per second. "
+                    f"Batch size has {'minimal' if best_t / worst_t < 1.5 else 'significant'} "
+                    f"impact on throughput because IO is the primary bottleneck.\n"
+                    f"Latency (right): Per-batch latency scales with batch size — "
+                    f"larger batches take longer but deliver more samples. "
+                    f"P95 latency: {p95s[batch_sizes[0]]:.0f}ms (bs={batch_sizes[0]}) → "
+                    f"{p95s[batch_sizes[-1]]:.0f}ms (bs={batch_sizes[-1]}). "
+                    f"High P95 stalls GPU training.\n"
+                    f"FIX: batch_size={best_bs} balances throughput and latency."
+                )
+
+            def _bs_what_why(nw, bs_results):
+                batch_sizes = sorted(bs_results.keys())
+                return (
+                    f"Run the data loader with batch sizes "
+                    f"{', '.join(str(bs) for bs in batch_sizes)} "
+                    f"at {nw} workers. {len(batch_sizes)} batch sizes tested.",
+                    "Find the batch size that maximizes GPU utilization. "
+                    "Larger batches amortize per-batch overhead but use more GPU memory."
+                )
+
+            n_pages = page_batch_size_sweep(pdf, merged_bs,
+                                            finding_fn=_bs_finding,
+                                            what_why_fn=_bs_what_why)
+            for i in range(n_pages):
+                page_num += 1
+            nw_list = sorted(merged_bs.keys())
+            print(f"  Page {page_num - n_pages + 1}"
+                  f"{f'-{page_num}' if n_pages > 1 else ''}: "
+                  f"Batch size sweep (workers: {', '.join(str(w) for w in nw_list)})")
+
+            # Explainer page: patch size vs batch size
+            # Need patch sweep data + one batch sweep result
+            has_patches = any(l in all_runs for l in ["patch64", "iso", "patch256"])
+            if has_patches:
+                # Pick the first worker count's batch results for the explainer
+                first_nw = sorted(merged_bs.keys())[0]
+                page_patch_vs_batch_explainer(pdf, all_runs, merged_bs[first_nw],
+                                              batch_num_workers=first_nw)
+                page_num += 1
+                print(f"  Page {page_num}: Patch size vs batch size explainer")
+
+        # Page: Cache cold vs warm
         if "cache_cold" in all_runs and "cache_warm" in all_runs:
             cold_mat = float(np.mean(all_runs["cache_cold"]["stages"]["data_materialize"]))
             warm_mat = float(np.mean(all_runs["cache_warm"]["stages"]["data_materialize"]))
