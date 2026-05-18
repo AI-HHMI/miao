@@ -1,0 +1,21 @@
+{
+  "label": "sweep_zarr3_shard512_chunk64",
+  "timestamp": "2026-05-18T10:42:14.355489",
+  "num_samples": 100,
+  "startup_ms": 1.1412715539336205,
+  "batch_sweep": false,
+  "config": {
+    "volumes": [
+      "zarr3-shard512-chunk64"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

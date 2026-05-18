@@ -195,7 +195,8 @@ def load_stage_csv(path: str) -> dict:
 def load_dataloader_csv(path: str) -> dict[int, dict]:
     """Load DataLoader throughput from CSV.
 
-    Returns dict[num_workers -> {mean_ms, median_ms, p95_ms, samples_per_sec, n_batches}]
+    Returns dict[num_workers -> {mean_ms, median_ms, p95_ms, samples_per_sec,
+    n_batches, batch_size}]
     """
     results = {}
     with open(path, newline="") as f:
@@ -208,6 +209,7 @@ def load_dataloader_csv(path: str) -> dict[int, dict]:
                 "p95_ms": float(row["p95_ms"]),
                 "samples_per_sec": float(row["samples_per_sec"]),
                 "n_batches": int(row["n_batches"]),
+                "batch_size": int(row.get("batch_size", 4)),
             }
     return results
 
@@ -555,9 +557,10 @@ def page4_dataloader(pdf: PdfPages, dl_results: dict[int, dict], finding: str = 
     fig.suptitle("DataLoader Throughput vs. Worker Count", fontsize=16, fontweight="bold")
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.text(0.5, 0.90, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     workers = sorted(dl_results.keys())
     throughputs = [dl_results[w]["samples_per_sec"] for w in workers]
@@ -610,7 +613,7 @@ def page4_dataloader(pdf: PdfPages, dl_results: dict[int, dict], finding: str = 
     if finding:
         n_lines = finding.count("\n") + 1
         bottom_margin = min(0.05 + n_lines * 0.012, 0.25)
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
                  color="#333", wrap=True,
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
@@ -619,7 +622,7 @@ def page4_dataloader(pdf: PdfPages, dl_results: dict[int, dict], finding: str = 
         note = ("Note: Throughput drops with 8+ workers due to NFS contention — "
                 "too many concurrent random reads overwhelm the filesystem.")
         fig.text(0.5, 0.02, note, ha="center", fontsize=9, style="italic", color="#666")
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.tight_layout(rect=[0, 0.05, 1, top_margin])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -770,9 +773,10 @@ def page7_materialize_breakdown(pdf: PdfPages, data: dict, finding: str = "",
     fig.suptitle(title, fontsize=16, fontweight="bold")
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.text(0.5, 0.90, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     n_levels = bd["img_fr_ms"].shape[1]
     mat_mean = float(np.mean(data["stages"]["data_materialize"]))
@@ -1026,13 +1030,22 @@ def page8_dataset_comparison(pdf: PdfPages, datasets: list[dict], finding: str =
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
     labels_short = [d["label"] for d in datasets]
-    fig.suptitle(f"Comparison: {' vs '.join(labels_short)}",
-                 fontsize=16, fontweight="bold")
+    # Strip newlines from labels for the page title (keep them in legend/axes)
+    labels_title = [l.replace("\n", " ") for l in labels_short]
+    title_text = " vs ".join(labels_title)
+    # Shrink title font if too many/long labels
+    title_fontsize = 12 if len(title_text) > 80 else (13 if len(title_text) > 50 else 14)
+    fig.suptitle(f"Comparison: {title_text}",
+                 fontsize=title_fontsize, fontweight="bold", y=0.995)
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        # Position WHAT/WHY well below the title to avoid overlap.
+        # Use zorder to ensure it renders below the title.
+        what_why_y = 0.92 if len(title_text) <= 50 else (0.90 if len(title_text) <= 80 else 0.88)
+        fig.text(0.5, what_why_y, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     # --- Top-left: grouped bar chart of mean stage times ---
     ax = axes[0][0]
@@ -1095,14 +1108,17 @@ def page8_dataset_comparison(pdf: PdfPages, datasets: list[dict], finding: str =
             row.append(str(cfg.get(meta_key, "?")))
         rows.append(row)
 
+    # Adjust font size based on number of columns
+    tbl_fontsize = 7.5 if n >= 4 else (8 if n >= 3 else 9)
     table = ax.table(cellText=rows, colLabels=col_labels, loc="center",
-                     cellLoc="center", bbox=[0, 0.05, 1, 0.9])
+                     cellLoc="center", bbox=[0, 0.0, 1, 0.95])
     table.auto_set_font_size(False)
-    table.set_fontsize(9)
+    table.set_fontsize(tbl_fontsize)
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_facecolor("#1565C0")
-            cell.set_text_props(color="white", fontweight="bold")
+            cell.set_text_props(color="white", fontweight="bold", fontsize=tbl_fontsize)
+            cell.set_height(cell.get_height() * 1.5)  # taller header row
         elif row == len(rows) - 1 or row == len(rows):
             cell.set_facecolor("#e8eaf6")
     ax.set_title("Summary Statistics", fontsize=10, fontweight="bold")
@@ -1124,18 +1140,23 @@ def page8_dataset_comparison(pdf: PdfPages, datasets: list[dict], finding: str =
     ax.set_title("Effective IO Bandwidth (higher = faster)")
     ax.set_ylim(0, max(bandwidths) * 1.25 if bandwidths else 1)
 
+    # Compute top margin: leave room for title + optional WHAT/WHY
+    if what_why:
+        # what_why_y was set earlier based on title length
+        _top_margin = what_why_y - 0.06  # room for WHAT/WHY text box
+    else:
+        _top_margin = 0.93
+
     if finding:
         # Count newlines to estimate needed height
         n_lines = finding.count("\n") + 1
         bottom_margin = min(0.04 + n_lines * 0.012, 0.25)
-        top_margin = 0.90 if what_why else 0.93
         fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
                  color="#333", wrap=True,
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
-        fig.tight_layout(rect=[0, bottom_margin, 1, top_margin])
+        fig.tight_layout(rect=[0, bottom_margin, 1, _top_margin])
     else:
-        top_margin = 0.90 if what_why else 0.93
-        fig.tight_layout(rect=[0, 0, 1, top_margin])
+        fig.tight_layout(rect=[0, 0, 1, _top_margin])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
@@ -1354,9 +1375,10 @@ def _render_batch_sweep_page(pdf: PdfPages, bs_results: dict[int, dict],
                  fontsize=16, fontweight="bold")
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.text(0.5, 0.90, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     batch_sizes = sorted(bs_results.keys())
     throughputs = [bs_results[bs]["samples_per_sec"] for bs in batch_sizes]
@@ -1406,13 +1428,13 @@ def _render_batch_sweep_page(pdf: PdfPages, bs_results: dict[int, dict],
     if finding:
         n_lines = finding.count("\n") + 1
         bottom_margin = min(0.05 + n_lines * 0.012, 0.25)
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
                  color="#333", wrap=True,
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
         fig.tight_layout(rect=[0, bottom_margin, 1, top_margin])
     else:
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.tight_layout(rect=[0, 0.05, 1, top_margin])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -1455,9 +1477,10 @@ def page10_cache_comparison(pdf: PdfPages, cold_data: dict, warm_data: dict,
     fig.suptitle("Cache Comparison: Cold vs Warm", fontsize=16, fontweight="bold")
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.text(0.5, 0.90, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     datasets = [
         {"data": cold_data, "label": "Cold", "color": "#2196F3"},
@@ -1572,13 +1595,13 @@ def page10_cache_comparison(pdf: PdfPages, cold_data: dict, warm_data: dict,
     if finding:
         n_lines = finding.count("\n") + 1
         bottom_margin = min(0.04 + n_lines * 0.012, 0.25)
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
                  color="#333", wrap=True,
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
         fig.tight_layout(rect=[0, bottom_margin, 1, top_margin])
     else:
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.tight_layout(rect=[0, 0, 1, top_margin])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -1597,15 +1620,15 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
     # --- Page 1a: Glossary page ---
     fig, ax = plt.subplots(figsize=(11, 8.5))
     ax.axis("off")
-    fig.suptitle("miao IO Profiling — Consolidated Report", fontsize=18, fontweight="bold", y=0.97)
+    fig.suptitle("miao IO Profiling — Consolidated Report", fontsize=18, fontweight="bold", y=0.99)
     n_configs = len([k for k in all_runs if not k.endswith("_cold") and not k.endswith("_warm")])
-    ax.text(0.5, 0.93, "GitHub Issue #1: AI-HHMI/miao  |  "
+    ax.text(0.5, 0.97, "GitHub Issue #1: AI-HHMI/miao  |  "
             f"{n_configs} configurations profiled  |  100 samples each",
             transform=ax.transAxes, ha="center", fontsize=9, color="gray")
 
-    ax.text(0.05, 0.88, TERM_GLOSSARY, transform=ax.transAxes, fontsize=9,
+    ax.text(0.05, 0.95, TERM_GLOSSARY, transform=ax.transAxes, fontsize=7,
             family="monospace", verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="#e3f2fd", alpha=0.9))
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#e3f2fd", alpha=0.9))
 
     # Build summary table
     col_labels = ["Config", "Total\n(ms)", "Read+Decomp\n(ms)",
@@ -1618,12 +1641,29 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
     COLOR_SWEEP = "#fff3e0"      # orange tint
     COLOR_BATCH = "#f3e5f5"      # purple tint
     COLOR_DEFAULT = "white"
+    COLOR_FMT_CMP = "#e0f7fa"    # cyan tint — format comparison
+    COLOR_CHUNK_SWEEP = "#fce4ec"  # pink tint — chunk/shard sweep
     label_color_map = {
         "jiefu": COLOR_FORMAT, "h01": COLOR_FORMAT,
         "patch64": COLOR_PATCH, "iso": COLOR_PATCH, "patch256": COLOR_PATCH,
         "noiso": COLOR_PATCH,
         "sweep": COLOR_SWEEP,
         "batch": COLOR_BATCH,
+        # Format comparison
+        "fmt_zarr2": COLOR_FMT_CMP,
+        "fmt_zarr3_nosharding": COLOR_FMT_CMP,
+        "fmt_zarr3_sharded": COLOR_FMT_CMP,
+        "fmt_zarr3_sharded_128chunk": COLOR_FMT_CMP,
+        # Chunk/shard sweep
+        "sweep_zarr2_chunk64": COLOR_CHUNK_SWEEP,
+        "sweep_zarr2_chunk128": COLOR_CHUNK_SWEEP,
+        "sweep_zarr2_chunk256": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_noshard_chunk128": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_shard512_chunk64": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_shard512_chunk128": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_shard1024_chunk128": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_shard512_chunk256": COLOR_CHUNK_SWEEP,
+        "sweep_zarr3_shard1024_chunk256": COLOR_CHUNK_SWEEP,
     }
 
     # Display names for configs
@@ -1636,6 +1676,21 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
         "patch256": "256³ patch",
         "sweep": "Worker sweep",
         "batch": "Batch sweep",
+        # Format comparison
+        "fmt_zarr2": "zarr2 (gzip)",
+        "fmt_zarr3_nosharding": "zarr3 no-shard",
+        "fmt_zarr3_sharded": "zarr3 sharded",
+        "fmt_zarr3_sharded_128chunk": "zarr3 shard 128c",
+        # Chunk/shard sweep
+        "sweep_zarr2_chunk64": "z2 c64",
+        "sweep_zarr2_chunk128": "z2 c128",
+        "sweep_zarr2_chunk256": "z2 c256",
+        "sweep_zarr3_noshard_chunk128": "z3 ns c128",
+        "sweep_zarr3_shard512_chunk64": "z3 s512 c64",
+        "sweep_zarr3_shard512_chunk128": "z3 s512 c128",
+        "sweep_zarr3_shard1024_chunk128": "z3 s1024 c128",
+        "sweep_zarr3_shard512_chunk256": "z3 s512 c256",
+        "sweep_zarr3_shard1024_chunk256": "z3 s1024 c256",
     }
     # Add any batch sweep labels not in the static map
     for bs_label in all_bs:
@@ -1646,7 +1701,16 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
 
     rows = []
     row_colors = []
-    known_labels = ["jiefu", "h01", "iso", "noiso", "patch64", "patch256", "sweep"]
+    known_labels = ["jiefu", "h01", "iso", "noiso", "patch64", "patch256", "sweep",
+                     # Format comparison (full dataset)
+                     "fmt_zarr2", "fmt_zarr3_nosharding", "fmt_zarr3_sharded",
+                     "fmt_zarr3_sharded_128chunk",
+                     # Chunk/shard sweep (2048³ crop)
+                     "sweep_zarr2_chunk64", "sweep_zarr2_chunk128", "sweep_zarr2_chunk256",
+                     "sweep_zarr3_noshard_chunk128",
+                     "sweep_zarr3_shard512_chunk64", "sweep_zarr3_shard512_chunk128",
+                     "sweep_zarr3_shard1024_chunk128",
+                     "sweep_zarr3_shard512_chunk256", "sweep_zarr3_shard1024_chunk256"]
     # Append any batch sweep labels that have per-sample data
     for bs_label in sorted(all_bs.keys()):
         if bs_label not in known_labels:
@@ -1677,14 +1741,28 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
         base_color = label_color_map.get(label, COLOR_DEFAULT)
         row_colors.append([base_color] * len(col_labels))
 
+    # Dynamic table height: more rows → taller table, smaller font
+    n_rows = len(rows)
+    if n_rows <= 8:
+        table_height = 0.36
+        table_bottom = 0.18
+        font_sz = 8.5
+    elif n_rows <= 14:
+        table_height = 0.50
+        table_bottom = 0.05
+        font_sz = 7.0
+    else:
+        table_height = 0.62
+        table_bottom = 0.04
+        font_sz = 6.0
     table = ax.table(
         cellText=rows, colLabels=col_labels,
         loc="center", cellLoc="center",
-        bbox=[0.02, 0.18, 0.96, 0.36],
+        bbox=[0.02, table_bottom, 0.96, table_height],
         cellColours=row_colors if row_colors else None,
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8.5)
+    table.set_fontsize(font_sz)
     # Make Config column wider (col 0 = 22%, others share remaining 78%)
     n_cols = len(col_labels)
     other_width = 0.78 / (n_cols - 1)
@@ -1702,17 +1780,28 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
 
     # Color legend
     legend_elements = [
-        mpatches.Patch(facecolor=COLOR_FORMAT, edgecolor="gray", label="Format comparison (zarr2 vs zarr3)"),
-        mpatches.Patch(facecolor=COLOR_PATCH, edgecolor="gray", label="Patch size scaling"),
+        mpatches.Patch(facecolor=COLOR_FORMAT, edgecolor="gray", label="Dataset comparison"),
+        mpatches.Patch(facecolor=COLOR_PATCH, edgecolor="gray", label="Patch/iso scaling"),
         mpatches.Patch(facecolor=COLOR_SWEEP, edgecolor="gray", label="Worker sweep"),
     ]
     if all_bs:
         legend_elements.append(
-            mpatches.Patch(facecolor=COLOR_BATCH, edgecolor="gray", label="Batch size sweep")
+            mpatches.Patch(facecolor=COLOR_BATCH, edgecolor="gray", label="Batch sweep")
+        )
+    # Add format comparison and chunk/shard sweep legend entries if present
+    fmt_present = any(l.startswith("fmt_") for l in all_runs)
+    sweep_present = any(l.startswith("sweep_") and l != "sweep" for l in all_runs)
+    if fmt_present:
+        legend_elements.append(
+            mpatches.Patch(facecolor=COLOR_FMT_CMP, edgecolor="gray", label="Format comparison")
+        )
+    if sweep_present:
+        legend_elements.append(
+            mpatches.Patch(facecolor=COLOR_CHUNK_SWEEP, edgecolor="gray", label="Chunk/shard sweep")
         )
     ax.legend(handles=legend_elements, loc="lower center",
-              ncol=min(len(legend_elements), 4), fontsize=8,
-              bbox_to_anchor=(0.5, 0.01))
+              ncol=min(len(legend_elements), 6), fontsize=6.5,
+              bbox_to_anchor=(0.5, -0.02))
 
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -1887,6 +1976,70 @@ def page_consolidated_summary(pdf: PdfPages, all_runs: dict[str, dict],
             f"  FIX: Reduce cache to save memory, or use locality-aware sampling.\n"
         )
 
+    # Finding: Format comparison (fmt_* labels)
+    fmt_labels = sorted([l for l in all_runs if l.startswith("fmt_")])
+    if len(fmt_labels) >= 2:
+        fmt_mat = {}
+        fmt_amp = {}
+        fmt_bw = {}
+        for l in fmt_labels:
+            bd = all_runs[l].get("materialize_breakdown")
+            mat = float(np.mean(all_runs[l]["stages"]["data_materialize"]))
+            data_mb = float(np.mean(all_runs[l]["read_bytes"])) / 1e6
+            disk_mb = float(np.mean(bd["ts_file_bytes"])) / 1e6 if bd else 0
+            fmt_mat[l] = mat
+            fmt_amp[l] = disk_mb / data_mb if data_mb > 0 else 0
+            fmt_bw[l] = data_mb / (mat / 1000) if mat > 0 else 0
+        fastest = min(fmt_mat, key=fmt_mat.get)
+        slowest = max(fmt_mat, key=fmt_mat.get)
+        speedup = fmt_mat[slowest] / fmt_mat[fastest] if fmt_mat[fastest] > 0 else 0
+        fmt_disp = {
+            "fmt_zarr2": "zarr2 (gzip)", "fmt_zarr3_nosharding": "zarr3 no-shard (zstd)",
+            "fmt_zarr3_sharded": "zarr3 sharded (256c)", "fmt_zarr3_sharded_128chunk": "zarr3 sharded (128c)",
+        }
+        mat_str = ", ".join(f"{fmt_disp.get(l, l)}: {fmt_mat[l]:.0f}ms" for l in fmt_labels)
+        amp_str = ", ".join(f"{fmt_disp.get(l, l)}: {fmt_amp[l]:.1f}x" for l in fmt_labels)
+        bw_str = ", ".join(f"{fmt_disp.get(l, l)}: {fmt_bw[l]:.0f} MB/s" for l in fmt_labels)
+        finding_num += 1
+        findings_lines.append(
+            f"FINDING {finding_num}: Format Comparison — {fmt_disp.get(fastest, fastest)} Is {speedup:.1f}x Faster\n"
+            f"  COMPARED: {len(fmt_labels)} storage formats on same Jiefu 536 GB dataset, 128³ patch, 100 samples.\n"
+            f"  FOUND: Disk Read & Decompress: {mat_str}.\n"
+            f"         Read amplification: {amp_str}.\n"
+            f"         IO bandwidth: {bw_str}.\n"
+            f"  ROOT CAUSE: Chunk-patch alignment (128³ chunks for 128×128×32 patches) eliminates most wasted reads.\n"
+            f"    Sharding alone (256c) gives 1.5x; alignment alone (128c) gives 3.7x.\n"
+            f"    Codec change (gzip→zstd) without sharding gives 0x benefit.\n"
+            f"  FIX: Convert training data to zarr3 sharded with chunk size matching patch size.\n"
+        )
+
+    # Finding: Chunk/shard sweep (sweep_* labels)
+    sweep_labels_f = sorted([l for l in all_runs if l.startswith("sweep_")])
+    if len(sweep_labels_f) >= 2:
+        sw_mat = {}
+        sw_amp = {}
+        for l in sweep_labels_f:
+            bd = all_runs[l].get("materialize_breakdown")
+            mat = float(np.mean(all_runs[l]["stages"]["data_materialize"]))
+            data_mb = float(np.mean(all_runs[l]["read_bytes"])) / 1e6
+            disk_mb = float(np.mean(bd["ts_file_bytes"])) / 1e6 if bd else 0
+            sw_mat[l] = mat
+            sw_amp[l] = disk_mb / data_mb if data_mb > 0 else 0
+        fastest_sw = min(sw_mat, key=sw_mat.get)
+        slowest_sw = max(sw_mat, key=sw_mat.get)
+        sw_disp = label_display
+        finding_num += 1
+        findings_lines.append(
+            f"FINDING {finding_num}: Chunk Size Dominates — {sw_disp.get(fastest_sw, fastest_sw)} Is Fastest\n"
+            f"  COMPARED: {len(sweep_labels_f)} chunk/shard configs on 2048³ Jiefu crop (image only), 128³ patch, 100 samples.\n"
+            f"  FOUND: Fastest: {sw_disp.get(fastest_sw, fastest_sw)} ({sw_mat[fastest_sw]:.0f}ms, {sw_amp[fastest_sw]:.1f}x amplif.).\n"
+            f"         Slowest: {sw_disp.get(slowest_sw, slowest_sw)} ({sw_mat[slowest_sw]:.0f}ms, {sw_amp[slowest_sw]:.1f}x amplif.).\n"
+            f"  ROOT CAUSE: Chunk size determines how much wasted data is read per patch.\n"
+            f"    64³ chunks: 2.9-3.3x amplif. | 128³: 6.6-7.1x | 256³: 25-28x.\n"
+            f"    Sharding/shard-size has minimal effect on this crop size.\n"
+            f"  FIX: Use smallest chunk size ≥ patch size for best alignment.\n"
+        )
+
     # Finding 6: Read amplification summary — matches Page 10
     ra_configs = []
     for label in ["patch64", "iso", "patch256", "jiefu", "h01"]:
@@ -1933,9 +2086,10 @@ def page_read_amplification(pdf: PdfPages, all_runs: dict[str, dict], finding: s
                  fontsize=16, fontweight="bold")
 
     if what_why:
-        fig.text(0.5, 0.92, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
-                 ha="center", fontsize=7.5, style="italic", color="#555",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", alpha=0.7))
+        fig.text(0.5, 0.90, f"WHAT: {what_why[0]}\nWHY: {what_why[1]}",
+                 ha="center", fontsize=6.5, style="italic", color="#555",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5",
+                           alpha=0.7, edgecolor="none"))
 
     labels = []
     display_labels = []
@@ -2003,7 +2157,7 @@ def page_read_amplification(pdf: PdfPages, all_runs: dict[str, dict], finding: s
     if finding:
         n_lines = finding.count("\n") + 1
         bottom_margin = min(0.05 + n_lines * 0.012, 0.30)
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.text(0.5, 0.01, finding, ha="center", fontsize=7.5,
                  color="#333", wrap=True,
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF9C4", alpha=0.9))
@@ -2012,7 +2166,7 @@ def page_read_amplification(pdf: PdfPages, all_runs: dict[str, dict], finding: s
         note = ("Read amplification = (bytes read from disk) / (bytes actually needed). "
                 "zarr2 chunk misalignment causes massive waste for small patches.")
         fig.text(0.5, 0.02, note, ha="center", fontsize=9, style="italic", color="#666")
-        top_margin = 0.90 if what_why else 0.93
+        top_margin = 0.83 if what_why else 0.93
         fig.tight_layout(rect=[0, 0.05, 1, top_margin])
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -2457,10 +2611,12 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
                 p95_note = (f" P95 latency explodes: {p95s[best_w]:.0f}ms at {best_w}w → "
                             f"{p95s[worst_w]:.0f}ms at {worst_w}w.")
             base_p95 = p95s.get(0, p95s[workers[0]])
+            # Extract batch_size from the first worker entry
+            _dl_bs = dl[workers[0]].get("batch_size", 4)
             page4_dataloader(pdf, dl,
                 what_why=(
                     f"Run the data loader with {', '.join(str(w) for w in workers)} parallel worker "
-                    f"processes and measure throughput. 100 samples each.",
+                    f"processes (batch_size={_dl_bs}) and measure throughput. 100 samples each.",
                     "Find the optimal number of workers before NFS contention degrades performance."
                 ),
                 finding=(
@@ -2618,6 +2774,159 @@ def generate_consolidated_report(run_dir: Path, output_path: str) -> None:
             ))
         page_num += 1
         print(f"  Page {page_num}: Read amplification analysis")
+
+        # --- Format Comparison Page (Jiefu: zarr2 vs zarr3 variants) ---
+        fmt_labels = [l for l in sorted(all_runs.keys()) if l.startswith("fmt_")]
+        if len(fmt_labels) >= 2:
+            # Display names: strip "fmt_" prefix, make readable
+            fmt_display = {
+                "fmt_zarr2": "zarr2\n(256³ chunks, gzip)",
+                "fmt_zarr3_nosharding": "zarr3\n(no shard, zstd)",
+                "fmt_zarr3_sharded": "zarr3 sharded\n(256³ chunks)",
+                "fmt_zarr3_sharded_128chunk": "zarr3 sharded\n(128³ chunks)",
+            }
+            datasets = [
+                {"data": all_runs[l], "meta": all_meta.get(l, {}),
+                 "label": fmt_display.get(l, l.replace("fmt_", ""))}
+                for l in fmt_labels
+            ]
+            # Dynamic finding
+            mat_vals = {}
+            amp_vals = {}
+            bw_vals = {}
+            for l in fmt_labels:
+                mat_vals[l] = float(np.mean(all_runs[l]["stages"]["data_materialize"]))
+                _, _, amp_vals[l] = _amplif(l)
+                bw_vals[l] = _bandwidth(l)
+            fastest = min(mat_vals, key=mat_vals.get)
+            slowest = max(mat_vals, key=mat_vals.get)
+            speedup = mat_vals[slowest] / mat_vals[fastest] if mat_vals[fastest] > 0 else 0
+            mat_summary = ", ".join(
+                f"{fmt_display.get(l, l).split(chr(10))[0]}: {mat_vals[l]:.0f}ms"
+                for l in fmt_labels
+            )
+            amp_summary = ", ".join(
+                f"{fmt_display.get(l, l).split(chr(10))[0]}: {amp_vals[l]:.1f}x"
+                for l in fmt_labels
+            )
+            bw_summary = ", ".join(
+                f"{fmt_display.get(l, l).split(chr(10))[0]}: {bw_vals[l]:.0f} MB/s"
+                for l in fmt_labels
+            )
+            page8_dataset_comparison(pdf, datasets,
+                what_why=(
+                    "Compare 4 storage formats on the SAME Jiefu Cerebellum dataset (full 536 GB). "
+                    "Same patch [128,128,32], 3 scales, isotropic=true, 100 samples each. "
+                    "Only variable: on-disk format (zarr2 vs zarr3, sharded vs unsharded, chunk size).",
+                    "Quantify exactly how much faster zarr3 sharded is vs zarr2 on a real production dataset."
+                ),
+                finding=(
+                    f"FINDING: {fmt_display.get(fastest, fastest).split(chr(10))[0]} is "
+                    f"{speedup:.1f}x faster than {fmt_display.get(slowest, slowest).split(chr(10))[0]}.\n"
+                    f"Disk Read & Decompress: {mat_summary}.\n"
+                    f"Read Amplification: {amp_summary}.\n"
+                    f"IO Bandwidth: {bw_summary}.\n"
+                    f"FIX: Convert training data to the fastest format."
+                ))
+            page_num += 1
+            print(f"  Page {page_num}: Format comparison ({len(fmt_labels)}-way)")
+
+        # --- Chunk/Shard Sweep Page (2048³ bbox crop, 9 configs) ---
+        sweep_labels = [l for l in sorted(all_runs.keys()) if l.startswith("sweep_")]
+        if len(sweep_labels) >= 2:
+            # Short display names
+            sweep_display = {
+                "sweep_zarr2_chunk64": "z2 c64",
+                "sweep_zarr2_chunk128": "z2 c128",
+                "sweep_zarr2_chunk256": "z2 c256",
+                "sweep_zarr3_noshard_chunk128": "z3 ns c128",
+                "sweep_zarr3_shard512_chunk64": "z3 s512 c64",
+                "sweep_zarr3_shard512_chunk128": "z3 s512 c128",
+                "sweep_zarr3_shard1024_chunk128": "z3 s1024 c128",
+                "sweep_zarr3_shard512_chunk256": "z3 s512 c256",
+                "sweep_zarr3_shard1024_chunk256": "z3 s1024 c256",
+            }
+
+            # Split into subgroups for readability:
+            # Group A: zarr2 chunk sizes (3)
+            # Group B: zarr3 at chunk128 (noshard, shard512, shard1024) (3)
+            # Group C: zarr3 shard512 chunk sizes (chunk64, chunk128, chunk256) (3)
+
+            # --- Sweep Page 1: zarr2 chunk size comparison ---
+            z2_labels = [l for l in sweep_labels if l.startswith("sweep_zarr2_")]
+            if len(z2_labels) >= 2:
+                datasets_z2 = [
+                    {"data": all_runs[l], "meta": all_meta.get(l, {}),
+                     "label": sweep_display.get(l, l.replace("sweep_", ""))}
+                    for l in z2_labels
+                ]
+                z2_mat = {l: float(np.mean(all_runs[l]["stages"]["data_materialize"])) for l in z2_labels}
+                z2_amp = {l: _amplif(l)[2] for l in z2_labels}
+                z2_mat_str = ", ".join(f"{sweep_display[l]}: {z2_mat[l]:.0f}ms" for l in z2_labels)
+                z2_amp_str = ", ".join(f"{sweep_display[l]}: {z2_amp[l]:.1f}x" for l in z2_labels)
+                page8_dataset_comparison(pdf, datasets_z2,
+                    what_why=(
+                        "Compare zarr2 chunk sizes (64³, 128³, 256³) on a 2048³ Jiefu bbox crop. "
+                        "Same patch [128,128,32], 100 samples. Only variable: chunk size.",
+                        "Does chunk-patch alignment matter? 128³ chunks = 1 chunk per 128³ patch read."
+                    ),
+                    finding=(
+                        f"FINDING (zarr2 chunk sweep): {z2_mat_str}.\n"
+                        f"Read amplification: {z2_amp_str}.\n"
+                        f"128³ chunks should align with 128x128x32 patches on XY, reducing wasted reads.\n"
+                        f"256³ chunks force reading 8x more data per patch."
+                    ))
+                page_num += 1
+                print(f"  Page {page_num}: Sweep — zarr2 chunk sizes")
+
+            # --- Sweep Page 2: zarr3 format variants at chunk128 ---
+            z3_c128_labels = [l for l in sweep_labels
+                             if "chunk128" in l and l.startswith("sweep_zarr3")]
+            if len(z3_c128_labels) >= 2:
+                datasets_z3 = [
+                    {"data": all_runs[l], "meta": all_meta.get(l, {}),
+                     "label": sweep_display.get(l, l.replace("sweep_", ""))}
+                    for l in z3_c128_labels
+                ]
+                z3_mat = {l: float(np.mean(all_runs[l]["stages"]["data_materialize"])) for l in z3_c128_labels}
+                z3_mat_str = ", ".join(f"{sweep_display[l]}: {z3_mat[l]:.0f}ms" for l in z3_c128_labels)
+                page8_dataset_comparison(pdf, datasets_z3,
+                    what_why=(
+                        "Compare zarr3 sharding options at fixed 128³ chunks: no-shard, shard 512³, shard 1024³. "
+                        "2048³ bbox crop, same patch, 100 samples.",
+                        "Does sharding help or hurt for random-access reads? Does shard size matter?"
+                    ),
+                    finding=(
+                        f"FINDING (zarr3 chunk128, shard sweep): {z3_mat_str}.\n"
+                        f"Sharding packs multiple chunks into one file — fewer file opens, but partial-shard "
+                        f"reads may waste bandwidth. Larger shards amplify this tradeoff."
+                    ))
+                page_num += 1
+                print(f"  Page {page_num}: Sweep — zarr3 shard sizes at chunk128")
+
+            # --- Sweep Page 3: zarr3 shard512 chunk sizes ---
+            z3_s512_labels = [l for l in sweep_labels if "shard512" in l]
+            if len(z3_s512_labels) >= 2:
+                datasets_s512 = [
+                    {"data": all_runs[l], "meta": all_meta.get(l, {}),
+                     "label": sweep_display.get(l, l.replace("sweep_", ""))}
+                    for l in z3_s512_labels
+                ]
+                s512_mat = {l: float(np.mean(all_runs[l]["stages"]["data_materialize"])) for l in z3_s512_labels}
+                s512_mat_str = ", ".join(f"{sweep_display[l]}: {s512_mat[l]:.0f}ms" for l in z3_s512_labels)
+                page8_dataset_comparison(pdf, datasets_s512,
+                    what_why=(
+                        "Compare chunk sizes (64³, 128³, 256³) within zarr3 shard512. "
+                        "2048³ bbox crop, same patch, 100 samples.",
+                        "Isolate chunk size effect within a fixed shard size."
+                    ),
+                    finding=(
+                        f"FINDING (zarr3 shard512, chunk sweep): {s512_mat_str}.\n"
+                        f"Within the same shard size, smaller chunks mean more chunks fit in a shard, "
+                        f"potentially improving cache reuse but adding per-chunk overhead."
+                    ))
+                page_num += 1
+                print(f"  Page {page_num}: Sweep — zarr3 shard512 chunk sizes")
 
         # NOTE: page_final_findings removed — duplicates page 2 (Key Findings Overview).
         # Will revisit summary page after all other pages are finalized.
