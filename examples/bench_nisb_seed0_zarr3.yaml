@@ -1,0 +1,17 @@
+volumes:
+  - name: "NISB Base Train Seed 0 (zarr3 sharded 128c)"
+    path: "/groups/miaai/miaai/benchmark/nisb-seed0-zarr3-sharded-128c.zarr"
+    image_key: "img"
+    zarr_version: "zarr3"
+    scales: [0, 1, 2]
+    label_key: "labels/seg"
+    weight: 1.0
+    normalize: true
+
+n_scales: 3
+output_axes: "lcxyz"
+patch_size: [96, 96, 96]
+bbox_mode: "relative"
+samples_per_epoch: 10000
+cache_bytes: 1073741824
+isotropic: false
