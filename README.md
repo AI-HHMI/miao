@@ -97,6 +97,7 @@ Each sample:
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
 | `sampling` | `"random"` (default) or `"sequential"` — see below |
 | `overlap` | Voxels of overlap between adjacent patches in sequential mode (default: `0`). Integer (same for all axes) or list in `output_axes` spatial order, e.g. `[16, 16, 8]` |
+| `sample_windows` | If `true` (default: `false`), each coarser scale's patch origin is chosen at random such that scale's crop still covers the finer scale's crop in finest-voxel space. (Requires `n_scales` > 1 and each volume's `scales` list ordered fine-to-coarse). See below |
 
 Input axes are auto-detected from OME-NGFF metadata (`multiscales.axes`).
 
@@ -144,6 +145,18 @@ Two coordinate fields are available in `meta`:
 | `meta["isotropic_coordinate"]` | Isotropic output voxels | Stitching inference predictions into a dense volume |
 
 `isotropic_coordinate` is present whenever `isotropic: true` (both random and sequential modes) and absent when `isotropic: false`.
+
+### Multi-scale window sampling (`sample_windows`)
+
+By default, every scale level uses the same center location, so finer patches are centered with coarser patches. With `sample_windows: true`, each coarser level samples its patch origin uniformly at random among valid positions that cover the previous level's patch.
+
+```yaml
+sample_windows: true
+```
+
+Sampled coarse patch locations will respect the valid sampling region, including any per-volume `bounding_box`.
+
+Each volume's `scales` must be listed from finest to coarsest (e.g. `[0, 1, 2]` with increasing voxel size). Reordering coarser levels before finer ones will raise an error.
 
 ## Requirements
 
