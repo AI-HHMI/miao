@@ -407,7 +407,7 @@ def profiled_getitem(dataset: VolumeDataset, idx: int) -> tuple[dict, StageTimin
                 if lbl_spatial_shape != target_size:
                     lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
                     lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0).squeeze(0)
-                    lbl = lbl_t.numpy().astype(np.int64)
+                    lbl = lbl_t.numpy().astype(vol_info.label_np_dtype)
             label_crops.append(lbl)
 
     timings.iso_resize_ms = (time.perf_counter() - t0) * 1000
@@ -427,9 +427,9 @@ def profiled_getitem(dataset: VolumeDataset, idx: int) -> tuple[dict, StageTimin
         image_dtype=vol_info.image_dtype,
     )
     if label_crops:
-        label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
+        label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).to(vol_info.label_torch_dtype)
     else:
-        label_tensor = torch.empty(0, dtype=torch.long)
+        label_tensor = torch.empty(0, dtype=vol_info.label_torch_dtype)
 
     bbox_arr = np.stack(bboxes)
     if dataset.config.bbox_mode == "relative":
@@ -901,7 +901,7 @@ def main():
     dl_results: dict[int, dict] = {}
     for nw in worker_counts:
         stats = benchmark_dataloader_throughput(
-            dataset, args.num_samples, nw, args.batch_size
+            dataset, args.num_samples, nw, args.batch_size,
         )
         dl_results[nw] = stats
         print(
@@ -935,7 +935,7 @@ def main():
             all_bs_results[nw] = {}
             for bs in batch_sizes:
                 stats = benchmark_dataloader_throughput(
-                    dataset, args.num_samples, nw, batch_size=bs
+                    dataset, args.num_samples, nw, batch_size=bs,
                 )
                 all_bs_results[nw][bs] = stats
                 print(

@@ -77,6 +77,33 @@ class VolumeInfo:
     # Per-axis zoom factor from storage to isotropic space (None if isotropic=False)
     # e.g., [5, 1, 1] for voxel sizes [40, 8, 8] nm (Z is 5x coarser)
     iso_zoom_factors: np.ndarray | None = None
+    # Smallest safe dtypes for label data (derived from on-disk dtype)
+    label_np_dtype: np.dtype = np.dtype(np.int64)
+    label_torch_dtype: torch.dtype = torch.int64
+
+
+def _label_dtypes(source_dtype: np.dtype) -> tuple[np.dtype, torch.dtype]:
+    """Pick the smallest safe integer dtypes for label data.
+
+    Maps the on-disk label dtype to the narrowest numpy/torch integer type
+    that can represent the full value range without overflow.
+    """
+    if np.issubdtype(source_dtype, np.floating):
+        return np.dtype(np.int64), torch.int64
+
+    info = np.iinfo(source_dtype)
+    lo, hi = info.min, info.max
+    # Check signed types from narrowest to widest
+    for np_dt, torch_dt in [
+        (np.int8, torch.int8),
+        (np.int16, torch.int16),
+        (np.int32, torch.int32),
+        (np.int64, torch.int64),
+    ]:
+        ii = np.iinfo(np_dt)
+        if ii.min <= lo and ii.max >= hi:
+            return np.dtype(np_dt), torch_dt
+    return np.dtype(np.int64), torch.int64
 
 
 class VolumeDataset(torch.utils.data.Dataset):
@@ -155,7 +182,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 lbl_meta = vi.label_meta.scales[finest]
                 lines.append(
                     f"    label: axes={vi.lbl_axes!r}, shape={lbl_meta.shape}, "
-                    f"dtype={lbl_meta.dtype}"
+                    f"dtype={lbl_meta.dtype} -> {vi.label_np_dtype}"
                 )
             lines.append(f"    sampling: weight={prob:.2f}, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
@@ -302,6 +329,14 @@ class VolumeDataset(torch.utils.data.Dataset):
         min_center = np.ceil(min_center).astype(np.int64)
         max_center = np.floor(max_center).astype(np.int64)
 
+        # Derive smallest safe label dtypes from on-disk dtype
+        if label_meta is not None:
+            lbl_np_dt, lbl_torch_dt = _label_dtypes(
+                label_meta.scales[finest_scale].dtype
+            )
+        else:
+            lbl_np_dt, lbl_torch_dt = np.dtype(np.int64), torch.int64
+
         return VolumeInfo(
             config=vol_cfg,
             image_meta=image_meta,
@@ -321,6 +356,8 @@ class VolumeDataset(torch.utils.data.Dataset):
             read_shape=read_shape,
             iso_read_shapes=iso_read_shapes,
             iso_zoom_factors=iso_zoom_factors,
+            label_np_dtype=lbl_np_dt,
+            label_torch_dtype=lbl_torch_dt,
         )
 
     def _build_sequential_grid(self) -> None:
@@ -435,7 +472,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                         / vol_info.image_meta.scales[level].path
                     )
                     stores[vol_name]["img"][level] = open_store(
-                        img_array_path, zarr_ver, ctx
+                        img_array_path, zarr_ver, ctx,
                     )
 
                     if vol_info.config.label_key and vol_info.label_meta:
@@ -445,7 +482,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                             / vol_info.label_meta.scales[level].path
                         )
                         stores[vol_name]["label"][level] = open_store(
-                            lbl_array_path, zarr_ver, ctx
+                            lbl_array_path, zarr_ver, ctx,
                         )
 
             self._worker_stores[worker_id] = stores
@@ -651,7 +688,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                     if lbl_spatial_shape != target_size:
                         lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
                         lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0).squeeze(0)
-                        lbl = lbl_t.numpy().astype(np.int64)
+                        lbl = lbl_t.numpy().astype(vol_info.label_np_dtype)
                 label_crops.append(lbl)
 
         # Stack across levels → (L, *storage_axes), then permute to output_axes
@@ -667,10 +704,10 @@ class VolumeDataset(torch.utils.data.Dataset):
             image_dtype=vol_info.image_dtype,
         )
         if label_crops:
-            label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
+            label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).to(vol_info.label_torch_dtype)
         else:
             # Keep output collate-friendly for default PyTorch DataLoader.
-            label_tensor = torch.empty(0, dtype=torch.long)
+            label_tensor = torch.empty(0, dtype=vol_info.label_torch_dtype)
 
         # Stack bboxes: (L, 2, Nd_spatial) in output spatial order, physical units
         bbox_arr = np.stack(bboxes)

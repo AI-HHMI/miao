@@ -4,7 +4,7 @@
 # Each run: 100 samples, workers 0,4 (0 for per-sample profiling, 4 for throughput)
 
 set -e
-cd /groups/scicompsoft/home/chend/temp/miao
+cd /groups/scicompsoft/home/chend/MIAAI/miao
 
 OUTDIR="benchmarks"
 SAMPLES=100
