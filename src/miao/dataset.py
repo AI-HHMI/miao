@@ -23,6 +23,60 @@ from miao.store import create_context, open_store
 from miao.zarr_meta import OmeMetadata, ScaleMetadata, read_ome_metadata
 
 
+def _random_patch_origin_covering_fine_extent(
+    fine_lo: np.ndarray,
+    fine_hi: np.ndarray,
+    rel_curr: np.ndarray,
+    eff_shape_curr: np.ndarray,
+    max_origin: np.ndarray,
+    *,
+    fine_roi_lo: np.ndarray | None = None,
+    fine_roi_hi_excl: np.ndarray | None = None,
+) -> np.ndarray:
+    """Sample an integer patch origin at the current scale, such that the patch covers [fine_lo, fine_hi) 
+    in finest-index space and is within the valid data region.
+
+    ``fine_*`` are per spatial axis in the same finest-coordinate frame as ``VolumeInfo.min_center``.
+    ``rel_curr`` is ``relative_scale_factors`` at the current scale (voxel size ratio vs finest).
+    ``max_origin`` is ``spatial_shape - eff_shape`` (largest valid origin per axis, inclusive).
+
+    When ``fine_roi_lo`` / ``fine_roi_hi_excl`` are set, the patch's finest extent
+    ``[origin * rel_curr, (origin + eff_shape) * rel_curr)`` must lie inside the half-open ROI
+    ``[fine_roi_lo, fine_roi_hi_excl)`` per axis (same frame as ``min_center`` / ``max_center``).
+    """
+    rel_curr = rel_curr.astype(np.float64)
+    fine_lo = fine_lo.astype(np.float64)
+    fine_hi = fine_hi.astype(np.float64)
+    eff_f = eff_shape_curr.astype(np.float64)
+    omin = np.ceil(fine_hi / rel_curr - eff_f - 1e-9)
+    omax = np.floor(fine_lo / rel_curr + 1e-9)
+    omin = np.maximum(omin, 0.0)
+    omax = np.minimum(omax, max_origin.astype(np.float64))
+    if fine_roi_lo is not None:
+        roi_omin = np.ceil(fine_roi_lo.astype(np.float64) / rel_curr - 1e-9)
+        omin = np.maximum(omin, roi_omin)
+    if fine_roi_hi_excl is not None:
+        roi_omax = np.floor(
+            fine_roi_hi_excl.astype(np.float64) / rel_curr - eff_f + 1e-9
+        )
+        omax = np.minimum(omax, roi_omax)
+    if np.any(omin > omax):
+        raise ValueError(
+            "No patch origin at this scale that covers the finer-level window, fits the volume, "
+            "and stays inside the min_center/max_center finest ROI "
+            f"(omin={omin.tolist()}, omax={omax.tolist()}, fine_lo={fine_lo.tolist()}, "
+            f"fine_hi={fine_hi.tolist()}, rel_curr={rel_curr.tolist()}, "
+            f"roi_lo={None if fine_roi_lo is None else fine_roi_lo.tolist()}, "
+            f"roi_hi_excl={None if fine_roi_hi_excl is None else fine_roi_hi_excl.tolist()})"
+        )
+    out = np.empty(len(omin), dtype=np.int64)
+    for d in range(len(omin)):
+        lo_i = int(omin[d])
+        hi_i = int(omax[d])
+        out[d] = np.random.randint(lo_i, hi_i + 1)
+    return out
+
+
 def _normalize_image_tensor(
     img_tensor: torch.Tensor,
     *,
@@ -535,15 +589,37 @@ class VolumeDataset(torch.utils.data.Dataset):
         label_crops: list[np.ndarray] = []
         bboxes: list[np.ndarray] = []
 
+        # Finest-coordinate ROI for any valid finest center in [min_center, max_center] at the
+        # first (finest) scale in config order — used to clip random coarse origins when
+        # sample_windows is enabled (includes optional bounding_box via min/max_center).
+        sample_roi_lo: np.ndarray | None = None
+        sample_roi_hi_excl: np.ndarray | None = None
+        if self.config.sample_windows and len(vol_info.config.scales) > 1:
+            level0 = vol_info.config.scales[0]
+            if vol_info.iso_read_shapes is not None:
+                eff0 = vol_info.iso_read_shapes[level0]
+            else:
+                eff0 = read_shape
+            h0 = eff0 // 2
+            sample_roi_lo = vol_info.min_center.astype(np.float64) - h0.astype(np.float64)
+            sample_roi_hi_excl = (
+                vol_info.max_center.astype(np.float64)
+                - h0.astype(np.float64)
+                + eff0.astype(np.float64)
+            )
+
         # Phase 1: Compute slices and issue all reads concurrently via ts.Batch
         level_info: list[dict] = []
         img_futures: list[ts.Future] = []
         lbl_futures: list[ts.Future | None] = []
 
+        prev_origin: np.ndarray | None = None
+        prev_eff_shape: np.ndarray | None = None
+        prev_rel: np.ndarray | None = None
+
         with ts.Batch() as batch:
-            for level in vol_info.config.scales:
+            for level_i, level in enumerate(vol_info.config.scales):
                 rel_factors = vol_info.relative_scale_factors[level]
-                center_at_level = np.floor(center / rel_factors).astype(np.int64)
 
                 # Use per-level isotropic read shape if enabled
                 if vol_info.iso_read_shapes is not None:
@@ -553,7 +629,37 @@ class VolumeDataset(torch.utils.data.Dataset):
                     eff_shape = read_shape
                     eff_half = half_patch
 
-                origin = center_at_level - eff_half
+                if self.config.sample_windows and level_i > 0:
+                    assert prev_origin is not None and prev_eff_shape is not None and prev_rel is not None
+                    if not np.all(rel_factors + 1e-9 >= prev_rel):
+                        raise AssertionError(
+                            "sample_windows requires each volume's `scales` list to be ordered from "
+                            "higher resolution to lower (non-decreasing relative_scale_factors per axis). "
+                            f"At index {level_i - 1} -> {level_i}, prev_rel={prev_rel.tolist()} but "
+                            f"current rel={rel_factors.tolist()} for scale level {level!r}."
+                        )
+                    fine_lo = prev_origin.astype(np.float64) * prev_rel
+                    fine_hi = (prev_origin + prev_eff_shape).astype(np.float64) * prev_rel
+                    img_sp_shape = np.array(
+                        vol_info.image_meta.scales[level].shape, dtype=np.int64
+                    )[vol_info.img_spatial_idx]
+                    max_origin = img_sp_shape - eff_shape
+                    origin = _random_patch_origin_covering_fine_extent(
+                        fine_lo,
+                        fine_hi,
+                        rel_factors,
+                        eff_shape,
+                        max_origin,
+                        fine_roi_lo=sample_roi_lo,
+                        fine_roi_hi_excl=sample_roi_hi_excl,
+                    )
+                else:
+                    center_at_level = np.floor(center / rel_factors).astype(np.int64)
+                    origin = center_at_level - eff_half
+
+                prev_origin = origin
+                prev_eff_shape = np.asarray(eff_shape, dtype=np.int64).copy()
+                prev_rel = rel_factors.astype(np.float64).copy()
 
                 voxel_size = vol_info.finest_voxel_size
                 phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
@@ -569,13 +675,23 @@ class VolumeDataset(torch.utils.data.Dataset):
                 if (
                     vol_info.config.label_key
                     and level in vol_stores["label"]
+                    and vol_info.label_meta is not None
                     and vol_info.label_relative_scale_factors is not None
                     and vol_info.lbl_axes is not None
                     and vol_info.lbl_spatial_idx is not None
                 ):
                     lbl_rel_factors = vol_info.label_relative_scale_factors[level]
-                    lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
-                    lbl_origin = lbl_center - eff_half
+                    if self.config.sample_windows and level_i > 0:
+                        center_fine = (
+                            origin.astype(np.float64) + eff_half.astype(np.float64)
+                        ) * rel_factors
+                        lbl_center = np.floor(center_fine / lbl_rel_factors).astype(
+                            np.int64
+                        )
+                        lbl_origin = lbl_center - eff_half
+                    else:
+                        lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
+                        lbl_origin = lbl_center - eff_half
                     # Build label slices from label axes metadata:
                     # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
                     lbl_slices = []
