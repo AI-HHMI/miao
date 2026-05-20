@@ -695,7 +695,9 @@ class VolumeDataset(torch.utils.data.Dataset):
         img_stacked = torch.from_numpy(np.stack(img_crops))
         if add_channel:
             img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
-        img_tensor = img_stacked.permute(img_perm).float()
+        from miao.config import IMAGE_DTYPE_MAP
+        _img_dtype = IMAGE_DTYPE_MAP[self.config.image_dtype]
+        img_tensor = img_stacked.permute(img_perm).to(_img_dtype)
         img_tensor = _normalize_image_tensor(
             img_tensor,
             normalize=vol_info.config.normalize,
