@@ -592,3 +592,136 @@ class TestVolumeDataset:
         ds_iso = VolumeDataset(MiaoConfig(**base, isotropic=True))
         # Zoom factors are [1,1,1] on isotropic volume → same grid
         assert len(ds_no_iso) == len(ds_iso)
+
+
+class TestChunkAlignedSampling:
+    """Tests for chunk_aligned=True random sampling."""
+
+    def test_centers_within_chunk(self, zarr2_volume: Path):
+        """Every sampled center produces a patch fitting within a single chunk."""
+        # zarr2_volume: 64^3, chunks=32^3, patch=8^3 → chunk > patch
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "test",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "scales": [0],
+            }],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=200,
+            chunk_aligned=True,
+        )
+        ds = VolumeDataset(cfg)
+        vol_info = ds._volumes[0]
+        finest_scale = min(vol_info.config.scales)
+        full_chunks = vol_info.image_meta.scales[finest_scale].chunks
+        spatial_chunks = [full_chunks[i] for i in vol_info.img_spatial_idx]
+
+        for _ in range(200):
+            center = ds._sample_chunk_aligned_center(vol_info)
+            for ax in range(len(center)):
+                half = vol_info.read_shape[ax] // 2
+                patch_start = int(center[ax]) - half
+                patch_end = patch_start + vol_info.read_shape[ax]
+                chunk_sz = spatial_chunks[ax]
+                assert patch_start // chunk_sz == (patch_end - 1) // chunk_sz, (
+                    f"axis {ax}: patch [{patch_start}, {patch_end}) straddles "
+                    f"chunk boundary (chunk_size={chunk_sz})"
+                )
+
+    def test_getitem_shapes(self, zarr2_volume: Path):
+        """chunk_aligned=True produces correct output tensor shapes."""
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "test",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "scales": [0, 1, 2],
+                "label_key": "labels/seg",
+            }],
+            n_scales=3,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=10,
+            chunk_aligned=True,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert sample["img"].shape == (3, 8, 8, 8)
+        assert sample["label"].shape == (3, 8, 8, 8)
+
+    def test_false_unchanged(self, zarr2_volume: Path):
+        """chunk_aligned=False behaves identically to the default."""
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "test",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "scales": [0],
+            }],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+            chunk_aligned=False,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert sample["img"].shape == (1, 8, 8, 8)
+        assert "grid_index" not in sample["meta"]
+
+    def test_patch_equals_chunk_grid_locked(self, zarr2_volume: Path):
+        """When patch_size == chunk_size, centers snap to chunk-boundary positions."""
+        # zarr2_volume: 64^3 with 32^3 chunks, patch=32
+        # half=16, valid center per chunk: c_lo=start+16, c_hi=start+32-32+16=start+16
+        # → exactly 1 position per chunk. Chunks at [0,32]: centers are {16, 48}
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "test",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "scales": [0],
+            }],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[32, 32, 32],
+            samples_per_epoch=50,
+            chunk_aligned=True,
+        )
+        ds = VolumeDataset(cfg)
+        vol_info = ds._volumes[0]
+        valid_centers = {16, 48}
+        for _ in range(50):
+            center = ds._sample_chunk_aligned_center(vol_info)
+            for ax in range(3):
+                assert int(center[ax]) in valid_centers, (
+                    f"axis {ax}: center {center[ax]} not in {valid_centers}"
+                )
+
+    def test_larger_chunk_has_diversity(self, zarr2_volume: Path):
+        """When chunk > patch, centers have random freedom within each chunk."""
+        # 64^3, chunks=32, patch=8 → 25 valid positions per chunk × 2 chunks
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "test",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "scales": [0],
+            }],
+            n_scales=1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=100,
+            chunk_aligned=True,
+        )
+        ds = VolumeDataset(cfg)
+        vol_info = ds._volumes[0]
+        centers_ax0 = set()
+        for _ in range(100):
+            center = ds._sample_chunk_aligned_center(vol_info)
+            centers_ax0.add(int(center[0]))
+        assert len(centers_ax0) > 2, (
+            f"Expected diverse centers when chunk > patch, got only {centers_ax0}"
+        )

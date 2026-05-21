@@ -1,0 +1,18 @@
+volumes:
+  - name: "Jiefu zarr3-sharded-128chunk"
+    path: "/groups/miaai/miaai/benchmark/jiefu-cerebellum-fibsem-zarr3-sharded-128chunk.zarr"
+    image_key: "raw"
+    zarr_version: "zarr3"
+    scales: [0, 1, 2]
+    label_key: "labels/agglom_seg"
+    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]
+    weight: 1.0
+    normalize: true
+
+n_scales: 3
+output_axes: "lcxyz"
+patch_size: [128, 128, 32]
+bbox_mode: "relative"
+samples_per_epoch: 1000
+cache_bytes: 1073741824
+isotropic: true

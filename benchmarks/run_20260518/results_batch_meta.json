@@ -1,0 +1,22 @@
+{
+  "label": "batch",
+  "timestamp": "2026-05-14T14:08:10.889411",
+  "num_samples": 200,
+  "startup_ms": 4.169514402747154,
+  "batch_sweep": true,
+  "config": {
+    "volumes": [
+      "Jiefu Cerebellum FIB-SEM",
+      "H01 Human Cortex"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

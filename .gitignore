@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 dist/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+Screenshot*
+smoke_test_sequential.py

@@ -1,0 +1,21 @@
+{
+  "label": "fmt_zarr3_sharded_128chunk",
+  "timestamp": "2026-05-18T10:41:02.715049",
+  "num_samples": 100,
+  "startup_ms": 2.487713471055031,
+  "batch_sweep": false,
+  "config": {
+    "volumes": [
+      "Jiefu zarr3-sharded-128chunk"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

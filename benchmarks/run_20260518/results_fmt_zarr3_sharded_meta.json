@@ -1,0 +1,21 @@
+{
+  "label": "fmt_zarr3_sharded",
+  "timestamp": "2026-05-18T10:40:42.401558",
+  "num_samples": 100,
+  "startup_ms": 2.4721678346395493,
+  "batch_sweep": false,
+  "config": {
+    "volumes": [
+      "Jiefu zarr3-sharded"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}
