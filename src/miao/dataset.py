@@ -186,6 +186,9 @@ class VolumeDataset(torch.utils.data.Dataset):
                 )
             lines.append(f"    sampling: weight={prob:.2f}, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
+            if self.config.chunk_aligned:
+                sp_chunks = [finest_meta.chunks[i] for i in vi.img_spatial_idx]
+                lines.append(f"    chunk_aligned: spatial_chunks={sp_chunks}")
             if vi.config.normalize:
                 if (
                     vi.config.normalize_min is not None
@@ -507,6 +510,67 @@ class VolumeDataset(torch.utils.data.Dataset):
                 slices.append(slice(None))  # channel dim: take all
         return tuple(slices)
 
+    def _sample_chunk_aligned_center(self, vol_info: VolumeInfo) -> np.ndarray:
+        """Sample a random patch center constrained to lie within a single chunk.
+
+        For each spatial axis:
+          - If chunk_size >= patch_size: pick a random chunk, then a random
+            center within it such that the full patch fits inside one chunk.
+          - If chunk_size < patch_size: fall back to unconstrained random.
+
+        Returns center array in image spatial axis order.
+        """
+        finest_scale = min(vol_info.config.scales)
+        full_chunks = vol_info.image_meta.scales[finest_scale].chunks
+        spatial_chunks = [full_chunks[i] for i in vol_info.img_spatial_idx]
+
+        center = np.empty(len(vol_info.img_spatial_idx), dtype=np.int64)
+
+        for ax in range(len(vol_info.img_spatial_idx)):
+            chunk_sz = spatial_chunks[ax]
+            patch_sz = vol_info.read_shape[ax]
+            lo = int(vol_info.min_center[ax])
+            hi = int(vol_info.max_center[ax])
+
+            if chunk_sz < patch_sz:
+                center[ax] = np.random.randint(lo, hi + 1)
+                continue
+
+            half = patch_sz // 2
+            spatial_extent = vol_info.image_meta.scales[finest_scale].shape[
+                vol_info.img_spatial_idx[ax]
+            ]
+            n_chunks = int(np.ceil(spatial_extent / chunk_sz))
+
+            valid_chunks: list[tuple[int, int]] = []
+            for ci in range(n_chunks):
+                chunk_start = ci * chunk_sz
+                # Valid center range within this chunk (patch fits entirely):
+                c_lo = chunk_start + half
+                c_hi = chunk_start + chunk_sz - patch_sz + half
+                if c_hi < c_lo:
+                    continue
+                # Clamp to volume's valid center range
+                c_lo = max(c_lo, lo)
+                c_hi = min(c_hi, hi)
+                if c_lo <= c_hi:
+                    valid_chunks.append((c_lo, c_hi))
+
+            if not valid_chunks:
+                center[ax] = np.random.randint(lo, hi + 1)
+                continue
+
+            # Weight chunks by valid range width for uniform spatial coverage
+            widths = np.array(
+                [c_hi - c_lo + 1 for c_lo, c_hi in valid_chunks], dtype=np.float64
+            )
+            probs = widths / widths.sum()
+            chunk_idx = np.random.choice(len(valid_chunks), p=probs)
+            c_lo, c_hi = valid_chunks[chunk_idx]
+            center[ax] = np.random.randint(c_lo, c_hi + 1)
+
+        return center
+
     def __getitem__(self, idx: int) -> dict:
         stores = self._get_stores()
 
@@ -558,12 +622,15 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         # Pick center coordinate (random mode only; sequential already set center above)
         if self.config.sampling == "random":
-            center = np.array(
-                [
-                    np.random.randint(lo, hi + 1)
-                    for lo, hi in zip(vol_info.min_center, vol_info.max_center)
-                ]
-            )
+            if self.config.chunk_aligned:
+                center = self._sample_chunk_aligned_center(vol_info)
+            else:
+                center = np.array(
+                    [
+                        np.random.randint(lo, hi + 1)
+                        for lo, hi in zip(vol_info.min_center, vol_info.max_center)
+                    ]
+                )
 
         read_shape = np.array(vol_info.read_shape)
         half_patch = read_shape // 2
