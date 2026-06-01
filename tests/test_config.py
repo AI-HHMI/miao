@@ -12,7 +12,6 @@ class TestVolumeConfig:
             name="raw",
             path="/data/test.zarr",
             image_key="raw",
-            scales=[0, 1],
         )
         assert v.weight == 1.0
         assert v.label_key is None
@@ -23,7 +22,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 weight=-1.0,
             )
 
@@ -33,7 +31,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_min=0.0,
             )
         with pytest.raises(ValueError, match="both be set or both omitted"):
@@ -41,7 +38,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_max=1.0,
             )
 
@@ -51,7 +47,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_min=1.0,
                 normalize_max=1.0,
             )

@@ -15,7 +15,10 @@ class VolumeConfig(BaseModel):
     name: str
     path: str
     image_key: str
-    scales: list[int]
+    # Optional per-volume override of the global MiaoConfig.resolutions. Each inner list is the
+    # desired output voxel size per spatial axis (physical units, same unit as the zarr's OME
+    # coordinateTransformations scale), in output_axes spatial order — like patch_size.
+    resolutions: Optional[list[list[float]]] = None
     zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
     label_key: Optional[str] = None
     weight: float = 1.0
@@ -52,11 +55,15 @@ class MiaoConfig(BaseModel):
     """Top-level configuration for miaio dataset."""
 
     volumes: list[VolumeConfig]
-    n_scales: int
+    # Desired output resolutions, one per scale. Each inner list is the output voxel size per
+    # spatial axis (physical units, same unit as the zarr's OME coordinateTransformations scale),
+    # in output_axes spatial order — like patch_size. Used as the default for every volume; a
+    # volume may override via VolumeConfig.resolutions. The number of scales (the stacked 'l'
+    # dimension) is len(resolutions).
+    resolutions: list[list[float]]
     output_axes: str
     patch_size: list[int]
     bbox_mode: Literal["absolute", "relative"] = "absolute"
-    isotropic: bool = False
     samples_per_epoch: int = 1000
     cache_bytes: int = 1 << 30  # 1 GB
     file_io_concurrency: int = 64
@@ -83,6 +90,15 @@ class MiaoConfig(BaseModel):
             )
         return v
 
+    def resolutions_for(self, vol: VolumeConfig) -> list[list[float]]:
+        """Return the effective resolutions for a volume (per-volume override or global default)."""
+        return vol.resolutions if vol.resolutions is not None else self.resolutions
+
+    @property
+    def n_scales(self) -> int:
+        """Number of scales (the stacked 'l' dimension), derived from resolutions."""
+        return len(self.resolutions)
+
     @model_validator(mode="after")
     def validate_patch_size_dims(self) -> "MiaoConfig":
         from miao.axes import spatial_axes
@@ -96,13 +112,51 @@ class MiaoConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_scales_length(self) -> "MiaoConfig":
+    def validate_resolutions(self) -> "MiaoConfig":
+        from miao.axes import spatial_axes
+
+        n_spatial = len(spatial_axes(self.output_axes))
+
+        def _check(res: list[list[float]], where: str) -> None:
+            if len(res) == 0:
+                raise ValueError(f"{where} must contain at least one resolution")
+            for i, r in enumerate(res):
+                if len(r) != n_spatial:
+                    raise ValueError(
+                        f"{where}[{i}] has {len(r)} elements but output_axes "
+                        f"{self.output_axes!r} has {n_spatial} spatial dimensions"
+                    )
+                if any(v <= 0 for v in r):
+                    raise ValueError(f"{where}[{i}]={r} must have all positive values")
+
+        _check(self.resolutions, "resolutions")
         for vol in self.volumes:
-            if len(vol.scales) != self.n_scales:
+            if vol.resolutions is not None:
+                _check(vol.resolutions, f"Volume {vol.name!r} resolutions")
+            eff = self.resolutions_for(vol)
+            if len(eff) != self.n_scales:
                 raise ValueError(
-                    f"Volume {vol.name!r} has {len(vol.scales)} scales "
-                    f"but n_scales={self.n_scales}"
+                    f"Volume {vol.name!r} has {len(eff)} resolutions "
+                    f"but the global resolutions defines {self.n_scales} scales — "
+                    "all volumes must define the same number of scales"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_sample_windows_ordering(self) -> "MiaoConfig":
+        if not self.sample_windows:
+            return self
+        for vol in self.volumes:
+            res = self.resolutions_for(vol)
+            for i in range(1, len(res)):
+                prev = res[i - 1]
+                curr = res[i]
+                if any(c + 1e-9 < p for c, p in zip(curr, prev)):
+                    raise ValueError(
+                        f"sample_windows requires resolutions ordered fine-to-coarse "
+                        f"(non-decreasing per axis). For volume {vol.name!r}, resolution "
+                        f"index {i - 1}->{i} is {prev} -> {curr}."
+                    )
         return self
 
     @model_validator(mode="after")

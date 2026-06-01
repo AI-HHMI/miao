@@ -10,6 +10,12 @@ import torch
 from miao.config import MiaoConfig
 from miao.dataset import VolumeDataset
 
+# Level voxel sizes of the standard 64^3 fixture are [1,1,1], [2,2,2], [4,4,4], so these
+# resolutions map exactly to pyramid levels 0, 1, 2 (downsample ratio 1).
+RES_1 = [[1, 1, 1]]
+RES_2 = [[1, 1, 1], [2, 2, 2]]
+RES_3 = [[1, 1, 1], [2, 2, 2], [4, 4, 4]]
+
 
 class TestVolumeDataset:
     def test_basic_getitem(self, sample_config: dict):
@@ -23,7 +29,7 @@ class TestVolumeDataset:
         assert "label" in sample
         assert "meta" in sample
 
-        # output_axes="lzyx" → img shape: (1, L, Z, Y, X) = (1, 3, 8, 8, 8)
+        # output_axes="lzyx" → img shape: (L, Z, Y, X) = (3, 8, 8, 8)
         assert sample["img"].shape == (3, 8, 8, 8)
         assert sample["img"].dtype == torch.float32
 
@@ -38,10 +44,9 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0, 1],
                 }
             ],
-            n_scales=2,
+            resolutions=RES_2,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -62,10 +67,9 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0, 1],
                 }
             ],
-            n_scales=2,
+            resolutions=RES_2,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -87,10 +91,9 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                 }
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lxyz",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -98,7 +101,7 @@ class TestVolumeDataset:
         ds = VolumeDataset(cfg)
         sample = ds[0]
 
-        # output_axes="lxyz" → (1, L, X, Y, Z)
+        # output_axes="lxyz" → (L, X, Y, Z)
         assert sample["img"].shape == (1, 8, 8, 8)
 
     def test_level_dim_placement(self, zarr2_volume: Path):
@@ -109,10 +112,9 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0, 1],
                 }
             ],
-            n_scales=2,
+            resolutions=RES_2,
             output_axes="xyzl",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -120,7 +122,7 @@ class TestVolumeDataset:
         ds = VolumeDataset(cfg)
         sample = ds[0]
 
-        # output_axes="xyzl" → (1, X, Y, Z, L) = (1, 8, 8, 8, 2)
+        # output_axes="xyzl" → (X, Y, Z, L) = (8, 8, 8, 2)
         assert sample["img"].shape == (8, 8, 8, 2)
 
     def test_meta_contents(self, sample_config: dict):
@@ -131,9 +133,12 @@ class TestVolumeDataset:
         meta = sample["meta"]
         assert "volume" in meta
         assert "coordinate" in meta
-        assert "scale_levels" in meta
+        assert "resolutions" in meta
+        assert "source_levels" in meta
         assert meta["volume"] == "test_raw"
-        assert meta["scale_levels"] == [0, 1, 2]
+        assert meta["resolutions"] == [[1, 1, 1], [2, 2, 2], [4, 4, 4]]
+        # These resolutions map exactly to pyramid levels 0, 1, 2.
+        assert meta["source_levels"] == [0, 1, 2]
         assert len(meta["coordinate"]) == 3
 
     def test_multiple_volumes_weighted(self, zarr2_volume: Path):
@@ -144,18 +149,16 @@ class TestVolumeDataset:
                     "name": "vol_a",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                     "weight": 0.99,
                 },
                 {
                     "name": "vol_b",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                     "weight": 0.01,
                 },
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=100,
@@ -177,10 +180,9 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                 }
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -189,19 +191,49 @@ class TestVolumeDataset:
         sample = ds[0]
         assert sample["img"].shape == (1, 8, 8, 8)
 
-    def test_scales_length_mismatch(self, zarr2_volume: Path):
-        """Test that mismatched n_scales raises an error."""
-        with pytest.raises(ValueError, match="2 scales.*n_scales=3"):
+    def test_downsample_from_pyramid(self, zarr2_volume: Path):
+        """A resolution between stored levels reads the coarsest qualifying level and downsamples.
+
+        Target [3,3,3]: level voxels are [1,1,1],[2,2,2],[4,4,4]. The coarsest level <= 3 on
+        every axis is level 1 (voxel 2), so it reads level 1 and resamples 2->3.
+        """
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                }
+            ],
+            resolutions=[[1, 1, 1], [3, 3, 3]],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=3,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert sample["img"].shape == (2, 8, 8, 8)
+        assert sample["meta"]["source_levels"] == [0, 1]
+        # Physical extents: scale 0 covers 8*1=8 units; scale 1 covers 8*3=24 units per axis.
+        bbox = sample["bbox"].numpy()  # (L, 2, n_spatial)
+        ext0 = bbox[0, 1] - bbox[0, 0]
+        ext1 = bbox[1, 1] - bbox[1, 0]
+        assert np.allclose(ext0, 8.0)
+        assert np.allclose(ext1, 24.0)
+
+    def test_resolutions_length_mismatch(self, zarr2_volume: Path):
+        """A per-volume resolutions override of a different length than the global raises."""
+        with pytest.raises(ValueError, match="must define the same number of scales"):
             MiaoConfig(
                 volumes=[
                     {
                         "name": "test",
                         "path": str(zarr2_volume),
                         "image_key": "raw",
-                        "scales": [0, 1],
+                        "resolutions": [[1, 1, 1]],
                     }
                 ],
-                n_scales=3,
+                resolutions=RES_3,
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
             )
@@ -215,10 +247,9 @@ class TestVolumeDataset:
                         "name": "test",
                         "path": str(zarr2_volume),
                         "image_key": "raw",
-                        "scales": [0],
                     }
                 ],
-                n_scales=1,
+                resolutions=RES_1,
                 output_axes="zyx",
                 patch_size=[8, 8, 8],
             )
@@ -236,13 +267,12 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                     "normalize": True,
                     "normalize_min": 100,
                     "normalize_max": 200,
                 }
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=1,
@@ -264,13 +294,12 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                     "normalize": True,
                     "normalize_min": 0,
                     "normalize_max": 128,
                 }
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=1,
@@ -296,13 +325,12 @@ class TestVolumeDataset:
                     "name": "test",
                     "path": str(zarr2_volume),
                     "image_key": "raw",
-                    "scales": [0],
                     "normalize": True,
                     "normalize_min": lo,
                     "normalize_max": hi,
                 }
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=1,
@@ -316,8 +344,8 @@ class TestVolumeDataset:
     def test_random_mode_no_grid_index(self, zarr2_volume: Path):
         """Random mode: meta does not contain 'grid_index' (avoids DataLoader collation issues)."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
@@ -331,8 +359,8 @@ class TestVolumeDataset:
     def test_sequential_basic(self, zarr2_volume: Path):
         """Sequential: __len__ equals precomputed grid size; sample shape is correct."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -348,8 +376,8 @@ class TestVolumeDataset:
     def test_sequential_deterministic(self, zarr2_volume: Path):
         """Same idx always returns the same coordinate and grid_index."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -364,8 +392,8 @@ class TestVolumeDataset:
     def test_sequential_grid_index_in_meta(self, zarr2_volume: Path):
         """Sequential mode: meta['grid_index'] is a tuple; first is (0,0,0)."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -382,8 +410,8 @@ class TestVolumeDataset:
         vol_shape = (64, 64, 64)
         patch_size = [8, 8, 8]
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=patch_size,
             sampling="sequential",
@@ -399,8 +427,8 @@ class TestVolumeDataset:
     def test_sequential_zero_overlap_stride_equals_patch(self, zarr2_volume: Path):
         """overlap=0: consecutive patches are exactly patch_size apart (no overlap, no gap)."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -415,8 +443,8 @@ class TestVolumeDataset:
     def test_sequential_overlap(self, zarr2_volume: Path):
         """overlap=4: stride=4, consecutive patch centers are 4 apart; grid is larger."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -433,10 +461,10 @@ class TestVolumeDataset:
         """Multi-volume: all volumes are iterated; grid_index resets per volume."""
         cfg = MiaoConfig(
             volumes=[
-                {"name": "vol_a", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]},
-                {"name": "vol_b", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]},
+                {"name": "vol_a", "path": str(zarr2_volume), "image_key": "raw"},
+                {"name": "vol_b", "path": str(zarr2_volume), "image_key": "raw"},
             ],
-            n_scales=1,
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -456,8 +484,8 @@ class TestVolumeDataset:
         """overlap >= patch_size raises ValueError at config creation time."""
         with pytest.raises(ValueError, match="overlap"):
             MiaoConfig(
-                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-                n_scales=1,
+                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+                resolutions=RES_1,
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
                 sampling="sequential",
@@ -468,8 +496,8 @@ class TestVolumeDataset:
         """Negative overlap raises ValueError."""
         with pytest.raises(ValueError, match="overlap"):
             MiaoConfig(
-                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-                n_scales=1,
+                volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+                resolutions=RES_1,
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
                 sampling="sequential",
@@ -479,8 +507,8 @@ class TestVolumeDataset:
     def test_sequential_per_axis_overlap(self, zarr2_volume: Path):
         """Per-axis overlap list: each axis uses its own overlap value."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sampling="sequential",
@@ -490,105 +518,68 @@ class TestVolumeDataset:
         # Z: stride=4 → 15 positions; Y,X: stride=8 → 8 positions each
         assert len(ds) == 15 * 8 * 8
 
-    # ── Isotropic + sequential sampling ──────────────────────────────────────
+    # ── Anisotropic volume: resolution targeting (replaces the old isotropic flag) ──
+    #
+    # The anisotropic fixture is 20×100×100 (ZYX) with voxel [5,1,1] and a single pyramid
+    # level. Requesting an isotropic 1-unit output resolution [1,1,1] cannot downsample on Z
+    # (voxel 5 > 1), so it reads level 0 and upsamples Z: read shape ceil([10,10,10]*[1/5,1,1])
+    # = [2,10,10], resampled up to the [10,10,10] output patch.
 
-    def test_sequential_isotropic_grid_size(self, zarr2_volume_anisotropic: Path):
-        """Isotropic sequential: grid is built in isotropic space, giving more positions."""
+    def test_anisotropic_sequential_grid_size(self, zarr2_volume_anisotropic: Path):
+        """Isotropic-target sequential grid tiles the volume at the output resolution."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
-                       "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic), "image_key": "raw"}],
+            resolutions=[[1, 1, 1]],
             output_axes="lzyx",
             patch_size=[10, 10, 10],
             sampling="sequential",
-            isotropic=True,
         )
         ds = VolumeDataset(cfg)
-        # Anisotropic volume: 20×100×100 storage, voxel [5,1,1]
-        # Isotropic space: 100×100×100 at 1-unit resolution
-        # iso_read_shape = ceil([10,10,10]*[1/5,1,1]) = [2,10,10]
-        # min_center=[1,5,5], max_center=[19,95,95]
-        # iso_min=[5,5,5], iso_max=[95,95,95], iso_stride=[10,10,10]
-        # positions per axis: [5,15,25,...,95] = 10
+        # min_center=[1,5,5], max_center=[19,95,95]; ref stride per axis = patch * res/voxel
+        # = [10,10,10]*[1/5,1,1] = [2,10,10].
+        # Z: range(1,20,2) = 10 positions; Y,X: range(5,96,10) = 10 positions each.
         assert len(ds) == 10 ** 3
 
-    def test_sequential_isotropic_coordinates(self, zarr2_volume_anisotropic: Path):
-        """Isotropic sequential: meta has both coordinate and isotropic_coordinate."""
+    def test_anisotropic_first_coordinate(self, zarr2_volume_anisotropic: Path):
+        """First sequential position is at min_center in the level-0 reference frame."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
-                       "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic), "image_key": "raw"}],
+            resolutions=[[1, 1, 1]],
             output_axes="lzyx",
             patch_size=[10, 10, 10],
             sampling="sequential",
-            isotropic=True,
         )
         ds = VolumeDataset(cfg)
         sample = ds[0]
-        assert "isotropic_coordinate" in sample["meta"]
         assert "coordinate" in sample["meta"]
-        # First position: iso=[5,5,5], storage=[1,5,5]
-        assert sample["meta"]["isotropic_coordinate"] == [5, 5, 5]
         assert sample["meta"]["coordinate"] == [1, 5, 5]
+        assert sample["meta"]["resolutions"] == [[1, 1, 1]]
+        # Single stored level → reads level 0 and upsamples.
+        assert sample["meta"]["source_levels"] == [0]
 
-    def test_sequential_isotropic_output_shape(self, zarr2_volume_anisotropic: Path):
-        """Isotropic sequential: output tensor matches patch_size (after interpolation)."""
+    def test_anisotropic_output_shape(self, zarr2_volume_anisotropic: Path):
+        """Output tensor matches patch_size after resampling the anisotropic read."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
-                       "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic), "image_key": "raw"}],
+            resolutions=[[1, 1, 1]],
             output_axes="lzyx",
             patch_size=[10, 10, 10],
             sampling="sequential",
-            isotropic=True,
         )
         ds = VolumeDataset(cfg)
         sample = ds[0]
         assert sample["img"].shape == (1, 10, 10, 10)
 
-    def test_random_isotropic_has_isotropic_coordinate(self, zarr2_volume_anisotropic: Path):
-        """Random + isotropic: meta includes isotropic_coordinate."""
+    def test_meta_has_resolutions_and_levels(self, zarr2_volume: Path):
+        """meta carries the target resolutions and resolved source levels."""
         cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume_anisotropic),
-                       "image_key": "raw", "scales": [0]}],
-            n_scales=1,
-            output_axes="lzyx",
-            patch_size=[10, 10, 10],
-            isotropic=True,
-            samples_per_epoch=5,
-        )
-        ds = VolumeDataset(cfg)
-        sample = ds[0]
-        assert "isotropic_coordinate" in sample["meta"]
-        iso = sample["meta"]["isotropic_coordinate"]
-        storage = sample["meta"]["coordinate"]
-        # Z axis has zoom=5, Y and X have zoom=1
-        assert iso[0] == storage[0] * 5.0
-        assert iso[1] == float(storage[1])
-        assert iso[2] == float(storage[2])
-
-    def test_non_isotropic_no_isotropic_coordinate(self, zarr2_volume: Path):
-        """Non-isotropic mode: meta does not contain isotropic_coordinate."""
-        cfg = MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=5,
         )
         ds = VolumeDataset(cfg)
-        assert "isotropic_coordinate" not in ds[0]["meta"]
-
-    def test_sequential_isotropic_on_isotropic_volume(self, zarr2_volume: Path):
-        """When volume is already isotropic, iso grid size matches non-iso grid size."""
-        base = dict(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw", "scales": [0]}],
-            n_scales=1,
-            output_axes="lzyx",
-            patch_size=[8, 8, 8],
-            sampling="sequential",
-        )
-        ds_no_iso = VolumeDataset(MiaoConfig(**base))
-        ds_iso = VolumeDataset(MiaoConfig(**base, isotropic=True))
-        # Zoom factors are [1,1,1] on isotropic volume → same grid
-        assert len(ds_no_iso) == len(ds_iso)
+        meta = ds[0]["meta"]
+        assert meta["resolutions"] == [[1, 1, 1]]
+        assert meta["source_levels"] == [0]

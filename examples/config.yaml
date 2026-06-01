@@ -3,9 +3,8 @@ volumes:
     path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem.zarr"
     image_key: "raw"
     zarr_version: "zarr2"
-    scales: [0, 1, 2]
     label_key: "labels/agglom_seg"
-    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (in voxels in storage axes order)
+    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (in finest-level voxels, storage axes order)
     weight: 0.5
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
 
@@ -13,12 +12,19 @@ volumes:
     path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
     image_key: "raw"
     zarr_version: "zarr3"
-    scales: [0, 1, 2]
     weight: 0.5
     label_key: "labels/c3_seg"
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
+    # Optionally override the global resolutions for a single volume:
+    # resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
 
-n_scales: 3
+# Desired output resolutions (one per scale), in output_axes spatial order — like patch_size.
+# Each tuple is the output voxel size per spatial axis, in the same physical unit as the
+# zarr's OME coordinateTransformations (e.g. nanometers). For each volume, the dataset reads
+# from the coarsest pyramid level whose voxel size is still <= the target on every axis
+# (downsample), then resamples to the target. If the target is finer than the finest stored
+# level, it reads the finest level and upsamples instead.
+resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
 output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
 patch_size: [128, 128, 32]
 bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
