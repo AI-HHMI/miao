@@ -4,7 +4,7 @@ volumes:
     image_key: "raw"
     zarr_version: "zarr2"
     label_key: "labels/agglom_seg"
-    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (in finest-level voxels, storage axes order)
+    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (finest-level voxels, storage order). Every window's read extent stays strictly inside this box.
     weight: 0.5
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
 
@@ -25,6 +25,14 @@ volumes:
 # (downsample), then resamples to the target. If the target is finer than the finest stored
 # level, it reads the finest level and upsamples instead.
 resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
+# Alternatively, draw resolutions randomly per sample (set instead of `resolutions`):
+# resolution_sampling:
+#   strategy: log_uniform   # only option for now (pluggable)
+#   n_scales: 3
+#   min: [8, 8, 8]          # output_axes spatial order
+#   max: [64, 64, 64]
+#   isotropic: true         # one factor per scale across axes; false = per-axis independent
+#   sort: true              # sort drawn scales fine -> coarse
 output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
 patch_size: [128, 128, 32]
 bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)

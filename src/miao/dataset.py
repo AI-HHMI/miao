@@ -18,7 +18,7 @@ from miao.axes import (
     spatial_axes,
     spatial_indices,
 )
-from miao.config import MiaoConfig, VolumeConfig
+from miao.config import MiaoConfig, ResolutionSampling, VolumeConfig
 from miao.store import create_context, open_store
 from miao.zarr_meta import OmeMetadata, read_ome_metadata
 
@@ -40,40 +40,40 @@ def _random_patch_origin_covering_fine_extent(
     ``rel_curr`` is ``relative_scale_factors`` at the current scale (voxel size ratio vs finest).
     ``max_origin`` is ``spatial_shape - eff_shape`` (largest valid origin per axis, inclusive).
 
-    When ``fine_roi_lo`` / ``fine_roi_hi_excl`` are set, the patch's finest extent
-    ``[origin * rel_curr, (origin + eff_shape) * rel_curr)`` must lie inside the half-open ROI
-    ``[fine_roi_lo, fine_roi_hi_excl)`` per axis (same frame as ``min_center`` / ``max_center``).
+    ``fine_roi_lo`` / ``fine_roi_hi_excl`` (if set) bound the patch's finest extent
+    ``[origin * rel_curr, (origin + eff_shape) * rel_curr)`` to ``[fine_roi_lo, fine_roi_hi_excl)``
+    — used to keep the patch strictly inside a ``bounding_box``. It is a hard constraint; the
+    caller (via ``_center_bounds``) guarantees a feasible origin exists, so this does not fail in
+    valid configs.
     """
     rel_curr = rel_curr.astype(np.float64)
     fine_lo = fine_lo.astype(np.float64)
     fine_hi = fine_hi.astype(np.float64)
     eff_f = eff_shape_curr.astype(np.float64)
-    omin = np.ceil(fine_hi / rel_curr - eff_f - 1e-9)
-    omax = np.floor(fine_lo / rel_curr + 1e-9)
-    omin = np.maximum(omin, 0.0)
-    omax = np.minimum(omax, max_origin.astype(np.float64))
+
+    # Cover the finer extent AND fit the volume.
+    lo = np.maximum(np.ceil(fine_hi / rel_curr - eff_f - 1e-9), 0.0)
+    hi = np.minimum(np.floor(fine_lo / rel_curr + 1e-9), max_origin.astype(np.float64))
+    # Stay inside the bounding_box (reference frame), if given.
     if fine_roi_lo is not None:
-        roi_omin = np.ceil(fine_roi_lo.astype(np.float64) / rel_curr - 1e-9)
-        omin = np.maximum(omin, roi_omin)
+        lo = np.maximum(lo, np.ceil(fine_roi_lo.astype(np.float64) / rel_curr - 1e-9))
     if fine_roi_hi_excl is not None:
-        roi_omax = np.floor(
-            fine_roi_hi_excl.astype(np.float64) / rel_curr - eff_f + 1e-9
+        hi = np.minimum(
+            hi, np.floor(fine_roi_hi_excl.astype(np.float64) / rel_curr - eff_f + 1e-9)
         )
-        omax = np.minimum(omax, roi_omax)
-    if np.any(omin > omax):
+    if np.any(lo > hi):
         raise ValueError(
             "No patch origin at this scale that covers the finer-level window, fits the volume, "
-            "and stays inside the min_center/max_center finest ROI "
-            f"(omin={omin.tolist()}, omax={omax.tolist()}, fine_lo={fine_lo.tolist()}, "
+            "and stays inside the bounding_box "
+            f"(lo={lo.tolist()}, hi={hi.tolist()}, fine_lo={fine_lo.tolist()}, "
             f"fine_hi={fine_hi.tolist()}, rel_curr={rel_curr.tolist()}, "
             f"roi_lo={None if fine_roi_lo is None else fine_roi_lo.tolist()}, "
             f"roi_hi_excl={None if fine_roi_hi_excl is None else fine_roi_hi_excl.tolist()})"
         )
-    out = np.empty(len(omin), dtype=np.int64)
-    for d in range(len(omin)):
-        lo_i = int(omin[d])
-        hi_i = int(omax[d])
-        out[d] = np.random.randint(lo_i, hi_i + 1)
+
+    out = np.empty(len(lo), dtype=np.int64)
+    for d in range(len(lo)):
+        out[d] = np.random.randint(int(lo[d]), int(hi[d]) + 1)
     return out
 
 
@@ -99,6 +99,45 @@ def _select_level_for_resolution(
     return min(level_voxels, key=lambda lvl: float(np.prod(level_voxels[lvl])))
 
 
+def _sample_log_uniform(
+    spec: ResolutionSampling, n_axes: int, rng: np.random.RandomState
+) -> np.ndarray:
+    """Draw resolutions log-uniformly over [min, max]. Returns (n_scales, n_axes), output order.
+
+    If ``spec.isotropic``, one scalar is drawn per scale (using axis 0's range) and broadcast to
+    all axes, yielding cubic voxels; otherwise each axis is drawn independently.
+    """
+    lo = np.array(spec.min, dtype=np.float64)
+    hi = np.array(spec.max, dtype=np.float64)
+    if spec.isotropic:
+        u = rng.uniform(np.log(lo[0]), np.log(hi[0]), size=spec.n_scales)
+        return np.exp(u)[:, None].repeat(n_axes, axis=1)
+    u = rng.uniform(np.log(lo), np.log(hi), size=(spec.n_scales, n_axes))
+    return np.exp(u)
+
+
+# Strategy registry — add new samplers here (e.g. "gaussian") without touching call sites.
+_RESOLUTION_SAMPLERS = {
+    "log_uniform": _sample_log_uniform,
+}
+
+
+def _sort_fine_to_coarse(res: np.ndarray) -> np.ndarray:
+    """Sort sampled resolutions (n_scales, n_axes) fine-to-coarse by per-scale geometric mean."""
+    keys = np.prod(res, axis=1)
+    return res[np.argsort(keys, kind="stable")]
+
+
+def _sample_resolutions(
+    spec: ResolutionSampling, n_axes: int, rng: np.random.RandomState
+) -> list[list[float]]:
+    """Draw a set of resolutions for one sample, in output_axes spatial order."""
+    raw = _RESOLUTION_SAMPLERS[spec.strategy](spec, n_axes, rng)
+    if spec.sort:
+        raw = _sort_fine_to_coarse(raw)
+    return [row.tolist() for row in raw]
+
+
 def _normalize_image_tensor(
     img_tensor: torch.Tensor,
     *,
@@ -121,8 +160,37 @@ def _normalize_image_tensor(
 
 
 @dataclass
+class ScaleResolution:
+    """Per-scale resolution of a set of target resolutions to pyramid reads.
+
+    Produced by ``VolumeDataset._resolve_scales`` — either once at init (fixed resolutions) or
+    fresh per ``__getitem__`` call (resolution sampling). All lists are length ``n_scales``.
+    """
+
+    # Per-scale target output resolution (spatial dims, image storage axis order)
+    resolutions: list[np.ndarray]
+    # Per-scale chosen image pyramid level to read from
+    chosen_levels: list[int]
+    # Per-scale spatial scale factors of the chosen level relative to level-0 (voxel ratio)
+    relative_scale_factors: list[np.ndarray]
+    # Per-scale storage read shape (image spatial axis order); resampled to read_shape on read
+    read_shapes: list[np.ndarray]
+    # Per-scale chosen label pyramid level (None if no labels)
+    label_chosen_levels: list[int] | None
+    # Per-scale label spatial scale factors of the chosen label level relative to image level-0
+    label_relative_scale_factors: list[np.ndarray] | None
+    # Per-scale label storage read shape (label spatial axis order)
+    label_read_shapes: list[np.ndarray] | None
+
+
+@dataclass
 class VolumeInfo:
-    """Resolved metadata for a single volume, ready for sampling."""
+    """Resolved metadata for a single volume, ready for sampling.
+
+    Holds the resolution-independent static metadata. The per-scale resolution
+    (``ScaleResolution``) is cached in ``scales`` when resolutions are fixed, or recomputed per
+    sample (``scales is None`` and ``sampling_spec`` is set).
+    """
 
     config: VolumeConfig
     image_meta: OmeMetadata
@@ -140,25 +208,18 @@ class VolumeInfo:
     # Level-0 (finest pyramid) absolute spatial voxel size (physical units). This is the
     # reference frame for center coordinates and min_center/max_center.
     finest_voxel_size: np.ndarray
-    # Per-scale target output resolution (spatial dims, image storage axis order)
-    resolutions: list[np.ndarray]
-    # Per-scale chosen image pyramid level to read from
-    chosen_levels: list[int]
-    # Per-scale chosen label pyramid level (None if no labels)
-    label_chosen_levels: list[int] | None
-    # Per-scale spatial scale factors of the chosen level relative to level-0 (voxel ratio)
-    relative_scale_factors: list[np.ndarray]
-    # Per-scale label spatial scale factors of the chosen label level relative to image level-0
-    label_relative_scale_factors: list[np.ndarray] | None
-    # Per-scale storage read shape (image spatial axis order); resampled to read_shape on read
-    read_shapes: list[np.ndarray]
-    # Per-scale label storage read shape (label spatial axis order)
-    label_read_shapes: list[np.ndarray] | None
+    # Per-level absolute spatial voxel sizes (for on-the-fly level selection)
+    img_level_voxels: dict[int, np.ndarray]
+    lbl_level_voxels: dict[int, np.ndarray] | None
+    # Output patch size in image spatial axis order (interpolation target for every scale)
+    read_shape: list[int]
     # Valid center coordinate range (spatial dims only, in image spatial axis order, level-0 frame)
     min_center: np.ndarray
     max_center: np.ndarray
-    # Output patch size in image spatial axis order (interpolation target for every scale)
-    read_shape: list[int]
+    # Cached per-scale resolution (fixed-resolution mode); None when sampling per call
+    scales: ScaleResolution | None = None
+    # Resolution sampling spec (sampling mode); None when resolutions are fixed
+    sampling_spec: ResolutionSampling | None = None
 
 
 class VolumeDataset(torch.utils.data.Dataset):
@@ -220,15 +281,25 @@ class VolumeDataset(torch.utils.data.Dataset):
                 f"    image: axes={vi.img_axes!r}, shape={finest_meta.shape}, "
                 f"dtype={finest_meta.dtype}",
             ]
-            # Per-scale: target resolution -> chosen source level (voxel size, storage read shape)
-            for s in range(len(vi.resolutions)):
-                target = vi.resolutions[s].tolist()
-                lvl = vi.chosen_levels[s]
-                lvl_voxel = (vi.relative_scale_factors[s] * vi.finest_voxel_size).tolist()
-                read = vi.read_shapes[s].tolist()
+            if vi.scales is not None:
+                # Fixed: target resolution -> chosen source level (voxel size, storage read shape)
+                sc = vi.scales
+                for s in range(len(sc.resolutions)):
+                    target = sc.resolutions[s].tolist()
+                    lvl = sc.chosen_levels[s]
+                    lvl_voxel = (sc.relative_scale_factors[s] * vi.finest_voxel_size).tolist()
+                    read = sc.read_shapes[s].tolist()
+                    lines.append(
+                        f"    scale {s}: resolution={target}{unit_label} -> level {lvl} "
+                        f"(voxel_size={lvl_voxel}, read {read} -> resample to {vi.read_shape})"
+                    )
+            else:
+                # Sampling: report the spec; resolutions drawn fresh per sample.
+                sp = vi.sampling_spec
                 lines.append(
-                    f"    scale {s}: resolution={target}{unit_label} -> level {lvl} "
-                    f"(voxel_size={lvl_voxel}, read {read} -> resample to {vi.read_shape})"
+                    f"    resolution_sampling: {sp.strategy}, n_scales={sp.n_scales}, "
+                    f"range [{sp.min}, {sp.max}]{unit_label}, "
+                    f"{'isotropic' if sp.isotropic else 'per-axis'}"
                 )
             if vi.label_meta is not None:
                 lbl_meta = vi.label_meta.scales[0]
@@ -297,7 +368,6 @@ class VolumeDataset(torch.utils.data.Dataset):
         read_shape = map_patch_size_to_input(
             self.config.patch_size, img_spatial, output_spatial
         )
-        read_shape_arr = np.array(read_shape, dtype=np.float64)
 
         # Reference frame: finest pyramid level (index 0) absolute spatial voxel size.
         finest_spatial_factors = np.array(
@@ -316,116 +386,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 for lvl, m in label_meta.scales.items()
             }
 
-        # Effective target resolutions for this volume, mapped to image storage spatial order.
-        effective_res = self.config.resolutions_for(vol_cfg)
-        resolutions: list[np.ndarray] = [
-            np.array(
-                map_patch_size_to_input(r, img_spatial, output_spatial), dtype=np.float64
-            )
-            for r in effective_res
-        ]
-
-        # Resolve each scale: chosen level, relative factors, storage read shapes.
-        chosen_levels: list[int] = []
-        relative_scale_factors: list[np.ndarray] = []
-        read_shapes: list[np.ndarray] = []
-        label_chosen_levels: list[int] | None = [] if label_meta is not None else None
-        label_relative_scale_factors: list[np.ndarray] | None = (
-            [] if label_meta is not None else None
-        )
-        label_read_shapes: list[np.ndarray] | None = (
-            [] if label_meta is not None else None
-        )
-
-        for scale_i, target in enumerate(resolutions):
-            img_lvl = _select_level_for_resolution(img_level_voxels, target)
-            img_voxel = img_level_voxels[img_lvl]
-            chosen_levels.append(img_lvl)
-            relative_scale_factors.append(img_voxel / finest_spatial_factors)
-            # Storage voxels to read so that, after resampling to read_shape, the output
-            # patch has voxel size `target`: read = patch * target / level_voxel.
-            read_shapes.append(
-                np.ceil(read_shape_arr * target / img_voxel).astype(np.int64)
-            )
-
-            if (
-                label_meta is not None
-                and lbl_level_voxels is not None
-                and lbl_sp_idx is not None
-            ):
-                # Map this scale's target into label spatial order (labels may store axes
-                # in a different order than the image).
-                lbl_target = np.array(
-                    map_patch_size_to_input(
-                        effective_res[scale_i], lbl_spatial, output_spatial
-                    ),
-                    dtype=np.float64,
-                )
-                lbl_lvl = _select_level_for_resolution(lbl_level_voxels, lbl_target)
-                lbl_voxel = lbl_level_voxels[lbl_lvl]
-                assert label_chosen_levels is not None
-                assert label_relative_scale_factors is not None
-                assert label_read_shapes is not None
-                label_chosen_levels.append(lbl_lvl)
-                label_relative_scale_factors.append(lbl_voxel / finest_spatial_factors)
-                label_read_shapes.append(
-                    np.ceil(
-                        np.array(
-                            map_patch_size_to_input(
-                                self.config.patch_size, lbl_spatial, output_spatial
-                            ),
-                            dtype=np.float64,
-                        )
-                        * lbl_target
-                        / lbl_voxel
-                    ).astype(np.int64)
-                )
-
-        # Compute valid center coordinate range (spatial dims only, level-0 frame)
-        finest_spatial_shape = np.array(image_meta.scales[0].shape)[img_sp_idx]
-        min_center = np.zeros(len(img_sp_idx), dtype=np.float64)
-        max_center = finest_spatial_shape.copy().astype(np.float64)
-
-        for s in range(len(resolutions)):
-            rf = relative_scale_factors[s]
-            img_sp_shape = np.array(
-                image_meta.scales[chosen_levels[s]].shape, dtype=np.float64
-            )[img_sp_idx]
-            eff_shape = read_shapes[s].astype(np.float64)
-            eff_half = np.floor(eff_shape / 2)
-            min_center = np.maximum(min_center, rf * eff_half)
-            max_center = np.minimum(
-                max_center, rf * (img_sp_shape - eff_shape + eff_half)
-            )
-
-            if (
-                label_meta is not None
-                and label_relative_scale_factors is not None
-                and label_chosen_levels is not None
-                and label_read_shapes is not None
-                and lbl_sp_idx is not None
-            ):
-                lrf = label_relative_scale_factors[s]
-                lbl_sp_shape = np.array(
-                    label_meta.scales[label_chosen_levels[s]].shape, dtype=np.float64
-                )[lbl_sp_idx]
-                lbl_eff = label_read_shapes[s].astype(np.float64)
-                lbl_half = np.floor(lbl_eff / 2)
-                min_center = np.maximum(min_center, lrf * lbl_half)
-                max_center = np.minimum(
-                    max_center, lrf * (lbl_sp_shape - lbl_eff + lbl_half)
-                )
-
-        # Apply optional bounding box constraint
-        if vol_cfg.bounding_box is not None:
-            bb = np.array(vol_cfg.bounding_box)
-            min_center = np.maximum(min_center, bb[:, 0].astype(np.float64))
-            max_center = np.minimum(max_center, bb[:, 1].astype(np.float64))
-
-        min_center = np.ceil(min_center).astype(np.int64)
-        max_center = np.floor(max_center).astype(np.int64)
-
-        return VolumeInfo(
+        # Build the static (resolution-independent) volume info first.
+        vol_info = VolumeInfo(
             config=vol_cfg,
             image_meta=image_meta,
             label_meta=label_meta,
@@ -437,17 +399,165 @@ class VolumeDataset(torch.utils.data.Dataset):
             lbl_spatial_idx=lbl_sp_idx,
             image_dtype=image_meta.scales[0].dtype,
             finest_voxel_size=finest_spatial_factors,
+            img_level_voxels=img_level_voxels,
+            lbl_level_voxels=lbl_level_voxels,
+            read_shape=read_shape,
+            min_center=np.zeros(len(img_sp_idx), dtype=np.int64),
+            max_center=np.zeros(len(img_sp_idx), dtype=np.int64),
+        )
+
+        sampling_spec = self.config.resolution_sampling_for(vol_cfg)
+        if sampling_spec is not None:
+            # Sampling mode: resolutions drawn per __getitem__. Bound centers using the coarsest
+            # case (the `max` resolution on every axis) — the largest physical extent is the
+            # binding constraint, so any sampled resolution <= max is guaranteed to fit.
+            vol_info.sampling_spec = sampling_spec
+            bound_res = [list(sampling_spec.max)] * sampling_spec.n_scales
+            scale_res = self._resolve_scales(vol_info, bound_res)
+        else:
+            # Fixed mode: resolve once and cache.
+            effective_res = self.config.resolutions_for(vol_cfg)
+            scale_res = self._resolve_scales(vol_info, effective_res)
+            vol_info.scales = scale_res
+
+        # _center_bounds folds in the volume fit and the strict bounding_box (extent-based).
+        min_center, max_center = self._center_bounds(vol_info, scale_res)
+        vol_info.min_center = np.ceil(min_center).astype(np.int64)
+        vol_info.max_center = np.floor(max_center).astype(np.int64)
+        return vol_info
+
+    def _resolve_scales(
+        self, vol_info: VolumeInfo, resolutions_output_order: list
+    ) -> ScaleResolution:
+        """Resolve a set of target resolutions (output_axes spatial order) to per-scale pyramid
+        reads. Pure function of the volume's static metadata; called once (fixed mode) or per
+        sample (sampling mode)."""
+        output_spatial = spatial_axes(self.config.output_axes)
+        img_spatial = vol_info.img_spatial_axes
+        lbl_spatial = vol_info.lbl_spatial_axes
+        finest = vol_info.finest_voxel_size
+        read_shape_arr = np.array(vol_info.read_shape, dtype=np.float64)
+        has_labels = vol_info.label_meta is not None and vol_info.lbl_level_voxels is not None
+
+        resolutions: list[np.ndarray] = []
+        chosen_levels: list[int] = []
+        relative_scale_factors: list[np.ndarray] = []
+        read_shapes: list[np.ndarray] = []
+        label_chosen_levels: list[int] | None = [] if has_labels else None
+        label_relative_scale_factors: list[np.ndarray] | None = [] if has_labels else None
+        label_read_shapes: list[np.ndarray] | None = [] if has_labels else None
+
+        for target_out in resolutions_output_order:
+            img_target = np.array(
+                map_patch_size_to_input(list(target_out), img_spatial, output_spatial),
+                dtype=np.float64,
+            )
+            resolutions.append(img_target)
+            img_lvl = _select_level_for_resolution(vol_info.img_level_voxels, img_target)
+            img_voxel = vol_info.img_level_voxels[img_lvl]
+            chosen_levels.append(img_lvl)
+            relative_scale_factors.append(img_voxel / finest)
+            # Storage voxels to read so that, after resampling to read_shape, the output patch
+            # has voxel size `target`: read = patch * target / level_voxel.
+            read_shapes.append(np.ceil(read_shape_arr * img_target / img_voxel).astype(np.int64))
+
+            if has_labels:
+                lbl_target = np.array(
+                    map_patch_size_to_input(list(target_out), lbl_spatial, output_spatial),
+                    dtype=np.float64,
+                )
+                lbl_lvl = _select_level_for_resolution(vol_info.lbl_level_voxels, lbl_target)
+                lbl_voxel = vol_info.lbl_level_voxels[lbl_lvl]
+                lbl_patch = np.array(
+                    map_patch_size_to_input(self.config.patch_size, lbl_spatial, output_spatial),
+                    dtype=np.float64,
+                )
+                label_chosen_levels.append(lbl_lvl)
+                label_relative_scale_factors.append(lbl_voxel / finest)
+                label_read_shapes.append(
+                    np.ceil(lbl_patch * lbl_target / lbl_voxel).astype(np.int64)
+                )
+
+        return ScaleResolution(
             resolutions=resolutions,
             chosen_levels=chosen_levels,
-            label_chosen_levels=label_chosen_levels,
             relative_scale_factors=relative_scale_factors,
-            label_relative_scale_factors=label_relative_scale_factors,
             read_shapes=read_shapes,
+            label_chosen_levels=label_chosen_levels,
+            label_relative_scale_factors=label_relative_scale_factors,
             label_read_shapes=label_read_shapes,
-            min_center=min_center,
-            max_center=max_center,
-            read_shape=read_shape,
         )
+
+    def _center_bounds(
+        self, vol_info: VolumeInfo, scale_res: ScaleResolution
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Valid center coordinate range (spatial dims, level-0 frame) for a ScaleResolution.
+
+        Keeps every scale's (image and label) read extent inside the volume and, when a
+        ``bounding_box`` is set, strictly inside that box. The bounding box constrains the read
+        *extent* (not just the center), so a centered patch placed at any returned center lies
+        fully within the box; the most restrictive (coarsest/largest) scale dominates.
+        """
+        img_sp_idx = vol_info.img_spatial_idx
+        finest_spatial_shape = np.array(vol_info.image_meta.scales[0].shape)[img_sp_idx]
+        min_center = np.zeros(len(img_sp_idx), dtype=np.float64)
+        max_center = finest_spatial_shape.copy().astype(np.float64)
+
+        bb = None
+        if vol_info.config.bounding_box is not None:
+            bb = np.array(vol_info.config.bounding_box, dtype=np.float64)  # ref-frame [lo, hi)
+
+        def _apply(rel: np.ndarray, eff: np.ndarray, sp_shape: np.ndarray) -> None:
+            nonlocal min_center, max_center
+            eff_half = np.floor(eff / 2)
+            # Volume fit (centered patch within [0, sp_shape) at this level).
+            min_center = np.maximum(min_center, rel * eff_half)
+            max_center = np.minimum(max_center, rel * (sp_shape - eff + eff_half))
+            if bb is not None:
+                # Strict bbox on the read extent. A centered patch spans (ref frame, worst-case
+                # over the floor()/eff//2 quantization) [center - (eff_half + 1)*rel,
+                # center + ceil(eff/2)*rel]; keep that inside [bb_lo, bb_hi).
+                ceil_half = np.ceil(eff / 2)
+                min_center = np.maximum(min_center, bb[:, 0] + (eff_half + 1.0) * rel)
+                max_center = np.minimum(max_center, bb[:, 1] - ceil_half * rel)
+
+        for s in range(len(scale_res.resolutions)):
+            img_sp_shape = np.array(
+                vol_info.image_meta.scales[scale_res.chosen_levels[s]].shape, dtype=np.float64
+            )[img_sp_idx]
+            _apply(
+                scale_res.relative_scale_factors[s],
+                scale_res.read_shapes[s].astype(np.float64),
+                img_sp_shape,
+            )
+
+            if (
+                vol_info.label_meta is not None
+                and scale_res.label_relative_scale_factors is not None
+                and scale_res.label_chosen_levels is not None
+                and scale_res.label_read_shapes is not None
+                and vol_info.lbl_spatial_idx is not None
+            ):
+                lbl_sp_shape = np.array(
+                    vol_info.label_meta.scales[scale_res.label_chosen_levels[s]].shape,
+                    dtype=np.float64,
+                )[vol_info.lbl_spatial_idx]
+                _apply(
+                    scale_res.label_relative_scale_factors[s],
+                    scale_res.label_read_shapes[s].astype(np.float64),
+                    lbl_sp_shape,
+                )
+
+        if bb is not None and np.any(np.ceil(min_center) > np.floor(max_center)):
+            raise ValueError(
+                f"Volume {vol_info.config.name!r}: bounding_box "
+                f"{vol_info.config.bounding_box} is too small to contain the requested "
+                f"window(s) at patch_size={self.config.patch_size}. Valid center range "
+                f"collapsed (min_center={np.ceil(min_center).tolist()} > "
+                f"max_center={np.floor(max_center).tolist()})."
+            )
+
+        return min_center, max_center
 
     def _build_sequential_grid(self) -> None:
         """Precompute flat list of (vol_idx, center, grid_index) for sequential sampling.
@@ -473,8 +583,10 @@ class VolumeDataset(torch.utils.data.Dataset):
                 ov, vol_info.img_spatial_axes, output_spatial
             )
 
-            # Scale-0 output voxel size in reference (level-0) voxels per axis.
-            ref_per_patch_voxel = vol_info.resolutions[0] / vol_info.finest_voxel_size
+            # Scale-0 output voxel size in reference (level-0) voxels per axis. Sequential mode
+            # always uses fixed resolutions (sampling is rejected by config validation).
+            assert vol_info.scales is not None
+            ref_per_patch_voxel = vol_info.scales.resolutions[0] / vol_info.finest_voxel_size
             stride = (
                 (np.array(vol_info.read_shape) - np.array(overlap_input)) * ref_per_patch_voxel
             )
@@ -517,8 +629,24 @@ class VolumeDataset(torch.utils.data.Dataset):
                 zarr_ver = vol_info.config.zarr_version
                 stores[vol_name] = {"img": {}, "label": {}}
 
-                # Open the union of chosen pyramid levels across scales (deduped).
-                for level in sorted(set(vol_info.chosen_levels)):
+                # Which pyramid levels to open: the union of cached chosen levels in fixed mode,
+                # or all levels in sampling mode (any level may be selected per call).
+                if vol_info.scales is not None:
+                    img_levels = sorted(set(vol_info.scales.chosen_levels))
+                    lbl_levels = (
+                        sorted(set(vol_info.scales.label_chosen_levels))
+                        if vol_info.scales.label_chosen_levels is not None
+                        else []
+                    )
+                else:
+                    img_levels = sorted(vol_info.image_meta.scales.keys())
+                    lbl_levels = (
+                        sorted(vol_info.label_meta.scales.keys())
+                        if vol_info.label_meta is not None
+                        else []
+                    )
+
+                for level in img_levels:
                     img_array_path = (
                         zarr_path
                         / vol_info.config.image_key
@@ -528,8 +656,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                         img_array_path, zarr_ver, ctx
                     )
 
-                if vol_info.config.label_key and vol_info.label_meta and vol_info.label_chosen_levels:
-                    for level in sorted(set(vol_info.label_chosen_levels)):
+                if vol_info.config.label_key and vol_info.label_meta:
+                    for level in lbl_levels:
                         lbl_array_path = (
                             zarr_path
                             / vol_info.config.label_key
@@ -574,6 +702,15 @@ class VolumeDataset(torch.utils.data.Dataset):
         vol_stores = stores[vol_info.config.name]
         output_spatial = spatial_axes(self.config.output_axes)
         spatial_perm = compute_permutation(vol_info.img_spatial_axes, output_spatial)
+
+        # Per-scale reads: cached (fixed resolutions) or freshly drawn (resolution sampling).
+        if vol_info.scales is not None:
+            scales = vol_info.scales
+        else:
+            sampled = _sample_resolutions(
+                vol_info.sampling_spec, len(output_spatial), np.random
+            )
+            scales = self._resolve_scales(vol_info, sampled)
 
         # Determine image intermediate axes after stacking: "l" + img_axes
         # Handle channel mismatch:
@@ -625,23 +762,17 @@ class VolumeDataset(torch.utils.data.Dataset):
         label_crops: list[np.ndarray] = []
         bboxes: list[np.ndarray] = []
 
-        # Reference-frame ROI for any valid center in [min_center, max_center] at the first
-        # scale — used to clip random coarse origins when sample_windows is enabled (includes
-        # optional bounding_box via min/max_center). The origins produced by
-        # _random_patch_origin_covering_fine_extent are in chosen-level voxels, so the ROI is
-        # expressed in reference (level-0) voxels via scale-0's relative factors.
+        # When sample_windows samples a coarser scale's origin off-center, constrain its read
+        # extent to the bounding_box (reference / level-0 voxels) so every window stays strictly
+        # inside the box. Without a bounding_box, only covering + volume bounds apply. The box is
+        # a hard constraint here; _center_bounds guarantees a feasible origin exists.
         sample_roi_lo: np.ndarray | None = None
         sample_roi_hi_excl: np.ndarray | None = None
-        n_scales = len(vol_info.resolutions)
-        if self.config.sample_windows and n_scales > 1:
-            rel0 = vol_info.relative_scale_factors[0]
-            eff0 = vol_info.read_shapes[0]
-            h0 = (eff0 // 2).astype(np.float64) * rel0
-            eff0_ref = eff0.astype(np.float64) * rel0
-            sample_roi_lo = vol_info.min_center.astype(np.float64) - h0
-            sample_roi_hi_excl = (
-                vol_info.max_center.astype(np.float64) - h0 + eff0_ref
-            )
+        n_scales = len(scales.resolutions)
+        if self.config.sample_windows and n_scales > 1 and vol_info.config.bounding_box is not None:
+            bb = np.array(vol_info.config.bounding_box, dtype=np.float64)
+            sample_roi_lo = bb[:, 0]
+            sample_roi_hi_excl = bb[:, 1]
 
         # Phase 1: Compute slices and issue all reads concurrently via ts.Batch
         img_futures: list[ts.Future] = []
@@ -653,9 +784,9 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         with ts.Batch() as batch:
             for s in range(n_scales):
-                level = vol_info.chosen_levels[s]
-                rel_factors = vol_info.relative_scale_factors[s]
-                eff_shape = vol_info.read_shapes[s]
+                level = scales.chosen_levels[s]
+                rel_factors = scales.relative_scale_factors[s]
+                eff_shape = scales.read_shapes[s]
                 eff_half = eff_shape // 2
 
                 if self.config.sample_windows and s > 0:
@@ -703,16 +834,16 @@ class VolumeDataset(torch.utils.data.Dataset):
 
                 if (
                     vol_info.config.label_key
-                    and vol_info.label_chosen_levels is not None
+                    and scales.label_chosen_levels is not None
                     and vol_info.label_meta is not None
-                    and vol_info.label_relative_scale_factors is not None
-                    and vol_info.label_read_shapes is not None
+                    and scales.label_relative_scale_factors is not None
+                    and scales.label_read_shapes is not None
                     and vol_info.lbl_axes is not None
                     and vol_info.lbl_spatial_idx is not None
                 ):
-                    lbl_level = vol_info.label_chosen_levels[s]
-                    lbl_rel_factors = vol_info.label_relative_scale_factors[s]
-                    lbl_eff_shape = vol_info.label_read_shapes[s]
+                    lbl_level = scales.label_chosen_levels[s]
+                    lbl_rel_factors = scales.label_relative_scale_factors[s]
+                    lbl_eff_shape = scales.label_read_shapes[s]
                     lbl_eff_half = lbl_eff_shape // 2
                     if self.config.sample_windows and s > 0:
                         center_fine = (
@@ -833,8 +964,8 @@ class VolumeDataset(torch.utils.data.Dataset):
             "meta": {
                 "volume": vol_info.config.name,
                 "coordinate": center.tolist(),
-                "resolutions": [r.tolist() for r in vol_info.resolutions],
-                "source_levels": vol_info.chosen_levels,
+                "resolutions": [r.tolist() for r in scales.resolutions],
+                "source_levels": scales.chosen_levels,
                 # grid_index only present in sequential mode; None breaks DataLoader collation
                 **({"grid_index": grid_index} if grid_index is not None else {}),
             },
