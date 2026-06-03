@@ -588,18 +588,14 @@ class TestVolumeDataset:
 class TestResolutionSampling:
     """Random per-sample resolution sampling (resolution_sampling)."""
 
-    def _cfg(self, zarr2_volume, **spec_overrides):
-        spec = {
-            "strategy": "log_uniform",
-            "n_scales": 2,
-            "min": [1, 1, 1],
-            "max": [4, 4, 4],
-            "isotropic": True,
-            **spec_overrides,
-        }
+    # Default: one isotropic range 1..4 (shorthand), 2 scales.
+    DEFAULT_SPEC = {"strategy": "log_uniform", "ranges": [[[1], [4]]], "n_scales": 2}
+
+    def _cfg(self, zarr2_volume, spec=None, **vol):
+        v = {"name": "test", "path": str(zarr2_volume), "image_key": "raw", **vol}
         return MiaoConfig(
-            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
-            resolution_sampling=spec,
+            volumes=[v],
+            resolution_sampling=spec or self.DEFAULT_SPEC,
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             samples_per_epoch=30,
@@ -622,15 +618,16 @@ class TestResolutionSampling:
             assert np.prod(res[0]) <= np.prod(res[1]) + 1e-9
 
     def test_isotropic_equal_per_axis(self, zarr2_volume: Path):
-        ds = VolumeDataset(self._cfg(zarr2_volume, isotropic=True))
+        ds = VolumeDataset(self._cfg(zarr2_volume))  # isotropic ranges
         np.random.seed(2)
         for i in range(10):
             for r in ds[i]["meta"]["resolutions"]:
                 assert len(set(r)) == 1, r
 
     def test_per_axis_varies(self, zarr2_volume: Path):
-        """Non-isotropic sampling can produce anisotropic voxels."""
-        ds = VolumeDataset(self._cfg(zarr2_volume, isotropic=False, n_scales=1))
+        """A per-axis range (full-length bounds) can produce anisotropic voxels."""
+        spec = {"strategy": "log_uniform", "ranges": [[[1, 1, 1], [4, 4, 4]]], "n_scales": 1}
+        ds = VolumeDataset(self._cfg(zarr2_volume, spec))
         np.random.seed(3)
         saw_aniso = False
         for i in range(30):
@@ -639,6 +636,23 @@ class TestResolutionSampling:
                 saw_aniso = True
                 break
         assert saw_aniso
+
+    def test_multiple_ranges_total_scales_and_bands(self, zarr2_volume: Path):
+        """Two disjoint ranges with per-range counts -> total scales = sum; draws fall in bands."""
+        spec = {
+            "strategy": "log_uniform",
+            "ranges": [[[1], [2]], [[3], [4]]],
+            "n_scales": [1, 2],
+        }
+        ds = VolumeDataset(self._cfg(zarr2_volume, spec))
+        np.random.seed(8)
+        for i in range(30):
+            res = np.array(ds[i]["meta"]["resolutions"])
+            assert res.shape == (3, 3)  # total 3 scales, 3 axes
+            vals = sorted(res[:, 0])  # isotropic -> per-scale scalar
+            # one draw in [1,2], two draws in [3,4] (after sorting, first in band 1, rest band 2)
+            assert 1.0 - 1e-6 <= vals[0] <= 2.0 + 1e-6
+            assert all(3.0 - 1e-6 <= v <= 4.0 + 1e-6 for v in vals[1:])
 
     def test_draws_vary_across_calls(self, zarr2_volume: Path):
         ds = VolumeDataset(self._cfg(zarr2_volume))
@@ -664,27 +678,7 @@ class TestResolutionSampling:
 
     def test_with_labels(self, zarr2_volume: Path):
         """Sampling works alongside labels; label output matches patch_size."""
-        cfg = MiaoConfig(
-            volumes=[
-                {
-                    "name": "test",
-                    "path": str(zarr2_volume),
-                    "image_key": "raw",
-                    "label_key": "labels/seg",
-                }
-            ],
-            resolution_sampling={
-                "strategy": "log_uniform",
-                "n_scales": 2,
-                "min": [1, 1, 1],
-                "max": [4, 4, 4],
-                "isotropic": True,
-            },
-            output_axes="lzyx",
-            patch_size=[8, 8, 8],
-            samples_per_epoch=10,
-        )
-        ds = VolumeDataset(cfg)
+        ds = VolumeDataset(self._cfg(zarr2_volume, label_key="labels/seg"))
         np.random.seed(6)
         sample = ds[0]
         assert sample["img"].shape == (2, 8, 8, 8)
@@ -791,10 +785,8 @@ class TestBoundingBox:
             zarr2_volume,
             resolution_sampling={
                 "strategy": "log_uniform",
+                "ranges": [[[1], [4]]],
                 "n_scales": 2,
-                "min": [1, 1, 1],
-                "max": [4, 4, 4],
-                "isotropic": True,
             },
         )
         self._assert_inside(VolumeDataset(cfg))

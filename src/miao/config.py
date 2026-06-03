@@ -12,28 +12,54 @@ from pydantic import BaseModel, field_validator, model_validator
 class ResolutionSampling(BaseModel):
     """Spec for randomly sampling output resolutions per __getitem__ call.
 
-    An alternative to a fixed `resolutions` list: each sample draws `n_scales` resolutions from
-    `[min, max]` (per spatial axis, in output_axes spatial order — like patch_size), then sorts
-    them fine-to-coarse. The drawn resolutions are reported in meta["resolutions"].
+    An alternative to a fixed `resolutions` list. Resolutions are drawn from one or more ranges
+    (physical voxel size, same unit as the zarr's OME coordinateTransformations — e.g. nm), then
+    sorted fine-to-coarse. The drawn resolutions are reported in meta["resolutions"].
+
+    `ranges` is a list of `[min, max]` pairs. Each bound is either a per-spatial-axis list
+    (output_axes spatial order, like patch_size) or a single-element list `[v]`, which is
+    isotropic — the value is broadcast to all axes. Examples::
+
+        ranges: [[[1, 1, 1], [4, 4, 4]]]          # one range, 1 -> 4 per axis
+        ranges: [[[1], [4]]]                       # same, isotropic shorthand
+        ranges: [[[1, 1, 1], [2, 2, 2]], [[4, 4, 4], [8, 8, 8]]]   # two ranges
+
+    `n_scales` is the number of scales to draw from each range, either a list (one entry per
+    range) or a scalar applied to every range. The total number of scales (the stacked 'l'
+    dimension) is the sum.
     """
 
     # Sampling strategy. Only "log_uniform" is implemented; the dataset dispatches through a
     # registry, so additional strategies (e.g. gaussian) can be added without schema changes.
     strategy: Literal["log_uniform"] = "log_uniform"
-    n_scales: int
-    min: list[float]  # minimum output voxel size per spatial axis (output_axes spatial order)
-    max: list[float]  # maximum output voxel size per spatial axis (output_axes spatial order)
-    # If True, draw one scalar factor per scale and broadcast to all axes (cubic/isotropic
-    # voxel). If False, draw each spatial axis independently (anisotropic voxel allowed).
-    isotropic: bool = False
+    # [[min, max], ...] — each bound is a per-axis list or single-element (isotropic) list.
+    ranges: list[list[list[float]]]
+    # Scales to draw per range: a scalar (same for all ranges) or a list (one per range).
+    n_scales: Union[int, list[int]] = 1
     sort: bool = True  # sort the sampled scales fine-to-coarse
 
-    @field_validator("n_scales")
-    @classmethod
-    def validate_n_scales(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError(f"n_scales must be >= 1, got {v}")
-        return v
+    def n_scales_per_range(self) -> list[int]:
+        """Number of scales to draw from each range."""
+        if isinstance(self.n_scales, int):
+            return [self.n_scales] * len(self.ranges)
+        return list(self.n_scales)
+
+    def total_n_scales(self) -> int:
+        """Total number of scales (the stacked 'l' dimension)."""
+        return sum(self.n_scales_per_range())
+
+    @staticmethod
+    def range_is_isotropic(rng: list[list[float]]) -> bool:
+        """A range is isotropic when its bounds are given as single values."""
+        return len(rng[0]) == 1
+
+    def max_resolution(self, n_axes: int) -> list[float]:
+        """Per-axis coarsest (largest) upper bound across all ranges (output spatial order)."""
+        out = [0.0] * n_axes
+        for _lo, hi in self.ranges:
+            hi_axes = hi * n_axes if len(hi) == 1 else hi
+            out = [max(out[i], hi_axes[i]) for i in range(n_axes)]
+        return out
 
 
 class VolumeConfig(BaseModel):
@@ -154,12 +180,12 @@ class MiaoConfig(BaseModel):
         if self.resolutions is not None:
             return len(self.resolutions)
         if self.resolution_sampling is not None:
-            return self.resolution_sampling.n_scales
+            return self.resolution_sampling.total_n_scales()
         # Mixed/invalid global config is caught by validators; fall back to the first volume.
         vol = self.volumes[0]
         if vol.resolutions is not None:
             return len(vol.resolutions)
-        return vol.resolution_sampling.n_scales
+        return vol.resolution_sampling.total_n_scales()
 
     @model_validator(mode="after")
     def validate_patch_size_dims(self) -> "MiaoConfig":
@@ -192,17 +218,40 @@ class MiaoConfig(BaseModel):
                     raise ValueError(f"{where}[{i}]={r} must have all positive values")
 
         def _check_sampling(spec: ResolutionSampling, where: str) -> None:
-            if len(spec.min) != n_spatial or len(spec.max) != n_spatial:
-                raise ValueError(
-                    f"{where} min/max must each have {n_spatial} elements (output_axes "
-                    f"{self.output_axes!r} spatial dims), got min={spec.min}, max={spec.max}"
-                )
-            if any(v <= 0 for v in spec.min) or any(v <= 0 for v in spec.max):
-                raise ValueError(f"{where} min/max must have all positive values")
-            if any(mx < mn for mn, mx in zip(spec.min, spec.max)):
-                raise ValueError(
-                    f"{where} requires min[i] <= max[i] per axis, got min={spec.min}, max={spec.max}"
-                )
+            if len(spec.ranges) == 0:
+                raise ValueError(f"{where} must contain at least one range")
+            for j, rng in enumerate(spec.ranges):
+                if len(rng) != 2:
+                    raise ValueError(
+                        f"{where} ranges[{j}] must be [min, max], got {rng}"
+                    )
+                lo, hi = rng
+                if len(lo) != len(hi):
+                    raise ValueError(
+                        f"{where} ranges[{j}] min/max length mismatch: {lo} vs {hi}"
+                    )
+                if len(lo) not in (1, n_spatial):
+                    raise ValueError(
+                        f"{where} ranges[{j}] bounds must have 1 (isotropic) or {n_spatial} "
+                        f"elements (output_axes {self.output_axes!r} spatial dims), got {len(lo)}"
+                    )
+                if any(v <= 0 for v in lo + hi):
+                    raise ValueError(f"{where} ranges[{j}]={rng} must have all positive values")
+                if any(h < l for l, h in zip(lo, hi)):
+                    raise ValueError(
+                        f"{where} ranges[{j}] requires min[i] <= max[i] per axis, got {lo}, {hi}"
+                    )
+            ns = spec.n_scales
+            if isinstance(ns, list):
+                if len(ns) != len(spec.ranges):
+                    raise ValueError(
+                        f"{where} n_scales has {len(ns)} entries but there are "
+                        f"{len(spec.ranges)} ranges"
+                    )
+                if any(k < 1 for k in ns):
+                    raise ValueError(f"{where} n_scales entries must each be >= 1, got {ns}")
+            elif ns < 1:
+                raise ValueError(f"{where} n_scales must be >= 1, got {ns}")
 
         def _exactly_one(res, samp, where: str) -> None:
             if (res is None) == (samp is None):
@@ -234,7 +283,7 @@ class MiaoConfig(BaseModel):
             # Every volume must resolve to the same number of scales.
             res = self.resolutions_for(vol)
             samp = self.resolution_sampling_for(vol)
-            n = len(res) if res is not None else samp.n_scales
+            n = len(res) if res is not None else samp.total_n_scales()
             if n != self.n_scales:
                 raise ValueError(
                     f"Volume {vol.name!r} defines {n} scales but the config defines "
@@ -253,11 +302,14 @@ class MiaoConfig(BaseModel):
         if self.sample_windows and any_sampling:
             for vol in self.volumes:
                 samp = self.resolution_sampling_for(vol)
-                if samp is not None and not samp.isotropic:
+                if samp is not None and not all(
+                    ResolutionSampling.range_is_isotropic(r) for r in samp.ranges
+                ):
                     raise ValueError(
                         f"Volume {vol.name!r}: sample_windows with resolution_sampling requires "
-                        "isotropic=True (per-axis-independent draws cannot guarantee the per-axis "
-                        "fine-to-coarse ordering sample_windows needs)"
+                        "every range to be isotropic (single-value bounds, e.g. [[1], [4]]) — "
+                        "per-axis-independent draws cannot guarantee the per-axis fine-to-coarse "
+                        "ordering sample_windows needs"
                     )
         return self
 

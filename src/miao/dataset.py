@@ -102,18 +102,22 @@ def _select_level_for_resolution(
 def _sample_log_uniform(
     spec: ResolutionSampling, n_axes: int, rng: np.random.RandomState
 ) -> np.ndarray:
-    """Draw resolutions log-uniformly over [min, max]. Returns (n_scales, n_axes), output order.
-
-    If ``spec.isotropic``, one scalar is drawn per scale (using axis 0's range) and broadcast to
-    all axes, yielding cubic voxels; otherwise each axis is drawn independently.
+    """Draw resolutions log-uniformly from each range. Returns (total_n_scales, n_axes), output
+    order. Isotropic ranges (single-value bounds) draw one scalar per scale and broadcast to all
+    axes (cubic voxel); per-axis ranges draw each axis independently.
     """
-    lo = np.array(spec.min, dtype=np.float64)
-    hi = np.array(spec.max, dtype=np.float64)
-    if spec.isotropic:
-        u = rng.uniform(np.log(lo[0]), np.log(hi[0]), size=spec.n_scales)
-        return np.exp(u)[:, None].repeat(n_axes, axis=1)
-    u = rng.uniform(np.log(lo), np.log(hi), size=(spec.n_scales, n_axes))
-    return np.exp(u)
+    counts = spec.n_scales_per_range()
+    chunks: list[np.ndarray] = []
+    for (lo, hi), k in zip(spec.ranges, counts):
+        lo_a = np.array(lo, dtype=np.float64)
+        hi_a = np.array(hi, dtype=np.float64)
+        if lo_a.shape[0] == 1:  # isotropic range
+            u = rng.uniform(np.log(lo_a[0]), np.log(hi_a[0]), size=k)
+            chunks.append(np.exp(u)[:, None].repeat(n_axes, axis=1))
+        else:
+            u = rng.uniform(np.log(lo_a), np.log(hi_a), size=(k, n_axes))
+            chunks.append(np.exp(u))
+    return np.concatenate(chunks, axis=0)
 
 
 # Strategy registry — add new samplers here (e.g. "gaussian") without touching call sites.
@@ -297,10 +301,12 @@ class VolumeDataset(torch.utils.data.Dataset):
                 # Sampling: report the spec; resolutions drawn fresh per sample.
                 sp = vi.sampling_spec
                 lines.append(
-                    f"    resolution_sampling: {sp.strategy}, n_scales={sp.n_scales}, "
-                    f"range [{sp.min}, {sp.max}]{unit_label}, "
-                    f"{'isotropic' if sp.isotropic else 'per-axis'}"
+                    f"    resolution_sampling: {sp.strategy}, "
+                    f"total_scales={sp.total_n_scales()}{unit_label}"
                 )
+                for (lo, hi), k in zip(sp.ranges, sp.n_scales_per_range()):
+                    iso = " (isotropic)" if sp.range_is_isotropic([lo, hi]) else ""
+                    lines.append(f"      range {lo}..{hi} x{k}{iso}")
             if vi.label_meta is not None:
                 lbl_meta = vi.label_meta.scales[0]
                 lines.append(
@@ -409,10 +415,11 @@ class VolumeDataset(torch.utils.data.Dataset):
         sampling_spec = self.config.resolution_sampling_for(vol_cfg)
         if sampling_spec is not None:
             # Sampling mode: resolutions drawn per __getitem__. Bound centers using the coarsest
-            # case (the `max` resolution on every axis) — the largest physical extent is the
-            # binding constraint, so any sampled resolution <= max is guaranteed to fit.
+            # case (the per-axis max upper bound across all ranges) — the largest physical extent
+            # is the binding constraint, so any sampled resolution is guaranteed to fit.
             vol_info.sampling_spec = sampling_spec
-            bound_res = [list(sampling_spec.max)] * sampling_spec.n_scales
+            n_axes = len(output_spatial)
+            bound_res = [sampling_spec.max_resolution(n_axes)]
             scale_res = self._resolve_scales(vol_info, bound_res)
         else:
             # Fixed mode: resolve once and cache.

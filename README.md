@@ -56,18 +56,23 @@ as a per-volume override) *instead of* `resolutions`:
 ```yaml
 resolution_sampling:
   strategy: log_uniform     # only option for now (pluggable; gaussian etc. can be added)
-  n_scales: 3               # number of scales (the 'l' dimension)
-  min: [8, 8, 8]            # min output voxel size per spatial axis (output_axes order)
-  max: [64, 64, 64]         # max output voxel size per spatial axis
-  isotropic: true           # one factor per scale across axes (cubic); false = per-axis independent
+  ranges: [[[8, 8, 8], [64, 64, 64]]]   # one or more [min, max] ranges (output_axes spatial order)
+  n_scales: 3               # scales to draw per range — scalar (all ranges) or list (one per range)
   sort: true                # sort the drawn scales fine -> coarse
 ```
 
-Each `__getitem__` draws `n_scales` resolutions log-uniformly over `[min, max]`, sorts them
-fine→coarse, and the drawn values are reported in `meta["resolutions"]` (so a model can
-condition on them). The output is always `patch_size` per scale. Constraints: exactly one of
+`ranges` is a list of `[min, max]` pairs. Each bound is either a per-spatial-axis list or a
+single-element list `[v]`, which is **isotropic** (broadcast to all axes). For example
+`[[[1, 1, 1], [4, 4, 4]]]` and `[[[1], [4]]]` both mean one isotropic range from 1 to 4;
+`[[[1], [2]], [[4], [8]]]` is two ranges. `n_scales` is the number of scales to draw from each
+range — a scalar applies the same count to every range, or pass a list (e.g. `[1, 1]`). The total
+number of scales (the `l` dimension) is the sum.
+
+Each `__getitem__` draws those resolutions log-uniformly within each range, sorts them
+fine→coarse, and the drawn values are reported in `meta["resolutions"]` (so a model can condition
+on them). The output is always `patch_size` per scale. Constraints: exactly one of
 `resolutions` / `resolution_sampling` may be set; `resolution_sampling` is incompatible with
-`sampling: "sequential"`; and `sample_windows` requires `isotropic: true`.
+`sampling: "sequential"`; and `sample_windows` requires every range to be isotropic.
 
 ### 2. Create a dataset
 
@@ -122,7 +127,7 @@ Each sample:
 | `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`). Also see `normalize_min` / `normalize_max` to set upper and lower normalization bounds|
 | `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis (finest-level voxels, storage axis order). Every window's read extent — at every scale, including coarser `sample_windows` patches — is kept strictly inside the box. Must be at least as large as the coarsest window, or dataset construction raises. |
 | `resolutions` | List of desired output resolutions, one tuple per scale. Each tuple is the output voxel size per spatial axis (physical units), in `output_axes` spatial order. The number of scales (the `l` dimension) is `len(resolutions)`. Mutually exclusive with `resolution_sampling` |
-| `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, n_scales, min, max, isotropic, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
+| `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, ranges, n_scales, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
 | `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
 | `patch_size` | Voxel count per crop, in `output_axes` spatial order |
 | `bbox_mode` | `"absolute"` (world coords, e.g. nm) or `"relative"` (relative to finest-level crop origin). Default: `"absolute"` |

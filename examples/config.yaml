@@ -28,10 +28,8 @@ resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
 # Alternatively, draw resolutions randomly per sample (set instead of `resolutions`):
 # resolution_sampling:
 #   strategy: log_uniform   # only option for now (pluggable)
-#   n_scales: 3
-#   min: [8, 8, 8]          # output_axes spatial order
-#   max: [64, 64, 64]
-#   isotropic: true         # one factor per scale across axes; false = per-axis independent
+#   ranges: [[[8, 8, 8], [64, 64, 64]]]   # [min, max] ranges; use [[v], [w]] for isotropic shorthand
+#   n_scales: 3             # scales per range — scalar (all ranges) or list (one per range, e.g. [1, 2])
 #   sort: true              # sort drawn scales fine -> coarse
 output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
 patch_size: [128, 128, 32]

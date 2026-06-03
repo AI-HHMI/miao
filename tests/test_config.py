@@ -12,10 +12,8 @@ def _vol(name="a", **kw):
 
 SAMPLING = {
     "strategy": "log_uniform",
+    "ranges": [[[8], [64]]],  # isotropic shorthand
     "n_scales": 3,
-    "min": [8, 8, 8],
-    "max": [64, 64, 64],
-    "isotropic": True,
 }
 
 
@@ -122,19 +120,67 @@ class TestResolutionSampling:
         with pytest.raises(ValueError, match="min\\[i\\] <= max\\[i\\]"):
             MiaoConfig(
                 volumes=[_vol()],
-                resolution_sampling={**SAMPLING, "min": [9, 8, 8], "max": [8, 8, 8]},
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[9, 8, 8], [8, 8, 8]]],
+                    "n_scales": 1,
+                },
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
             )
 
     def test_wrong_axis_count(self):
-        with pytest.raises(ValueError, match="must each have 3 elements"):
+        with pytest.raises(ValueError, match="1 \\(isotropic\\) or 3"):
             MiaoConfig(
                 volumes=[_vol()],
-                resolution_sampling={**SAMPLING, "min": [8, 8], "max": [64, 64]},
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[8, 8], [64, 64]]],
+                    "n_scales": 1,
+                },
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
             )
+
+    def test_n_scales_list_length_mismatch(self):
+        with pytest.raises(ValueError, match="n_scales has 1 entries but there are 2 ranges"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[1], [2]], [[4], [8]]],
+                    "n_scales": [1],
+                },
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_isotropic_shorthand_and_total_scales(self):
+        # Two ranges, scalar n_scales applied to both -> total 4 scales.
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling={
+                "strategy": "log_uniform",
+                "ranges": [[[1], [2]], [[4], [8]]],
+                "n_scales": 2,
+            },
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.n_scales == 4
+
+    def test_n_scales_list_per_range(self):
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling={
+                "strategy": "log_uniform",
+                "ranges": [[[1, 1, 1], [2, 2, 2]], [[4, 4, 4], [8, 8, 8]]],
+                "n_scales": [1, 3],
+            },
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.n_scales == 4
 
     def test_rejected_with_sequential(self):
         with pytest.raises(ValueError, match="incompatible with sampling='sequential'"):
@@ -147,10 +193,14 @@ class TestResolutionSampling:
             )
 
     def test_sample_windows_requires_isotropic(self):
-        with pytest.raises(ValueError, match="requires\\s+isotropic=True"):
+        with pytest.raises(ValueError, match="every range to be isotropic"):
             MiaoConfig(
                 volumes=[_vol()],
-                resolution_sampling={**SAMPLING, "isotropic": False},
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[8, 8, 8], [64, 64, 64]]],  # per-axis, not isotropic
+                    "n_scales": 3,
+                },
                 output_axes="lzyx",
                 patch_size=[8, 8, 8],
                 sample_windows=True,
@@ -159,7 +209,7 @@ class TestResolutionSampling:
     def test_sample_windows_isotropic_ok(self):
         cfg = MiaoConfig(
             volumes=[_vol()],
-            resolution_sampling={**SAMPLING, "isotropic": True},
+            resolution_sampling=SAMPLING,  # isotropic shorthand ranges
             output_axes="lzyx",
             patch_size=[8, 8, 8],
             sample_windows=True,
