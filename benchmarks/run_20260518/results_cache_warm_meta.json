@@ -1,0 +1,21 @@
+{
+  "label": "cache_warm",
+  "timestamp": "2026-05-13T14:13:04.713537",
+  "num_samples": 100,
+  "startup_ms": 3.682771697640419,
+  "config": {
+    "volumes": [
+      "Jiefu Cerebellum FIB-SEM",
+      "H01 Human Cortex"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

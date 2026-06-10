@@ -220,11 +220,39 @@ class VolumeInfo:
     # Valid center coordinate range (spatial dims only, in image spatial axis order, level-0 frame)
     min_center: np.ndarray
     max_center: np.ndarray
+    
     # Cached per-scale resolution (fixed-resolution mode); None when sampling per call
     scales: ScaleResolution | None = None
     # Resolution sampling spec (sampling mode); None when resolutions are fixed
     sampling_spec: ResolutionSampling | None = None
+    
+    # Smallest safe dtypes for label data (derived from on-disk dtype)
+    label_np_dtype: np.dtype = np.dtype(np.int64)
+    label_torch_dtype: torch.dtype = torch.int64
 
+
+def _label_dtypes(source_dtype: np.dtype) -> tuple[np.dtype, torch.dtype]:
+    """Pick the smallest safe integer dtypes for label data.
+
+    Maps the on-disk label dtype to the narrowest numpy/torch integer type
+    that can represent the full value range without overflow.
+    """
+    if np.issubdtype(source_dtype, np.floating):
+        return np.dtype(np.int64), torch.int64
+
+    info = np.iinfo(source_dtype)
+    lo, hi = info.min, info.max
+    # Check signed types from narrowest to widest
+    for np_dt, torch_dt in [
+        (np.int8, torch.int8),
+        (np.int16, torch.int16),
+        (np.int32, torch.int32),
+        (np.int64, torch.int64),
+    ]:
+        ii = np.iinfo(np_dt)
+        if ii.min <= lo and ii.max >= hi:
+            return np.dtype(np_dt), torch_dt
+    return np.dtype(np.int64), torch.int64
 
 class VolumeDataset(torch.utils.data.Dataset):
     """Map-style dataset that yields multi-scale random patches from OME-NGFF zarr volumes.
@@ -311,10 +339,13 @@ class VolumeDataset(torch.utils.data.Dataset):
                 lbl_meta = vi.label_meta.scales[0]
                 lines.append(
                     f"    label: axes={vi.lbl_axes!r}, shape={lbl_meta.shape}, "
-                    f"dtype={lbl_meta.dtype}"
+                    f"dtype={lbl_meta.dtype} -> {vi.label_np_dtype}"
                 )
             lines.append(f"    sampling: weight={prob:.2f}, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
+            if self.config.chunk_aligned:
+                sp_chunks = [finest_meta.chunks[i] for i in vi.img_spatial_idx]
+                lines.append(f"    chunk_aligned: spatial_chunks={sp_chunks}")
             if vi.config.normalize:
                 if (
                     vi.config.normalize_min is not None
@@ -392,6 +423,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                 for lvl, m in label_meta.scales.items()
             }
 
+        # Derive smallest safe label dtypes from on-disk dtype
+        if label_meta is not None:
+            lbl_np_dt, lbl_torch_dt = _label_dtypes(
+                label_meta.scales[0].dtype
+            )
+        else:
+            lbl_np_dt, lbl_torch_dt = np.dtype(np.int64), torch.int64
+            
         # Build the static (resolution-independent) volume info first.
         vol_info = VolumeInfo(
             config=vol_cfg,
@@ -410,6 +449,8 @@ class VolumeDataset(torch.utils.data.Dataset):
             read_shape=read_shape,
             min_center=np.zeros(len(img_sp_idx), dtype=np.int64),
             max_center=np.zeros(len(img_sp_idx), dtype=np.int64),
+            label_np_dtype=lbl_np_dt,
+            label_torch_dtype=lbl_torch_dt,
         )
 
         sampling_spec = self.config.resolution_sampling_for(vol_cfg)
@@ -660,7 +701,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                         / vol_info.image_meta.scales[level].path
                     )
                     stores[vol_name]["img"][level] = open_store(
-                        img_array_path, zarr_ver, ctx
+                        img_array_path, zarr_ver, ctx,
                     )
 
                 if vol_info.config.label_key and vol_info.label_meta:
@@ -671,7 +712,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                             / vol_info.label_meta.scales[level].path
                         )
                         stores[vol_name]["label"][level] = open_store(
-                            lbl_array_path, zarr_ver, ctx
+                            lbl_array_path, zarr_ver, ctx,
                         )
 
             self._worker_stores[worker_id] = stores
@@ -695,6 +736,67 @@ class VolumeDataset(torch.utils.data.Dataset):
             else:
                 slices.append(slice(None))  # channel dim: take all
         return tuple(slices)
+
+    def _sample_chunk_aligned_center(self, vol_info: VolumeInfo) -> np.ndarray:
+        """Sample a random patch center constrained to lie within a single chunk.
+
+        For each spatial axis:
+          - If chunk_size >= patch_size: pick a random chunk, then a random
+            center within it such that the full patch fits inside one chunk.
+          - If chunk_size < patch_size: fall back to unconstrained random.
+
+        Returns center array in image spatial axis order.
+        """
+        # Level 0 is the finest pyramid level and the frame center coordinates live in.
+        full_chunks = vol_info.image_meta.scales[0].chunks
+        spatial_chunks = [full_chunks[i] for i in vol_info.img_spatial_idx]
+
+        center = np.empty(len(vol_info.img_spatial_idx), dtype=np.int64)
+
+        for ax in range(len(vol_info.img_spatial_idx)):
+            chunk_sz = spatial_chunks[ax]
+            patch_sz = vol_info.read_shape[ax]
+            lo = int(vol_info.min_center[ax])
+            hi = int(vol_info.max_center[ax])
+
+            if chunk_sz < patch_sz:
+                center[ax] = np.random.randint(lo, hi + 1)
+                continue
+
+            half = patch_sz // 2
+            spatial_extent = vol_info.image_meta.scales[0].shape[
+                vol_info.img_spatial_idx[ax]
+            ]
+            n_chunks = int(np.ceil(spatial_extent / chunk_sz))
+
+            valid_chunks: list[tuple[int, int]] = []
+            for ci in range(n_chunks):
+                chunk_start = ci * chunk_sz
+                # Valid center range within this chunk (patch fits entirely):
+                c_lo = chunk_start + half
+                c_hi = chunk_start + chunk_sz - patch_sz + half
+                if c_hi < c_lo:
+                    continue
+                # Clamp to volume's valid center range
+                c_lo = max(c_lo, lo)
+                c_hi = min(c_hi, hi)
+                if c_lo <= c_hi:
+                    valid_chunks.append((c_lo, c_hi))
+
+            if not valid_chunks:
+                center[ax] = np.random.randint(lo, hi + 1)
+                continue
+
+            # Weight chunks by valid range width for uniform spatial coverage
+            widths = np.array(
+                [c_hi - c_lo + 1 for c_lo, c_hi in valid_chunks], dtype=np.float64
+            )
+            probs = widths / widths.sum()
+            chunk_idx = np.random.choice(len(valid_chunks), p=probs)
+            c_lo, c_hi = valid_chunks[chunk_idx]
+            center[ax] = np.random.randint(c_lo, c_hi + 1)
+
+        return center
 
     def __getitem__(self, idx: int) -> dict:
         stores = self._get_stores()
@@ -756,12 +858,15 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         # Pick center coordinate (random mode only; sequential already set center above)
         if self.config.sampling == "random":
-            center = np.array(
-                [
-                    np.random.randint(lo, hi + 1)
-                    for lo, hi in zip(vol_info.min_center, vol_info.max_center)
-                ]
-            )
+            if self.config.chunk_aligned:
+                center = self._sample_chunk_aligned_center(vol_info)
+            else:
+                center = np.array(
+                    [
+                        np.random.randint(lo, hi + 1)
+                        for lo, hi in zip(vol_info.min_center, vol_info.max_center)
+                    ]
+                )
 
         read_shape = np.array(vol_info.read_shape)
         target_size = tuple(int(s) for s in read_shape)  # interpolation target
@@ -935,14 +1040,16 @@ class VolumeDataset(torch.utils.data.Dataset):
                 if lbl_spatial_shape != target_size:
                     lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
                     lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0).squeeze(0)
-                    lbl = lbl_t.numpy().astype(np.int64)
+                    lbl = lbl_t.numpy().astype(vol_info.label_np_dtype)
                 label_crops.append(lbl)
 
         # Stack across levels → (L, *storage_axes), then permute to output_axes
         img_stacked = torch.from_numpy(np.stack(img_crops))
         if add_channel:
             img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
-        img_tensor = img_stacked.permute(img_perm).float()
+        from miao.config import IMAGE_DTYPE_MAP
+        _img_dtype = IMAGE_DTYPE_MAP[self.config.image_dtype]
+        img_tensor = img_stacked.permute(img_perm).to(_img_dtype)
         img_tensor = _normalize_image_tensor(
             img_tensor,
             normalize=vol_info.config.normalize,
@@ -951,10 +1058,10 @@ class VolumeDataset(torch.utils.data.Dataset):
             image_dtype=vol_info.image_dtype,
         )
         if label_crops:
-            label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).long()
+            label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).to(vol_info.label_torch_dtype)
         else:
             # Keep output collate-friendly for default PyTorch DataLoader.
-            label_tensor = torch.empty(0, dtype=torch.long)
+            label_tensor = torch.empty(0, dtype=vol_info.label_torch_dtype)
 
         # Stack bboxes: (L, 2, Nd_spatial) in output spatial order, physical units
         bbox_arr = np.stack(bboxes)

@@ -36,3 +36,4 @@ patch_size: [128, 128, 32]
 bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
 samples_per_epoch: 1000
 cache_bytes: 1073741824
+isotropic: true

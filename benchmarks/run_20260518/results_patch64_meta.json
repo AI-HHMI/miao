@@ -1,0 +1,21 @@
+{
+  "label": "patch64",
+  "timestamp": "2026-05-13T14:09:17.832105",
+  "num_samples": 100,
+  "startup_ms": 4.004531539976597,
+  "config": {
+    "volumes": [
+      "Jiefu Cerebellum FIB-SEM",
+      "H01 Human Cortex"
+    ],
+    "patch_size": [
+      64,
+      64,
+      16
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

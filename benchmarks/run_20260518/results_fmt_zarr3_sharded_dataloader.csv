@@ -1,0 +1,3 @@
+num_workers,batch_size,mean_ms,median_ms,p95_ms,samples_per_sec,n_batches
+0,4,505.97,496.32,617.58,7.91,25
+4,4,134.43,43.19,421.88,29.75,25
