@@ -1,0 +1,21 @@
+{
+  "label": "nisb_seed0_zarr3",
+  "timestamp": "2026-05-18T13:49:14.098999",
+  "num_samples": 100,
+  "startup_ms": 2.202162519097328,
+  "batch_sweep": false,
+  "config": {
+    "volumes": [
+      "NISB Base Train Seed 0 (zarr3 sharded 128c)"
+    ],
+    "patch_size": [
+      96,
+      96,
+      96
+    ],
+    "n_scales": 3,
+    "isotropic": false,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

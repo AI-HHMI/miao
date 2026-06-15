@@ -1,0 +1,20 @@
+{
+  "label": "jiefu",
+  "timestamp": "2026-05-13T14:06:47.140255",
+  "num_samples": 100,
+  "startup_ms": 2.172457054257393,
+  "config": {
+    "volumes": [
+      "Jiefu Cerebellum FIB-SEM"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

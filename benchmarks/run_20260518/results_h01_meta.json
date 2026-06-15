@@ -1,0 +1,20 @@
+{
+  "label": "h01",
+  "timestamp": "2026-05-13T14:07:12.496863",
+  "num_samples": 100,
+  "startup_ms": 2.078765071928501,
+  "config": {
+    "volumes": [
+      "H01 Human Cortex"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}

@@ -1,0 +1,16 @@
+volumes:
+  - name: "zarr2-chunk64"
+    path: "/groups/miaai/miaai/benchmark/sweep/zarr2-chunk64.zarr"
+    image_key: "raw"
+    zarr_version: "zarr2"
+    scales: [0, 1, 2]
+    weight: 1.0
+    normalize: true
+
+n_scales: 3
+output_axes: "lcxyz"
+patch_size: [128, 128, 32]
+bbox_mode: "relative"
+samples_per_epoch: 1000
+cache_bytes: 1073741824
+isotropic: true

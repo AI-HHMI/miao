@@ -5,8 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional, Union
 
+import torch
 import yaml
 from pydantic import BaseModel, field_validator, model_validator
+
+# Mapping from config string to torch dtype for image tensors.
+IMAGE_DTYPE_MAP: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 
 class VolumeConfig(BaseModel):
@@ -62,6 +70,17 @@ class MiaoConfig(BaseModel):
     file_io_concurrency: int = 64
     sampling: Literal["random", "sequential"] = "random"
     overlap: Union[int, list[int]] = 0  # voxels; in output_axes spatial order (same as patch_size)
+    image_dtype: str = "float32"  # output image tensor dtype: "float32", "bfloat16", or "float16"
+    chunk_aligned: bool = False  # constrain random patches to stay within a single chunk
+
+    @field_validator("image_dtype")
+    @classmethod
+    def validate_image_dtype(cls, v: str) -> str:
+        if v not in IMAGE_DTYPE_MAP:
+            raise ValueError(
+                f"image_dtype must be one of {set(IMAGE_DTYPE_MAP)}, got {v!r}"
+            )
+        return v
 
     @field_validator("output_axes")
     @classmethod
