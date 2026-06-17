@@ -70,6 +70,10 @@ class MiaoConfig(BaseModel):
     file_io_concurrency: int = 64
     sampling: Literal["random", "sequential"] = "random"
     overlap: Union[int, list[int]] = 0  # voxels; in output_axes spatial order (same as patch_size)
+    # If True, each coarser scale's patch origin is sampled uniformly at random such that the patch
+    # still covers the previous (finer) scale's patch in finest-index space. Requires scales in
+    # each volume's `scales` list to be ordered fine-to-coarse (non-decreasing relative voxel size).
+    sample_windows: bool = False
     image_dtype: str = "float32"  # output image tensor dtype: "float32", "bfloat16", or "float16"
     chunk_aligned: bool = False  # constrain random patches to stay within a single chunk
 
