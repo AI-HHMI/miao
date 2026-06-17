@@ -1,0 +1,21 @@
+{
+  "label": "fmt_zarr2",
+  "timestamp": "2026-05-18T10:39:07.897597",
+  "num_samples": 100,
+  "startup_ms": 2.1624956279993057,
+  "batch_sweep": false,
+  "config": {
+    "volumes": [
+      "Jiefu zarr2"
+    ],
+    "patch_size": [
+      128,
+      128,
+      32
+    ],
+    "n_scales": 3,
+    "isotropic": true,
+    "cache_bytes": 1073741824,
+    "file_io_concurrency": 64
+  }
+}
