@@ -684,6 +684,32 @@ class TestResolutionSampling:
         assert sample["img"].shape == (2, 8, 8, 8)
         assert sample["label"].shape == (2, 8, 8, 8)
 
+    def test_level_spanning_range_no_overflow(self, zarr2_volume: Path):
+        """A range spanning multiple pyramid levels (voxels 1/2/4) reads cleanly across many
+        draws — different draws select different levels with different read shapes, and the
+        per-scale origin must stay in-bounds regardless of the (coarsest-resolution) bounds."""
+        spec = {"strategy": "log_uniform", "ranges": [[[1], [4]]], "n_scales": 1}
+        ds = VolumeDataset(self._cfg(zarr2_volume, spec))
+        np.random.seed(0)
+        levels_seen = set()
+        for i in range(400):
+            s = ds[i]
+            assert s["img"].shape == (1, 8, 8, 8)
+            levels_seen.update(s["meta"]["source_levels"])
+        assert len(levels_seen) > 1  # the range really does span levels
+
+    def test_window_too_large_raises(self, zarr2_volume: Path):
+        """If the coarsest sampled resolution makes the window exceed the volume, fail clearly."""
+        # 64^3 fixture, level voxels 1/2/4. target 40 -> level 2 (voxel 4), read 8*40/4=80 > 64.
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolution_sampling={"strategy": "log_uniform", "ranges": [[[1], [40]]], "n_scales": 1},
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        with pytest.raises(ValueError, match="does not fit the volume"):
+            VolumeDataset(cfg)
+
 
 class TestSampleWindows:
     """Multi-scale window sampling (sample_windows=True)."""

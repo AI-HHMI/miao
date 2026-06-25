@@ -472,6 +472,16 @@ class VolumeDataset(torch.utils.data.Dataset):
         min_center, max_center = self._center_bounds(vol_info, scale_res)
         vol_info.min_center = np.ceil(min_center).astype(np.int64)
         vol_info.max_center = np.floor(max_center).astype(np.int64)
+
+        if np.any(vol_info.min_center > vol_info.max_center):
+            window = "coarsest sampled resolution" if sampling_spec is not None else "resolutions"
+            raise ValueError(
+                f"Volume {vol_cfg.name!r}: no valid sampling region — the patch window does not "
+                f"fit the volume at the requested {window} (patch_size={self.config.patch_size}, "
+                f"min_center={vol_info.min_center.tolist()} > "
+                f"max_center={vol_info.max_center.tolist()}). Use a finer max resolution, a "
+                f"smaller patch_size, or a larger volume."
+            )
         return vol_info
 
     def _resolve_scales(
@@ -928,6 +938,13 @@ class VolumeDataset(torch.utils.data.Dataset):
                 else:
                     center_at_level = np.floor(center / rel_factors).astype(np.int64)
                     origin = center_at_level - eff_half
+                    # Clamp into the valid range: when resolutions are sampled, the chosen level
+                    # (and its read shape) differ from the one used to derive min/max_center, so
+                    # per-level floor() rounding can nudge the origin a voxel out of bounds.
+                    img_sp_shape = np.array(
+                        vol_info.image_meta.scales[level].shape, dtype=np.int64
+                    )[vol_info.img_spatial_idx]
+                    origin = np.clip(origin, 0, img_sp_shape - eff_shape)
 
                 prev_origin = origin
                 prev_eff_shape = np.asarray(eff_shape, dtype=np.int64).copy()
@@ -967,6 +984,11 @@ class VolumeDataset(torch.utils.data.Dataset):
                     else:
                         lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
                     lbl_origin = lbl_center - lbl_eff_half
+                    # Clamp into the label volume (same per-level rounding concern as the image).
+                    lbl_sp_shape = np.array(
+                        vol_info.label_meta.scales[lbl_level].shape, dtype=np.int64
+                    )[vol_info.lbl_spatial_idx]
+                    lbl_origin = np.clip(lbl_origin, 0, lbl_sp_shape - lbl_eff_shape)
                     # Build label slices from label axes metadata:
                     # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
                     lbl_slices = []
