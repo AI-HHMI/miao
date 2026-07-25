@@ -141,6 +141,45 @@ class TestVolumeDataset:
         assert meta["source_levels"] == [0, 1, 2]
         assert len(meta["coordinate"]) == 3
 
+    def test_pixel_size_output(self, sample_config: dict):
+        """pixel_size is a (L, Nd_spatial) float tensor matching the requested resolutions."""
+        cfg = MiaoConfig(**sample_config)
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+
+        assert "pixel_size" in sample
+        ps = sample["pixel_size"]
+        assert isinstance(ps, torch.Tensor)
+        assert ps.dtype == torch.float32
+        # 3 levels, 3 spatial axes
+        assert ps.shape == (3, 3)
+        # output_axes="lzyx" → output spatial order == storage order, so pixel_size
+        # equals the config resolutions exactly.
+        assert torch.allclose(ps, torch.tensor([[1.0, 1, 1], [2, 2, 2], [4, 4, 4]]))
+
+    def test_pixel_size_output_axis_order(self, zarr2_volume: Path):
+        """pixel_size is returned in output spatial order (exercises non-identity perm)."""
+        cfg = MiaoConfig(
+            volumes=[{"name": "test", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_2,
+            output_axes="lxyz",  # storage is zyx → spatial perm is non-trivial
+            patch_size=[8, 8, 8],
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        ps = ds[0]["pixel_size"]
+        # Recovers the config resolutions (given in output spatial order) per level.
+        assert ps.shape == (2, 3)
+        assert torch.allclose(ps, torch.tensor([[1.0, 1, 1], [2, 2, 2]]))
+
+    def test_pixel_size_dataloader(self, sample_config: dict):
+        """Default collate stacks pixel_size to (B, L, Nd_spatial)."""
+        cfg = MiaoConfig(**sample_config)
+        ds = VolumeDataset(cfg)
+        dl = torch.utils.data.DataLoader(ds, batch_size=2, num_workers=0)
+        batch = next(iter(dl))
+        assert batch["pixel_size"].shape == (2, 3, 3)
+
     def test_multiple_volumes_weighted(self, zarr2_volume: Path):
         """Test that volumes are sampled according to weights."""
         cfg = MiaoConfig(
@@ -660,6 +699,23 @@ class TestResolutionSampling:
         first = [tuple(ds[i]["meta"]["resolutions"][0]) for i in range(20)]
         assert len(set(first)) > 1
 
+    def test_pixel_size_reflects_sampled_resolutions(self, zarr2_volume: Path):
+        """In sampling mode, pixel_size is recomputed per sample from the drawn resolutions."""
+        ds = VolumeDataset(self._cfg(zarr2_volume))
+        np.random.seed(4)
+        seen = set()
+        for i in range(20):
+            sample = ds[i]
+            ps = sample["pixel_size"]
+            assert ps.shape == (2, 3)
+            # output_axes="lzyx" → output spatial order == storage order, so pixel_size
+            # matches meta["resolutions"] (which reports the actually-drawn resolutions).
+            expected = torch.tensor(sample["meta"]["resolutions"], dtype=torch.float32)
+            assert torch.allclose(ps, expected)
+            seen.add(tuple(ps[0].tolist()))
+        # Draws genuinely vary across calls (not a constant broadcast).
+        assert len(seen) > 1
+
     def test_seeded_reproducible(self, zarr2_volume: Path):
         ds = VolumeDataset(self._cfg(zarr2_volume))
         np.random.seed(7)
@@ -962,3 +1018,201 @@ class TestChunkAlignedSampling:
         assert len(centers_ax0) > 2, (
             f"Expected diverse centers when chunk > patch, got only {centers_ax0}"
         )
+
+
+class TestAugRotHelper:
+    """Unit tests for the axis-aligned transform helper (no RNG / dataset)."""
+
+    def test_identity(self):
+        from miao.dataset import _apply_axis_aligned_aug
+
+        # "lzyx" → x=3, y=2, z=1
+        t = torch.arange(2 * 4 * 4 * 4).reshape(2, 4, 4, 4)
+        out = _apply_axis_aligned_aug(t, (3, 2, 1), (0, 1, 2), (False, False, False))
+        assert torch.equal(out, t)
+
+    def test_flip_x_only(self):
+        from miao.dataset import _apply_axis_aligned_aug
+
+        t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
+        out = _apply_axis_aligned_aug(t, (3, 2, 1), (0, 1, 2), (True, False, False))
+        assert torch.equal(out, torch.flip(t, dims=[3]))
+
+    def test_swap_x_z(self):
+        from miao.dataset import _apply_axis_aligned_aug
+
+        # perm (2,1,0) swaps the x and z slots → transpose of dims 1 (z) and 3 (x).
+        t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
+        out = _apply_axis_aligned_aug(t, (3, 2, 1), (2, 1, 0), (False, False, False))
+        assert torch.equal(out, t.transpose(1, 3))
+
+    def test_leaves_nonspatial_dims(self):
+        from miao.dataset import _apply_axis_aligned_aug
+
+        # "lzyxc": l=0, z=1, y=2, x=3, c=4 → spatial dims (x,y,z)=(3,2,1); l and c untouched.
+        t = torch.arange(2 * 4 * 4 * 4 * 3).reshape(2, 4, 4, 4, 3)
+        out = _apply_axis_aligned_aug(t, (3, 2, 1), (1, 2, 0), (True, False, True))
+        assert out.shape == t.shape
+
+    def test_group_has_48_distinct_elements(self):
+        from miao.dataset import _SPATIAL_PERMS, _apply_axis_aligned_aug
+
+        # Distinct labels per voxel so any two different transforms differ.
+        t = torch.arange(1 * 3 * 3 * 3).reshape(1, 3, 3, 3)
+        seen = set()
+        for perm in _SPATIAL_PERMS:
+            for fmask in range(8):
+                flips = (bool(fmask & 1), bool(fmask & 2), bool(fmask & 4))
+                out = _apply_axis_aligned_aug(t, (3, 2, 1), perm, flips)
+                seen.add(out.numpy().tobytes())
+        assert len(_SPATIAL_PERMS) == 6
+        assert len(seen) == 48
+
+
+class TestAugRot:
+    """Per-volume aug_rot: random axis-aligned rotations/flips (48 total)."""
+
+    def _cfg(self, zarr2_volume, patch, res, aug_rot=True, output_axes="lzyx", labels=False):
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw", "aug_rot": aug_rot}
+        if labels:
+            vol["label_key"] = "labels/seg"
+        return MiaoConfig(
+            volumes=[vol],
+            resolutions=res,
+            output_axes=output_axes,
+            patch_size=patch,
+            samples_per_epoch=50,
+        )
+
+    def test_default_false(self, zarr2_volume: Path):
+        cfg = MiaoConfig(
+            volumes=[{"name": "v", "path": str(zarr2_volume), "image_key": "raw"}],
+            resolutions=RES_1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.volumes[0].aug_rot is False
+
+    def test_shape_preserved(self, zarr2_volume: Path):
+        cfg = self._cfg(zarr2_volume, [8, 8, 8], RES_2)
+        ds = VolumeDataset(cfg)
+        np.random.seed(0)
+        for i in range(20):
+            assert ds[i]["img"].shape == (2, 8, 8, 8)
+
+    def test_preserves_value_multiset(self, zarr2_volume: Path):
+        """A signed permutation is a bijection over a cubic patch, so the sorted voxel values
+        are invariant. Force a single center (patch == full volume) so aug is the only change."""
+        # patch 64 on the 64^3 fixture at res [1,1,1] → exactly one valid center (deterministic).
+        aug = VolumeDataset(self._cfg(zarr2_volume, [64, 64, 64], RES_1, aug_rot=True))
+        plain = VolumeDataset(self._cfg(zarr2_volume, [64, 64, 64], RES_1, aug_rot=False))
+        ref = plain[0]["img"]
+        for i in range(10):
+            np.random.seed(i)
+            out = aug[i]["img"]
+            assert out.shape == ref.shape
+            assert torch.allclose(
+                torch.sort(out.flatten()).values, torch.sort(ref.flatten()).values
+            )
+
+    def test_produces_variation(self, zarr2_volume: Path):
+        """Over many samples of a fixed patch, more than one distinct orientation appears."""
+        aug = VolumeDataset(self._cfg(zarr2_volume, [64, 64, 64], RES_1, aug_rot=True))
+        np.random.seed(0)
+        seen = {aug[i]["img"].numpy().tobytes() for i in range(30)}
+        assert len(seen) > 1
+
+    def test_image_and_label_share_transform(self, tmp_path: Path):
+        """Image and label get the same transform. Build a volume whose label is a spatial
+        gradient so the orientation is recoverable, and check img/label stay aligned."""
+        import json
+
+        import zarr
+        from zarr.storage import LocalStore
+
+        zpath = tmp_path / "grad.zarr"
+        store = LocalStore(str(zpath))
+        root = zarr.open_group(store, mode="a", zarr_format=2)
+        axes = [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"]
+        # Distinct value at every voxel so the orientation is unambiguous.
+        data = np.arange(8 * 8 * 8, dtype=np.float32).reshape(8, 8, 8)
+        for key, dtype, arr in [("raw", "float32", data), ("seg", "uint32", data.astype("uint32"))]:
+            grp = root.create_group(key)
+            a = grp.create_array("0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=dtype, overwrite=True)
+            a[:] = arr
+            zattrs = zpath / key / ".zattrs"
+            zattrs.write_text(json.dumps({"multiscales": [{
+                "version": "0.4", "axes": axes,
+                "datasets": [{"path": "0", "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, 1.0, 1.0]}]}],
+            }]}))
+
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "v", "path": str(zpath), "image_key": "raw",
+                "label_key": "seg", "aug_rot": True, "normalize": False,
+            }],
+            resolutions=RES_1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=20,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(20):
+            np.random.seed(i)
+            s = ds[i]
+            # Same transform on both → image (float) equals label (as float) elementwise.
+            assert torch.equal(s["img"][0], s["label"][0].to(torch.float32))
+
+    def test_anisotropic_resolution_raises(self, zarr2_volume: Path):
+        """Fixed anisotropic output resolution → error at read time."""
+        cfg = self._cfg(zarr2_volume, [8, 8, 8], [[1, 1, 2]])
+        ds = VolumeDataset(cfg)
+        with pytest.raises(ValueError, match="isotropic output resolution"):
+            ds[0]
+
+    def test_anisotropic_sampling_raises(self, zarr2_volume: Path):
+        """Per-axis resolution sampling can draw anisotropic resolutions → error at read time."""
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw", "aug_rot": True}
+        cfg = MiaoConfig(
+            volumes=[vol],
+            resolution_sampling={"ranges": [[[1, 1, 1], [2, 4, 4]]]},
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=10,
+        )
+        ds = VolumeDataset(cfg)
+        np.random.seed(0)
+        with pytest.raises(ValueError, match="isotropic output resolution"):
+            for i in range(20):
+                ds[i]
+
+    def test_isotropic_sampling_ok(self, zarr2_volume: Path):
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw", "aug_rot": True}
+        cfg = MiaoConfig(
+            volumes=[vol],
+            resolution_sampling={"ranges": [[[1], [4]]], "n_scales": 2},
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=10,
+        )
+        ds = VolumeDataset(cfg)
+        np.random.seed(0)
+        for i in range(10):
+            assert ds[i]["img"].shape == (2, 8, 8, 8)
+
+    def test_non_cubic_patch_rejected(self, zarr2_volume: Path):
+        with pytest.raises(ValueError, match="cubic patch_size"):
+            self._cfg(zarr2_volume, [8, 8, 4], RES_1)
+
+    def test_missing_spatial_axis_rejected(self, zarr2_volume: Path):
+        with pytest.raises(ValueError, match="contain all of x, y, z"):
+            MiaoConfig(
+                volumes=[{
+                    "name": "v", "path": str(zarr2_volume),
+                    "image_key": "raw", "aug_rot": True,
+                }],
+                resolutions=[[1, 1]],
+                output_axes="lyx",
+                patch_size=[8, 8],
+            )
