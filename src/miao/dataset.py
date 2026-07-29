@@ -142,60 +142,6 @@ def _sample_resolutions(
     return [row.tolist() for row in raw]
 
 
-def _random_patch_origin_covering_fine_extent(
-    fine_lo: np.ndarray,
-    fine_hi: np.ndarray,
-    rel_curr: np.ndarray,
-    eff_shape_curr: np.ndarray,
-    max_origin: np.ndarray,
-    *,
-    fine_roi_lo: np.ndarray | None = None,
-    fine_roi_hi_excl: np.ndarray | None = None,
-) -> np.ndarray:
-    """Sample an integer patch origin at the current scale, such that the patch covers [fine_lo, fine_hi) 
-    in finest-index space and is within the valid data region.
-
-    ``fine_*`` are per spatial axis in the same finest-coordinate frame as ``VolumeInfo.min_center``.
-    ``rel_curr`` is ``relative_scale_factors`` at the current scale (voxel size ratio vs finest).
-    ``max_origin`` is ``spatial_shape - eff_shape`` (largest valid origin per axis, inclusive).
-
-    When ``fine_roi_lo`` / ``fine_roi_hi_excl`` are set, the patch's finest extent
-    ``[origin * rel_curr, (origin + eff_shape) * rel_curr)`` must lie inside the half-open ROI
-    ``[fine_roi_lo, fine_roi_hi_excl)`` per axis (same frame as ``min_center`` / ``max_center``).
-    """
-    rel_curr = rel_curr.astype(np.float64)
-    fine_lo = fine_lo.astype(np.float64)
-    fine_hi = fine_hi.astype(np.float64)
-    eff_f = eff_shape_curr.astype(np.float64)
-    omin = np.ceil(fine_hi / rel_curr - eff_f - 1e-9)
-    omax = np.floor(fine_lo / rel_curr + 1e-9)
-    omin = np.maximum(omin, 0.0)
-    omax = np.minimum(omax, max_origin.astype(np.float64))
-    if fine_roi_lo is not None:
-        roi_omin = np.ceil(fine_roi_lo.astype(np.float64) / rel_curr - 1e-9)
-        omin = np.maximum(omin, roi_omin)
-    if fine_roi_hi_excl is not None:
-        roi_omax = np.floor(
-            fine_roi_hi_excl.astype(np.float64) / rel_curr - eff_f + 1e-9
-        )
-        omax = np.minimum(omax, roi_omax)
-    if np.any(omin > omax):
-        raise ValueError(
-            "No patch origin at this scale that covers the finer-level window, fits the volume, "
-            "and stays inside the min_center/max_center finest ROI "
-            f"(omin={omin.tolist()}, omax={omax.tolist()}, fine_lo={fine_lo.tolist()}, "
-            f"fine_hi={fine_hi.tolist()}, rel_curr={rel_curr.tolist()}, "
-            f"roi_lo={None if fine_roi_lo is None else fine_roi_lo.tolist()}, "
-            f"roi_hi_excl={None if fine_roi_hi_excl is None else fine_roi_hi_excl.tolist()})"
-        )
-    out = np.empty(len(omin), dtype=np.int64)
-    for d in range(len(omin)):
-        lo_i = int(omin[d])
-        hi_i = int(omax[d])
-        out[d] = np.random.randint(lo_i, hi_i + 1)
-    return out
-
-
 def _normalize_image_tensor(
     img_tensor: torch.Tensor,
     *,

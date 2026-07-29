@@ -185,18 +185,6 @@ Sampled coarse patch locations stay strictly within any per-volume `bounding_box
 
 `resolutions` must be listed from finest to coarsest (non-decreasing voxel size per axis, e.g. `[[8,8,8], [16,16,16]]`). Reordering coarser resolutions before finer ones will raise an error.
 
-### Multi-scale window sampling (`sample_windows`)
-
-By default, every scale level uses the same center location, so finer patches are centered with coarser patches. With `sample_windows: true`, each coarser level samples its patch origin uniformly at random among valid positions that cover the previous level's patch.
-
-```yaml
-sample_windows: true
-```
-
-Sampled coarse patch locations will respect the valid sampling region, including any per-volume `bounding_box`.
-
-Each volume's `scales` must be listed from finest to coarsest (e.g. `[0, 1, 2]` with increasing voxel size). Reordering coarser levels before finer ones will raise an error.
-
 ## Requirements
 
 - Python >= 3.10
