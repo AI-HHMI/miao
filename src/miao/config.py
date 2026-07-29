@@ -89,6 +89,11 @@ class VolumeConfig(BaseModel):
     # If both omitted: integer images use [0, dtype_max]; float images are unchanged.
     normalize_min: Optional[float] = None
     normalize_max: Optional[float] = None
+    # If True, additionally standardize each returned sample to zero mean / unit standard
+    # deviation (applied after the `normalize` scaling above). With multiple scales, the
+    # statistics are taken from the coarsest-resolution (largest physical extent) crop and
+    # applied to every scale, so the scales stay on a common intensity scale.
+    patch_normalize: bool = False
     # If True, apply a random axis-aligned rotation/flip augmentation to each returned patch —
     # one of the 48 signed permutations of the x/y/z axes (the full symmetry group of the cube:
     # 3! axis permutations x 2^3 per-axis flips). The same transform is applied to the image and

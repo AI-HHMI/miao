@@ -193,6 +193,28 @@ def _normalize_image_tensor(
     return img_tensor
 
 
+def _coarsest_scale_index(resolutions: list[np.ndarray]) -> int:
+    """Index of the coarsest scale — the largest physical crop, since patch_size is shared."""
+    return int(np.argmax([float(np.prod(np.asarray(r, dtype=np.float64))) for r in resolutions]))
+
+
+def _patch_normalize_image_tensor(
+    img_tensor: torch.Tensor,
+    *,
+    l_dim: int,
+    ref_level: int,
+) -> torch.Tensor:
+    """Standardize a sample to zero mean / unit standard deviation.
+
+    Statistics come from a single scale level and are applied to every level, so the scales of a
+    multi-scale sample stay on a common intensity scale.
+    """
+    ref = img_tensor.index_select(l_dim, torch.tensor([ref_level])).float()
+    std = ref.std().clamp_min(1e-8)
+    out = (img_tensor.float() - ref.mean()) / std
+    return out.to(img_tensor.dtype)
+
+
 @dataclass
 class ScaleResolution:
     """Per-scale resolution of a set of target resolutions to pyramid reads.
@@ -398,6 +420,11 @@ class VolumeDataset(torch.utils.data.Dataset):
                         "    normalize: float dtype unchanged "
                         "(set normalize_min and normalize_max to scale)"
                     )
+            if vi.config.patch_normalize:
+                lines.append(
+                    "    patch_normalize: per-sample zero mean / unit std"
+                    + (" (stats from the coarsest scale)" if self.config.n_scales > 1 else "")
+                )
             print("\n".join(lines))
         dims = ", ".join(c.upper() for c in self.config.output_axes)
         print(f"  output: axes={self.config.output_axes!r}, tensor_shape=({dims})")
@@ -1132,6 +1159,12 @@ class VolumeDataset(torch.utils.data.Dataset):
             normalize_max=vol_info.config.normalize_max,
             image_dtype=vol_info.image_dtype,
         )
+        if vol_info.config.patch_normalize:
+            img_tensor = _patch_normalize_image_tensor(
+                img_tensor,
+                l_dim=self.config.output_axes.index("l"),
+                ref_level=_coarsest_scale_index(scales.resolutions),
+            )
         if label_crops:
             label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).to(vol_info.label_torch_dtype)
         else:

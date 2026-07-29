@@ -378,6 +378,81 @@ class TestVolumeDataset:
         sample = ds[0]
         assert torch.allclose(sample["img"], torch.full_like(sample["img"], expected))
 
+    def test_patch_normalize_single_scale(self, zarr2_volume: Path):
+        """Single scale: the returned sample has zero mean and unit standard deviation."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "patch_normalize": True,
+                }
+            ],
+            resolutions=RES_1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=1,
+        )
+        ds = VolumeDataset(cfg)
+        img = ds[0]["img"]
+        assert img.mean().abs() < 1e-5
+        assert abs(img.std().item() - 1.0) < 1e-5
+
+    def test_patch_normalize_multi_scale_uses_coarsest(self, zarr2_volume: Path):
+        """Multi-scale: every scale is normalized by the coarsest crop's mean/std."""
+
+        def sample(patch_normalize: bool) -> torch.Tensor:
+            cfg = MiaoConfig(
+                volumes=[
+                    {
+                        "name": "test",
+                        "path": str(zarr2_volume),
+                        "image_key": "raw",
+                        "patch_normalize": patch_normalize,
+                    }
+                ],
+                resolutions=RES_3,
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+                sampling="sequential",
+            )
+            return VolumeDataset(cfg)[0]["img"]
+
+        raw = sample(False)
+        normed = sample(True)
+
+        coarsest = raw[-1]
+        expected = (raw - coarsest.mean()) / coarsest.std()
+        assert torch.allclose(normed, expected, atol=1e-5)
+
+        # Only the reference scale is exactly standardized; the finer ones share its statistics.
+        assert normed[-1].mean().abs() < 1e-5
+        assert abs(normed[-1].std().item() - 1.0) < 1e-5
+
+    def test_patch_normalize_constant_patch(self, zarr2_volume: Path):
+        """A zero-variance patch must not produce inf/nan."""
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                    "normalize": True,
+                    "normalize_min": 0.0,
+                    "normalize_max": 1e-12,  # clips everything to the upper bound
+                    "patch_normalize": True,
+                }
+            ],
+            resolutions=RES_1,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=1,
+        )
+        ds = VolumeDataset(cfg)
+        img = ds[0]["img"]
+        assert torch.isfinite(img).all()
+
     # ── Random mode: grid_index is None ──────────────────────────────────────
 
     def test_random_mode_no_grid_index(self, zarr2_volume: Path):
