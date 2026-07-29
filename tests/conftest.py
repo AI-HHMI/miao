@@ -185,11 +185,12 @@ def sample_config(zarr2_volume: Path) -> dict:
                 "name": "test_raw",
                 "path": str(zarr2_volume),
                 "image_key": "raw",
-                "scales": [0, 1, 2],
                 "label_key": "labels/seg",
             }
         ],
-        "n_scales": 3,
+        # Level voxel sizes of the 64^3 fixture are [1,1,1], [2,2,2], [4,4,4], so these
+        # resolutions map exactly to pyramid levels 0, 1, 2 (downsample ratio 1).
+        "resolutions": [[1, 1, 1], [2, 2, 2], [4, 4, 4]],
         "output_axes": "lzyx",
         "patch_size": [8, 8, 8],
         "samples_per_epoch": 10,

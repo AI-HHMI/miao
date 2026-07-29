@@ -3,7 +3,18 @@
 import pytest
 import yaml
 
-from miao.config import MiaoConfig, VolumeConfig, load_config
+from miao.config import MiaoConfig, ResolutionSampling, VolumeConfig, load_config
+
+
+def _vol(name="a", **kw):
+    return {"name": name, "path": "/data/test.zarr", "image_key": "raw", **kw}
+
+
+SAMPLING = {
+    "strategy": "log_uniform",
+    "ranges": [[[8], [64]]],  # isotropic shorthand
+    "n_scales": 3,
+}
 
 
 class TestVolumeConfig:
@@ -12,7 +23,6 @@ class TestVolumeConfig:
             name="raw",
             path="/data/test.zarr",
             image_key="raw",
-            scales=[0, 1],
         )
         assert v.weight == 1.0
         assert v.label_key is None
@@ -23,7 +33,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 weight=-1.0,
             )
 
@@ -33,7 +42,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_min=0.0,
             )
         with pytest.raises(ValueError, match="both be set or both omitted"):
@@ -41,7 +49,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_max=1.0,
             )
 
@@ -51,7 +58,6 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
-                scales=[0],
                 normalize_min=1.0,
                 normalize_max=1.0,
             )
@@ -72,6 +78,165 @@ class TestMiaoConfig:
         sample_config["volumes"].append(sample_config["volumes"][0].copy())
         with pytest.raises(ValueError, match="unique"):
             MiaoConfig(**sample_config)
+
+
+class TestResolutionSampling:
+    def test_valid_global(self):
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling=SAMPLING,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.n_scales == 3
+        assert cfg.is_sampling(cfg.volumes[0])
+
+    def test_neither_set(self):
+        with pytest.raises(ValueError, match="exactly one of"):
+            MiaoConfig(volumes=[_vol()], output_axes="lzyx", patch_size=[8, 8, 8])
+
+    def test_both_set_global(self):
+        with pytest.raises(ValueError, match="exactly one of"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolutions=[[1, 1, 1]],
+                resolution_sampling={**SAMPLING, "n_scales": 1},
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_both_set_per_volume(self):
+        with pytest.raises(ValueError, match="at most one"):
+            MiaoConfig(
+                volumes=[
+                    _vol(resolutions=[[1, 1, 1]], resolution_sampling={**SAMPLING, "n_scales": 1})
+                ],
+                resolutions=[[1, 1, 1]],
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_min_greater_than_max(self):
+        with pytest.raises(ValueError, match="min\\[i\\] <= max\\[i\\]"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[9, 8, 8], [8, 8, 8]]],
+                    "n_scales": 1,
+                },
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_wrong_axis_count(self):
+        with pytest.raises(ValueError, match="1 \\(isotropic\\) or 3"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[8, 8], [64, 64]]],
+                    "n_scales": 1,
+                },
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_n_scales_list_length_mismatch(self):
+        with pytest.raises(ValueError, match="n_scales has 1 entries but there are 2 ranges"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[1], [2]], [[4], [8]]],
+                    "n_scales": [1],
+                },
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
+
+    def test_isotropic_shorthand_and_total_scales(self):
+        # Two ranges, scalar n_scales applied to both -> total 4 scales.
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling={
+                "strategy": "log_uniform",
+                "ranges": [[[1], [2]], [[4], [8]]],
+                "n_scales": 2,
+            },
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.n_scales == 4
+
+    def test_n_scales_list_per_range(self):
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling={
+                "strategy": "log_uniform",
+                "ranges": [[[1, 1, 1], [2, 2, 2]], [[4, 4, 4], [8, 8, 8]]],
+                "n_scales": [1, 3],
+            },
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert cfg.n_scales == 4
+
+    def test_rejected_with_sequential(self):
+        with pytest.raises(ValueError, match="incompatible with sampling='sequential'"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling=SAMPLING,
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+                sampling="sequential",
+            )
+
+    def test_sample_windows_requires_isotropic(self):
+        with pytest.raises(ValueError, match="every range to be isotropic"):
+            MiaoConfig(
+                volumes=[_vol()],
+                resolution_sampling={
+                    "strategy": "log_uniform",
+                    "ranges": [[[8, 8, 8], [64, 64, 64]]],  # per-axis, not isotropic
+                    "n_scales": 3,
+                },
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+                sample_windows=True,
+            )
+
+    def test_sample_windows_isotropic_ok(self):
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling=SAMPLING,  # isotropic shorthand ranges
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sample_windows=True,
+        )
+        assert cfg.n_scales == 3
+
+    def test_per_volume_override_mixes_modes(self):
+        cfg = MiaoConfig(
+            volumes=[
+                _vol("fixed"),
+                _vol("sampled", resolution_sampling={**SAMPLING, "n_scales": 1}),
+            ],
+            resolutions=[[1, 1, 1]],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        assert not cfg.is_sampling(cfg.volumes[0])
+        assert cfg.is_sampling(cfg.volumes[1])
+
+    def test_scale_count_mismatch(self):
+        with pytest.raises(ValueError, match="same number of scales"):
+            MiaoConfig(
+                volumes=[_vol("a"), _vol("b", resolutions=[[1, 1, 1]])],
+                resolution_sampling={**SAMPLING, "n_scales": 2},
+                output_axes="lzyx",
+                patch_size=[8, 8, 8],
+            )
 
 
 class TestLoadConfig:
