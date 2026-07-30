@@ -59,6 +59,6 @@ def map_patch_size_to_input(
     """
     if input_axes == output_axes:
         return list(patch_size)
-    # Inverse permutation: for each position in input, find where it ends up in output
+    # perm[i] is the position in output_axes of the axis at input position i.
     perm = compute_permutation(output_axes, input_axes)
-    return [patch_size[perm.index(i)] for i in range(len(patch_size))]
+    return [patch_size[p] for p in perm]
