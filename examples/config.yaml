@@ -24,7 +24,7 @@ volumes:
 
 resolution_sampling:
   strategy: log_uniform   # only option for now (pluggable)
-  ranges: [[[8], [64]]]   # [min, max] ranges; use [[v], [w]] for isotropic shorthand
+  ranges: [[[8], [64]]]   # isotropic [min, max] range; use [[a,b,c],[d,e,f]] for per-axis (anisotropic)
   n_scales: 3             # scales per range — scalar (all ranges) or list (one per range, e.g. [1, 2])
   sort: true              # sort drawn scales fine -> coarse
 
