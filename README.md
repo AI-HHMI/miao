@@ -56,21 +56,28 @@ as a per-volume override) *instead of* `resolutions`:
 ```yaml
 resolution_sampling:
   strategy: log_uniform     # only option for now (pluggable; gaussian etc. can be added)
-  ranges: [[[8, 8, 8], [64, 64, 64]]]   # one or more [min, max] ranges (output_axes spatial order)
+  ranges: [[[8], [64]]]     # one or more [min, max] ranges; [[v],[w]] = isotropic (per-axis: [[a,b,c],[d,e,f]])
   n_scales: 3               # scales to draw per range — scalar (all ranges) or list (one per range)
   sort: true                # sort the drawn scales fine -> coarse
 ```
 
-`ranges` is a list of `[min, max]` pairs. Each bound is either a per-spatial-axis list or a
-single-element list `[v]`, which is **isotropic** (broadcast to all axes). For example
-`[[[1, 1, 1], [4, 4, 4]]]` and `[[[1], [4]]]` both mean one isotropic range from 1 to 4;
-`[[[1], [2]], [[4], [8]]]` is two ranges. `n_scales` is the number of scales to draw from each
-range — a scalar applies the same count to every range, or pass a list (e.g. `[1, 1]`). The total
-number of scales (the `l` dimension) is the sum.
+`ranges` is a list of `[min, max]` pairs. How each bound is written controls whether the drawn
+resolution is isotropic:
+
+- **Single-element bounds** `[[v], [w]]` are **isotropic**: one value is drawn per scale and
+  broadcast to all axes (cubic voxel). E.g. `[[[1], [4]]]` — one range, cubic, 1 to 4.
+- **Per-axis bounds** `[[a, b, c], [d, e, f]]` draw **each axis independently**, producing an
+  anisotropic voxel. E.g. `[[[1, 1, 1], [4, 4, 4]]]` draws x, y, z separately in 1..4, so a
+  sample might be `[1.8, 3.2, 2.5]` — this is *not* the same as the isotropic `[[[1], [4]]]`.
+
+Multiple ranges are allowed, e.g. `[[[1], [2]], [[4], [8]]]` (two ranges). `n_scales` is the
+number of scales to draw from each range — a scalar applies the same count to every range, or
+pass a list (e.g. `[1, 1]`). The total number of scales (the `l` dimension) is the sum.
 
 Each `__getitem__` draws those resolutions log-uniformly within each range, sorts them
-fine→coarse, and the drawn values are reported in `meta["resolutions"]` (so a model can condition
-on them). The output is always `patch_size` per scale. Constraints: exactly one of
+fine→coarse, and the drawn values are reported both in the top-level `pixel_size` tensor and in
+`meta["resolutions"]` (so a model can condition on them). The output is always `patch_size` per
+scale. Constraints: exactly one of
 `resolutions` / `resolution_sampling` may be set; `resolution_sampling` is incompatible with
 `sampling: "sequential"`; and `sample_windows` requires every range to be isotropic.
 
@@ -93,11 +100,25 @@ loader = DataLoader(
 )
 
 for batch in loader:
-    img = batch["img"]        # (B, L, X, Y, Z) or (B, L, X, Y, Z, C) if channel present
-    label = batch["label"]    # (B, L, X, Y, Z) or None
-    bbox = batch["bbox"]      # (B, L, 2, Nd_spatial)
-    meta = batch["meta"]      # dict with volume name, coordinate, resolutions, source levels
+    img = batch["img"]                # (B, L, X, Y, Z) or (B, L, X, Y, Z, C) if channel present
+    label = batch["label"]            # (B, L, X, Y, Z) or None
+    bbox = batch["bbox"]              # (B, L, 2, Nd_spatial)
+    pixel_size = batch["pixel_size"]  # (B, L, Nd_spatial) — output voxel size per level
+    meta = batch["meta"]              # dict with volume name, coordinate, resolutions, source levels
 ```
+
+#### `pixel_size`
+
+Every sample returns a `pixel_size` tensor of shape `(L, Nd_spatial)` (batched to
+`(B, L, Nd_spatial)`) giving the **physical output voxel size per scale level**, in the same
+physical unit as the zarr's OME `coordinateTransformations` and in `output_axes` spatial order
+(matching `bbox`). It is a first-class tensor at the top level of the batch (not nested under
+`meta`), so the default PyTorch collate stacks it cleanly — convenient for feeding a
+scale-conditioned model.
+
+It reports the resolutions actually used for that sample, so in **random resolution sampling**
+mode it reflects the freshly-drawn values on every `__getitem__` rather than a fixed list. The
+same values (before reordering to output axis order) are also mirrored in `meta["resolutions"]`.
 
 ### How it works
 
@@ -127,6 +148,7 @@ Each sample:
 | `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`). Also see `normalize_min` / `normalize_max` to set upper and lower normalization bounds|
 | `volumes[].patch_normalize` | Standardize each returned sample to zero mean / unit standard deviation, applied after `normalize` (default: `false`). With multiple scales, the statistics are taken from the coarsest-resolution (largest physical extent) crop and applied to every scale |
 | `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis (finest-level voxels, storage axis order). Every window's read extent — at every scale, including coarser `sample_windows` patches — is kept strictly inside the box. Must be at least as large as the coarsest window, or dataset construction raises. |
+| `volumes[].aug_rot` | If `true` (default: `false`), apply a random axis-aligned rotation/flip to each returned sample — one of the 48 symmetries of the cube. Requires isotropic output. See "Axis-aligned rotation/flip augmentation (`aug_rot`)" below. |
 | `resolutions` | List of desired output resolutions, one tuple per scale. Each tuple is the output voxel size per spatial axis (physical units), in `output_axes` spatial order. The number of scales (the `l` dimension) is `len(resolutions)`. Mutually exclusive with `resolution_sampling` |
 | `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, ranges, n_scales, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
 | `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
@@ -161,6 +183,7 @@ loader = DataLoader(dataset, batch_size=4, shuffle=False)  # shuffle=False requi
 
 for batch in loader:
     img  = batch["img"]
+    pixel_size = batch["pixel_size"]   # (B, L, Nd_spatial) output voxel size per level
     meta = batch["meta"]
     # meta["grid_index"]: tuple e.g. (2, 0, 3) = position in the grid per axis
     # use grid_index to stitch patch predictions back into a full-volume output
@@ -185,6 +208,35 @@ sample_windows: true
 Sampled coarse patch locations stay strictly within any per-volume `bounding_box` (the box bounds every scale's read extent, not just the patch center).
 
 `resolutions` must be listed from finest to coarsest (non-decreasing voxel size per axis, e.g. `[[8,8,8], [16,16,16]]`). Reordering coarser resolutions before finer ones will raise an error.
+
+### Axis-aligned rotation/flip augmentation (`aug_rot`)
+
+Set `aug_rot: true` on a volume to augment each returned sample with a random axis-aligned rotation/flip:
+
+```yaml
+volumes:
+  - name: "raw"
+    path: "/data/sample_A.zarr"
+    image_key: "raw"
+    label_key: "labels/seg"
+    aug_rot: true            # optional, default: false
+```
+
+Each `__getitem__` draws **one** transform uniformly from the 48 symmetries of the cube — the full set of axis-aligned 3D rotations and reflections (3! axis permutations × 2³ per-axis flips = 48). This is the largest augmentation set achievable without interpolation, since every transform maps voxels onto voxels exactly.
+
+The same transform is applied to:
+
+- **the image and its labels** together (so they stay aligned), and
+- **every requested scale** in the multi-scale stack (so the nested scales stay mutually consistent).
+
+**Isotropic output is required.** An axis permutation mixes the spatial axes, which is only meaningful when the output voxels are cubes. Two conditions are checked:
+
+- `patch_size` must be equal across `x`, `y`, `z` (validated when the config is loaded).
+- The output resolution being read must be equal on all spatial axes (validated per sample, since `resolution_sampling` can draw a different resolution each call). With `resolution_sampling`, use isotropic (single-value) bounds.
+
+It is fine for the **underlying stored data** to be anisotropic — e.g. `z` coarser than `x`/`y` and upsampled — as long as the requested **output** resolution is isotropic.
+
+> **Note:** `aug_rot` reorients the returned `img` and `label` tensors only. The `bbox` and `meta.coordinate` still describe the original (pre-augmentation) read location in the source volume; `pixel_size` is unaffected because it is isotropic by construction.
 
 ## Requirements
 
