@@ -1,8 +1,8 @@
 volumes:
   - name: "Jiefu Cerebellum FIB-SEM"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem_crop.zarr"
     image_key: "raw"
-    zarr_version: "zarr2"
+    zarr_version: "zarr3"
     label_key: "labels/agglom_seg"
     bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]  # [z_min, z_max], [y_min, y_max], [x_min, x_max] (finest-level voxels, storage order). Every window's read extent stays strictly inside this box.
     weight: 0.5
@@ -19,21 +19,18 @@ volumes:
     # resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
 
 # Desired output resolutions (one per scale), in output_axes spatial order — like patch_size.
-# Each tuple is the output voxel size per spatial axis, in the same physical unit as the
-# zarr's OME coordinateTransformations (e.g. nanometers). For each volume, the dataset reads
-# from the coarsest pyramid level whose voxel size is still <= the target on every axis
-# (downsample), then resamples to the target. If the target is finer than the finest stored
-# level, it reads the finest level and upsamples instead.
-resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
+# resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
 # Alternatively, draw resolutions randomly per sample (set instead of `resolutions`):
-# resolution_sampling:
-#   strategy: log_uniform   # only option for now (pluggable)
-#   ranges: [[[8], [64]]]   # isotropic [min, max] range; use [[a,b,c],[d,e,f]] for per-axis (anisotropic)
-#   n_scales: 3             # scales per range — scalar (all ranges) or list (one per range, e.g. [1, 2])
-#   sort: true              # sort drawn scales fine -> coarse
+
+resolution_sampling:
+  strategy: log_uniform   # only option for now (pluggable)
+  ranges: [[[8], [64]]]   # isotropic [min, max] range; use [[a,b,c],[d,e,f]] for per-axis (anisotropic)
+  n_scales: 3             # scales per range — scalar (all ranges) or list (one per range, e.g. [1, 2])
+  sort: true              # sort drawn scales fine -> coarse
+
 output_axes: "lcxyz" # input will be automatically re-ordered to match this axes order (default: "xyz")
-patch_size: [128, 128, 32]
-bbox_mode: "relative" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
+patch_size: [128, 128, 128]
+bbox_mode: "absolute" # "absolute" (world coords) or "relative" (relative to finest-level crop origin)
 samples_per_epoch: 1000
 cache_bytes: 1073741824
 isotropic: true

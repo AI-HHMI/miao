@@ -104,6 +104,49 @@ class TestVolumeDataset:
         # output_axes="lxyz" → (L, X, Y, Z)
         assert sample["img"].shape == (1, 8, 8, 8)
 
+    def test_axis_reorientation_cyclic(self, zarr2_volume: Path):
+        """Non-cubic patch with a cyclic storage↔output permutation.
+
+        Storage is zyx and output spatial order is xzy — a 3-cycle, unlike the
+        zyx↔xyz reversal which is its own inverse and so can't distinguish a
+        permutation from its inverse. Guards the patch_size/resolution mapping
+        in axes.map_patch_size_to_input.
+        """
+        import zarr
+
+        cfg = MiaoConfig(
+            volumes=[
+                {
+                    "name": "test",
+                    "path": str(zarr2_volume),
+                    "image_key": "raw",
+                }
+            ],
+            resolutions=RES_1,
+            output_axes="lxzy",
+            patch_size=[6, 8, 12],  # X=6, Z=8, Y=12 — distinct per axis
+            samples_per_epoch=5,
+        )
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+
+        # output_axes="lxzy" → (L, X, Z, Y)
+        assert sample["img"].shape == (1, 6, 8, 12)
+
+        # The values must be the on-disk crop around meta["coordinate"] (storage
+        # zyx order), transposed zyx → xzy. At resolution [1,1,1] the read is
+        # level 0 with no resampling, so the match is exact.
+        center = np.array(sample["meta"]["coordinate"])
+        storage_shape = np.array([8, 12, 6])  # patch_size in storage (z, y, x) order
+        origin = np.clip(center - storage_shape // 2, 0, 64 - storage_shape)
+        raw = zarr.open_group(str(zarr2_volume), mode="r")["raw"]["0"][
+            origin[0] : origin[0] + 8,
+            origin[1] : origin[1] + 12,
+            origin[2] : origin[2] + 6,
+        ]
+        expected = np.transpose(raw, (2, 0, 1))  # zyx → xzy
+        np.testing.assert_allclose(sample["img"][0].numpy(), expected)
+
     def test_level_dim_placement(self, zarr2_volume: Path):
         """Test that 'l' can be placed at different positions."""
         cfg = MiaoConfig(
