@@ -1334,3 +1334,120 @@ class TestAugRot:
                 output_axes="lyx",
                 patch_size=[8, 8],
             )
+
+
+def _build_axes_volume(root: Path, img_axes: str, lbl_axes: str, n: int = 16) -> Path:
+    """A minimal container whose image and label groups declare the given axis orders.
+
+    Both hold the same physical data (values encode the physical voxel coordinate) written in
+    each group's own on-disk order, with isotropic unit voxels.
+    """
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    zz, yy, xx = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+    val_zyx = (zz * 10000 + yy * 100 + xx).astype(np.float32)
+
+    grp_root = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2)
+    for key, axes_str, dtype in [("raw", img_axes, "float32"), ("seg", lbl_axes, "uint32")]:
+        spatial = "".join(c for c in axes_str if c in "xyz")
+        data = np.transpose(val_zyx, ["zyx".index(c) for c in spatial]).astype(dtype)
+        if "c" in axes_str:  # singleton channel at the position declared in axes_str
+            data = np.expand_dims(data, axis=axes_str.index("c"))
+        g = grp_root.create_group(key)
+        a = g.create_array("0", shape=data.shape, chunks=data.shape, dtype=dtype, overwrite=True)
+        a[:] = data
+        axes = [
+            {"name": c, "type": ("channel" if c == "c" else "space")}
+            | ({} if c == "c" else {"unit": "micrometer"})
+            for c in axes_str
+        ]
+        (root / key / ".zattrs").write_text(json.dumps({"multiscales": [{
+            "version": "0.4", "axes": axes,
+            "datasets": [{"path": "0", "coordinateTransformations": [
+                {"type": "scale", "scale": [1.0] * len(axes_str)}]}],
+        }]}))
+    return root
+
+
+class TestLabelAxisOrderValidation:
+    """A label group whose SPATIAL axis order differs from the image's must be rejected.
+
+    Reads are addressed in each array's own on-disk order while label read coordinates are
+    derived from image-order quantities, so a mismatch silently returns transposed labels — with
+    the correct shape and dtype, hence undetectable downstream. Real data exhibits this (an
+    OME-NGFF container may store `raw` as xyz and a label group as zyx), so it is rejected up
+    front instead.
+    """
+
+    def _cfg(self, path: Path) -> MiaoConfig:
+        return MiaoConfig(
+            volumes=[{"name": "v", "path": str(path), "image_key": "raw", "label_key": "seg"}],
+            resolutions=RES_1, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
+        )
+
+    def test_matching_axes_accepted(self, tmp_path: Path):
+        p = _build_axes_volume(tmp_path / "ok.zarr", "zyx", "zyx")
+        ds = VolumeDataset(self._cfg(p))
+        assert ds[0]["label"].shape == (1, 4, 4, 4)
+
+    def test_reversed_label_axes_rejected(self, tmp_path: Path):
+        p = _build_axes_volume(tmp_path / "rev.zarr", "zyx", "xyz")
+        with pytest.raises(ValueError, match="do not match image spatial axes"):
+            VolumeDataset(self._cfg(p))
+
+    def test_cyclic_label_axes_rejected(self, tmp_path: Path):
+        p = _build_axes_volume(tmp_path / "cyc.zarr", "zyx", "yzx")
+        with pytest.raises(ValueError, match="do not match image spatial axes"):
+            VolumeDataset(self._cfg(p))
+
+    def test_error_names_both_keys_and_orders(self, tmp_path: Path):
+        """The message has to be actionable — which volume, which keys, which orders."""
+        p = _build_axes_volume(tmp_path / "msg.zarr", "zyx", "xyz")
+        with pytest.raises(ValueError) as exc:
+            VolumeDataset(self._cfg(p))
+        msg = str(exc.value)
+        for expected in ["'v'", "'zyx'", "'xyz'", "'raw'", "'seg'"]:
+            assert expected in msg, f"{expected} missing from error:\n{msg}"
+
+    def test_channel_only_difference_accepted(self, tmp_path: Path):
+        """image 'cxyz' vs label 'xyz' is a channel-presence difference, not a spatial-order
+        one — common in real data (all the nisb/* datasets) and handled correctly."""
+        p = _build_axes_volume(tmp_path / "chan.zarr", "cxyz", "xyz")
+        cfg = MiaoConfig(
+            volumes=[{"name": "v", "path": str(p), "image_key": "raw", "label_key": "seg"}],
+            resolutions=RES_1, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
+        )
+        ds = VolumeDataset(cfg)
+        assert ds[0]["label"].shape == (1, 4, 4, 4)
+
+    def test_channel_on_label_only_accepted(self, tmp_path: Path):
+        p = _build_axes_volume(tmp_path / "chan2.zarr", "zyx", "zyxc")
+        ds = VolumeDataset(self._cfg(p))
+        assert ds[0]["label"].shape == (1, 4, 4, 4)
+
+    def test_no_label_key_unaffected(self, tmp_path: Path):
+        """Volumes without labels never hit the check."""
+        p = _build_axes_volume(tmp_path / "nolbl.zarr", "zyx", "xyz")
+        cfg = MiaoConfig(
+            volumes=[{"name": "v", "path": str(p), "image_key": "raw"}],
+            resolutions=RES_1, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
+        )
+        ds = VolumeDataset(cfg)
+        assert ds[0]["label"].numel() == 0
+
+    def test_rejected_regardless_of_output_axes(self, tmp_path: Path):
+        """output_axes standardizes the returned tensor, not the read path — so it cannot
+        rescue a storage-order mismatch, whichever order is requested."""
+        p = _build_axes_volume(tmp_path / "out.zarr", "zyx", "xyz")
+        for out_axes in ("lzyx", "lxyz", "xyzl"):
+            cfg = MiaoConfig(
+                volumes=[{"name": "v", "path": str(p), "image_key": "raw",
+                          "label_key": "seg"}],
+                resolutions=RES_1, output_axes=out_axes, patch_size=[4, 4, 4],
+                samples_per_epoch=2,
+            )
+            with pytest.raises(ValueError, match="do not match image spatial axes"):
+                VolumeDataset(cfg)

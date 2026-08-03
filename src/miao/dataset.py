@@ -462,6 +462,28 @@ class VolumeDataset(torch.utils.data.Dataset):
             lbl_spatial = spatial_axes(lbl_axes)
             lbl_sp_idx = spatial_indices(lbl_axes)
 
+            # Reads are addressed in each array's own on-disk axis order, and the label read
+            # coordinates are derived from image-order quantities (patch centre, voxel-size
+            # ratios, read extents). If the two groups declare their spatial axes in different
+            # orders those quantities silently refer to different axes, and labels come back
+            # transposed relative to the image — with the correct shape and dtype, so nothing
+            # downstream can detect it. OME-NGFF permits per-group axis order, so reject the
+            # case explicitly rather than returning corrupt data.
+            #
+            # Only SPATIAL order is compared: a channel axis on one side and not the other
+            # (e.g. image "cxyz", label "xyz") is common and handled correctly.
+            if lbl_spatial != img_spatial:
+                raise ValueError(
+                    f"Volume {vol_cfg.name!r}: label spatial axes {lbl_spatial!r} "
+                    f"(from {lbl_axes!r}) do not match image spatial axes {img_spatial!r} "
+                    f"(from {img_axes!r}). Reading labels whose axis order differs from the "
+                    "image is not supported — the label crop would be transposed relative to "
+                    "the image with no other symptom. Point label_key at a label group written "
+                    f"in {img_spatial!r} order, or rewrite this one transposed on disk.\n"
+                    f"  image_key={vol_cfg.image_key!r}\n"
+                    f"  label_key={vol_cfg.label_key!r}"
+                )
+
         # Output patch size in image spatial axis order (interpolation target for every scale)
         read_shape = map_patch_size_to_input(
             self.config.patch_size, img_spatial, output_spatial
