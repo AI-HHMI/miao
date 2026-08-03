@@ -272,7 +272,10 @@ class VolumeInfo:
     # Valid center coordinate range (spatial dims only, in image spatial axis order, level-0 frame)
     min_center: np.ndarray
     max_center: np.ndarray
-    
+    # bounding_box reordered from the config's output_axes spatial order to image storage spatial
+    # order, shape (Nd_spatial, 2) as [lo, hi); None when no bounding_box is configured.
+    bounding_box: np.ndarray | None = None
+
     # Cached per-scale resolution (fixed-resolution mode); None when sampling per call
     scales: ScaleResolution | None = None
     # Resolution sampling spec (sampling mode); None when resolutions are fixed
@@ -319,6 +322,8 @@ class VolumeDataset(torch.utils.data.Dataset):
        "pixel_size" is (L, Nd_spatial) µm/px per level in output spatial axis
        order (matching "bbox"); in resolution-sampling mode it reflects the
        resolutions drawn for that sample.
+       Every spatial field in "meta" ("coordinate", "resolutions", and, in
+       sequential mode, "grid_index") is reported in output_axes spatial order.
 
     Tensor shapes are (1, L, *output_axes_dims) where L = number of scale levels.
     Input axes are auto-detected from OME-NGFF metadata.
@@ -491,7 +496,16 @@ class VolumeDataset(torch.utils.data.Dataset):
             )
         else:
             lbl_np_dt, lbl_torch_dt = np.dtype(np.int64), torch.int64
-            
+
+        # bounding_box is specified in output_axes spatial order; reorder it to image storage
+        # spatial order so it can be compared against storage-ordered read extents downstream.
+        bounding_box = None
+        if vol_cfg.bounding_box is not None:
+            bb_perm = compute_permutation(output_spatial, img_spatial)
+            bounding_box = np.array(
+                [vol_cfg.bounding_box[p] for p in bb_perm], dtype=np.float64
+            )
+
         # Build the static (resolution-independent) volume info first.
         vol_info = VolumeInfo(
             config=vol_cfg,
@@ -510,6 +524,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             read_shape=read_shape,
             min_center=np.zeros(len(img_sp_idx), dtype=np.int64),
             max_center=np.zeros(len(img_sp_idx), dtype=np.int64),
+            bounding_box=bounding_box,
             label_np_dtype=lbl_np_dt,
             label_torch_dtype=lbl_torch_dt,
         )
@@ -622,9 +637,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         min_center = np.zeros(len(img_sp_idx), dtype=np.float64)
         max_center = finest_spatial_shape.copy().astype(np.float64)
 
-        bb = None
-        if vol_info.config.bounding_box is not None:
-            bb = np.array(vol_info.config.bounding_box, dtype=np.float64)  # ref-frame [lo, hi)
+        # bounding_box (image storage spatial order, reference-frame [lo, hi)); None if unset.
+        bb = vol_info.bounding_box
 
         def _apply(rel: np.ndarray, eff: np.ndarray, sp_shape: np.ndarray) -> None:
             nonlocal min_center, max_center
@@ -971,8 +985,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         sample_roi_lo: np.ndarray | None = None
         sample_roi_hi_excl: np.ndarray | None = None
         n_scales = len(scales.resolutions)
-        if self.config.sample_windows and n_scales > 1 and vol_info.config.bounding_box is not None:
-            bb = np.array(vol_info.config.bounding_box, dtype=np.float64)
+        if self.config.sample_windows and n_scales > 1 and vol_info.bounding_box is not None:
+            bb = vol_info.bounding_box  # image storage spatial order, reference-frame [lo, hi)
             sample_roi_lo = bb[:, 0]
             sample_roi_hi_excl = bb[:, 1]
 
@@ -1217,6 +1231,20 @@ class VolumeDataset(torch.utils.data.Dataset):
         )
         pixel_size_tensor = torch.from_numpy(pixel_size_arr).float()
 
+        # `center`, `scales.resolutions`, and `grid_index` are all in image storage spatial order;
+        # reorder each to output_axes spatial order (via `spatial_perm`, as bbox/pixel_size do) so
+        # every spatial field in `meta` is reported in output_axes order.
+        coordinate_out = center[list(spatial_perm)].tolist()
+        resolutions_out = [
+            np.asarray(res, dtype=np.float64)[list(spatial_perm)].tolist()
+            for res in scales.resolutions
+        ]
+        grid_index_out = (
+            tuple(int(grid_index[p]) for p in spatial_perm)
+            if grid_index is not None
+            else None
+        )
+
         return {
             "img": img_tensor,
             "label": label_tensor,
@@ -1224,10 +1252,10 @@ class VolumeDataset(torch.utils.data.Dataset):
             "pixel_size": pixel_size_tensor,
             "meta": {
                 "volume": vol_info.config.name,
-                "coordinate": center.tolist(),
-                "resolutions": [r.tolist() for r in scales.resolutions],
+                "coordinate": coordinate_out,
+                "resolutions": resolutions_out,
                 "source_levels": scales.chosen_levels,
                 # grid_index only present in sequential mode; None breaks DataLoader collation
-                **({"grid_index": grid_index} if grid_index is not None else {}),
+                **({"grid_index": grid_index_out} if grid_index_out is not None else {}),
             },
         }

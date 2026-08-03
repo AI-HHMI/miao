@@ -103,9 +103,9 @@ class VolumeConfig(BaseModel):
     # data to be anisotropic (e.g. z coarser than x/y and upsampled) as long as the requested
     # output resolution is isotropic.
     aug_rot: bool = False
-    # [[min_0, max_0], ...] in finest-scale voxels, storage axis order. Strictly contains every
-    # window's read extent (all scales, including coarser sample_windows patches), not just the
-    # patch center. Must be at least as large as the coarsest window.
+    # [[min_0, max_0], ...] in finest-scale voxels, output_axes spatial order (like patch_size).
+    # Strictly contains every window's read extent (all scales, including coarser sample_windows
+    # patches), not just the patch center. Must be at least as large as the coarsest window.
     bounding_box: Optional[list[list[int]]] = None
 
     @field_validator("weight")

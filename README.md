@@ -118,7 +118,10 @@ scale-conditioned model.
 
 It reports the resolutions actually used for that sample, so in **random resolution sampling**
 mode it reflects the freshly-drawn values on every `__getitem__` rather than a fixed list. The
-same values (before reordering to output axis order) are also mirrored in `meta["resolutions"]`.
+same values are also mirrored in `meta["resolutions"]` (also in `output_axes` spatial order).
+
+All spatial fields in `meta` are reported in `output_axes` spatial order: `coordinate`
+(level-0 reference voxels), `resolutions`, and, in sequential mode, `grid_index`.
 
 ### How it works
 
@@ -147,7 +150,7 @@ Each sample:
 | `volumes[].weight` | Sampling probability weight (default: equal across volumes) |
 | `volumes[].normalize` | Auto-normalize images to [0, 1] by dtype max (default: `true`). Also see `normalize_min` / `normalize_max` to set upper and lower normalization bounds|
 | `volumes[].patch_normalize` | Standardize each returned sample to zero mean / unit standard deviation, applied after `normalize` (default: `false`). With multiple scales, the statistics are taken from the coarsest-resolution (largest physical extent) crop and applied to every scale |
-| `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis (finest-level voxels, storage axis order). Every window's read extent — at every scale, including coarser `sample_windows` patches — is kept strictly inside the box. Must be at least as large as the coarsest window, or dataset construction raises. |
+| `volumes[].bounding_box` | Optional `[[min, max], ...]` per spatial axis (finest-level voxels, `output_axes` spatial order — same order as `patch_size`). Every window's read extent — at every scale, including coarser `sample_windows` patches — is kept strictly inside the box. Must be at least as large as the coarsest window, or dataset construction raises. |
 | `volumes[].aug_rot` | If `true` (default: `false`), apply a random axis-aligned rotation/flip to each returned sample — one of the 48 symmetries of the cube. Requires isotropic output. See "Axis-aligned rotation/flip augmentation (`aug_rot`)" below. |
 | `resolutions` | List of desired output resolutions, one tuple per scale. Each tuple is the output voxel size per spatial axis (physical units), in `output_axes` spatial order. The number of scales (the `l` dimension) is `len(resolutions)`. Mutually exclusive with `resolution_sampling` |
 | `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, ranges, n_scales, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
@@ -186,6 +189,7 @@ for batch in loader:
     pixel_size = batch["pixel_size"]   # (B, L, Nd_spatial) output voxel size per level
     meta = batch["meta"]
     # meta["grid_index"]: tuple e.g. (2, 0, 3) = position in the grid per axis
+    #   (output_axes spatial order, matching the img/label tensor axes)
     # use grid_index to stitch patch predictions back into a full-volume output
 ```
 
@@ -195,7 +199,7 @@ In sequential mode the grid tiles the volume at the **first scale's** target res
 stride is one output patch (minus `overlap`) worth of physical extent. This gives full
 coverage of the output volume with no gaps, even when the source data is anisotropic. Patch
 centers are reported in `meta["coordinate"]` (level-0 reference voxels) and the grid position
-in `meta["grid_index"]`.
+in `meta["grid_index"]`, both in `output_axes` spatial order.
 
 ### Multi-scale window sampling (`sample_windows`)
 

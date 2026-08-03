@@ -133,10 +133,11 @@ class TestVolumeDataset:
         # output_axes="lxzy" → (L, X, Z, Y)
         assert sample["img"].shape == (1, 6, 8, 12)
 
-        # The values must be the on-disk crop around meta["coordinate"] (storage
-        # zyx order), transposed zyx → xzy. At resolution [1,1,1] the read is
-        # level 0 with no resampling, so the match is exact.
-        center = np.array(sample["meta"]["coordinate"])
+        # meta["coordinate"] is in output_axes spatial order ("xzy"); map it back to
+        # storage (zyx) to reconstruct the on-disk crop, transposed zyx → xzy. At
+        # resolution [1,1,1] the read is level 0 with no resampling, so the match is exact.
+        coord = sample["meta"]["coordinate"]  # output order: x, z, y
+        center = np.array([coord["xzy".index(c)] for c in "zyx"])  # storage z, y, x order
         storage_shape = np.array([8, 12, 6])  # patch_size in storage (z, y, x) order
         origin = np.clip(center - storage_shape // 2, 0, 64 - storage_shape)
         raw = zarr.open_group(str(zarr2_volume), mode="r")["raw"]["0"][
@@ -990,6 +991,38 @@ class TestBoundingBox:
             },
         )
         self._assert_inside(VolumeDataset(cfg))
+
+    def test_output_axes_order(self, zarr2_volume: Path):
+        """bounding_box is given in output_axes spatial order, not storage order.
+
+        Storage is zyx; output spatial order is xyz. An asymmetric box exercises the
+        permutation: it is reordered internally to storage (zyx) and every returned
+        window (reported in output xyz order) stays inside the box as specified.
+        """
+        # output xyz order: x in [9, 55], y in [12, 48], z in [10, 50].
+        bb_xyz = [[9, 55], [12, 48], [10, 50]]
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "v", "path": str(zarr2_volume), "image_key": "raw",
+                "bounding_box": bb_xyz,
+            }],
+            output_axes="lxyz", patch_size=[8, 8, 8], resolutions=RES_3,
+            samples_per_epoch=300,
+        )
+        ds = VolumeDataset(cfg)
+
+        # Stored bounding_box is reordered to storage (zyx): [z, y, x].
+        stored = ds._volumes[0].bounding_box
+        np.testing.assert_array_equal(stored, [[10, 50], [12, 48], [9, 55]])
+
+        # Every window (bbox tensor is in output xyz order; isotropic volume so fv=1) fits.
+        fv = ds._volumes[0].finest_voxel_size
+        bb = np.array(bb_xyz, dtype=float)
+        np.random.seed(0)
+        for i in range(300):
+            bbx = ds[i]["bbox"].numpy()  # (L, 2, 3), output spatial = xyz
+            assert np.all(bbx[:, 0, :] / fv >= bb[:, 0] - 1e-6)
+            assert np.all(bbx[:, 1, :] / fv <= bb[:, 1] + 1e-6)
 
     def test_too_small_box_raises(self, zarr2_volume: Path):
         """A box smaller than the coarsest window raises a clear error at dataset build."""
