@@ -5,7 +5,7 @@ volumes:
     zarr_version: "zarr2"
     scales: [0, 1, 2]
     label_key: "labels/agglom_seg"
-    bounding_box: [[1197, 5561], [1457, 4773], [1132, 12109]]
+    bounding_box: [[1132, 12109], [1457, 4773], [1197, 5561]]
     weight: 1.0
     normalize: true
 
