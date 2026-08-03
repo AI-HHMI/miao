@@ -462,16 +462,12 @@ class VolumeDataset(torch.utils.data.Dataset):
             lbl_spatial = spatial_axes(lbl_axes)
             lbl_sp_idx = spatial_indices(lbl_axes)
 
-            # Reads are addressed in each array's own on-disk axis order, and the label read
-            # coordinates are derived from image-order quantities (patch centre, voxel-size
-            # ratios, read extents). If the two groups declare their spatial axes in different
-            # orders those quantities silently refer to different axes, and labels come back
-            # transposed relative to the image — with the correct shape and dtype, so nothing
-            # downstream can detect it. OME-NGFF permits per-group axis order, so reject the
-            # case explicitly rather than returning corrupt data.
+            # Label read coords are derived from image-order quantities, so a differing
+            # spatial axis order silently transposes the label crop (same shape/dtype,
+            # undetectable downstream). Reject it explicitly instead.
             #
-            # Only SPATIAL order is compared: a channel axis on one side and not the other
-            # (e.g. image "cxyz", label "xyz") is common and handled correctly.
+            # Only spatial order is compared — a channel axis present on one side but not
+            # the other (e.g. image "cxyz", label "xyz") is fine.
             if lbl_spatial != img_spatial:
                 raise ValueError(
                     f"Volume {vol_cfg.name!r}: label spatial axes {lbl_spatial!r} "
