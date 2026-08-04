@@ -123,6 +123,141 @@ same values are also mirrored in `meta["resolutions"]` (also in `output_axes` sp
 All spatial fields in `meta` are reported in `output_axes` spatial order: `coordinate`
 (level-0 reference voxels), `resolutions`, and, in sequential mode, `grid_index`.
 
+### 3. Create a 2D image dataset
+
+A 2D dataset is the degenerate case of a 3D one: request a patch that is **one voxel thick**
+along one spatial axis and the crop is an axis-aligned plane. Do that once per axis,
+concatenate the three datasets, and every sample is a plane drawn from one of the three
+orientations.
+
+`patch_size` is in `output_axes` spatial order, so which axis goes thin depends on where the
+`1` sits. With `output_axes: "lcxyz"` (spatial order `xyz`):
+
+| `patch_size` | thin axis | plane | `img` shape |
+|---|---|---|---|
+| `[1, P, P]` | `x` | `yz` | `(L, C, 1, P, P)` |
+| `[P, 1, P]` | `y` | `xz` | `(L, C, P, 1, P)` |
+| `[P, P, 1]` | `z` | `xy` | `(L, C, P, P, 1)` |
+
+Everything else keeps working — multi-scale reads, `resolution_sampling`, labels,
+normalization and weighted volume sampling all behave exactly as they do in 3D.
+
+```python
+from torch.utils.data import ConcatDataset, DataLoader, default_collate
+from miao import MiaoConfig, VolumeDataset, load_config
+
+base = load_config("config.yaml")
+P = 128
+spatial_order = "".join(c for c in base.output_axes if c in "xyzt")   # "xyz"
+
+def plane_config(cfg: MiaoConfig, thin_axis: str, size: int) -> MiaoConfig:
+    """Config for a one-voxel-thick patch, i.e. a plane normal to `thin_axis`."""
+    data = cfg.model_dump()
+    data["patch_size"] = [1 if c == thin_axis else size for c in spatial_order]
+    data["samples_per_epoch"] = cfg.samples_per_epoch // len(spatial_order)
+    return MiaoConfig(**data)
+
+dataset = ConcatDataset(
+    [VolumeDataset(plane_config(base, ax, P)) for ax in spatial_order]
+)
+```
+
+The three sub-datasets put the singleton on different axes, so a shuffled batch mixes shapes
+and the default collate fails (`stack expects each tensor to be equal size`). Squeeze the
+singleton spatial axis in a `collate_fn` and every sample becomes `(L, C, P, P)`:
+
+```python
+def make_plane_collate(output_axes: str):
+    """Collate 1-voxel-thick samples by squeezing away the singleton spatial axis."""
+    img_dim = {c: i for i, c in enumerate(output_axes) if c in "xyzt"}
+    label_axes = output_axes.replace("c", "")     # labels carry no channel axis
+
+    def collate(samples):
+        squeezed, planes = [], []
+        for sample in samples:
+            img = sample["img"]
+            thin = [c for c, d in img_dim.items() if img.shape[d] == 1]
+            if len(thin) != 1:
+                raise ValueError(f"expected one singleton spatial axis, found {thin}")
+            axis = thin[0]
+            sample = dict(sample)
+            sample["img"] = img.squeeze(img_dim[axis])
+            if sample["label"].numel():           # empty when a volume has no labels
+                sample["label"] = sample["label"].squeeze(label_axes.index(axis))
+            squeezed.append(sample)
+            planes.append("".join(c for c in img_dim if c != axis))
+        batch = default_collate(squeezed)
+        batch["plane"] = planes                   # e.g. "yz" — one entry per sample
+        return batch
+
+    return collate
+
+loader = DataLoader(dataset, batch_size=8, shuffle=True,
+                    collate_fn=make_plane_collate(base.output_axes))
+
+for batch in loader:
+    img = batch["img"]                # (B, L, C, P, P)
+    label = batch["label"]            # (B, L, P, P)
+    bbox = batch["bbox"]              # (B, L, 2, Nd_spatial) — still 3D
+    plane = batch["plane"]            # "yz" / "xz" / "xy", one per sample
+```
+
+`bbox` and `pixel_size` keep their full spatial rank, so a plane's position, orientation and
+physical thickness all survive collation. With a single scale, `batch["img"][:, 0]` gives
+the `(B, C, H, W)` a 2D model expects. A runnable version of all of this is in
+[`examples/example_2d.ipynb`](examples/example_2d.ipynb).
+
+#### Plane thickness
+
+A one-voxel-thick output is still read as a whole number of stored voxels, so a plane spans
+a physical extent of `ceil(target / level_voxel) × level_voxel` along its normal — rounded
+up, and *not* the requested `pixel_size`. Asking for a 16 nm plane from a volume stored at
+33 nm along that axis gives a 33 nm-thick plane while `pixel_size` still reports 16. Read
+the true extent from `bbox`, which reports the physical footprint actually covered.
+`level_voxel` here is the voxel size of the pyramid level actually chosen, not of level 0.
+
+When more than one stored voxel is read along the normal, they are resampled to one by the
+same trilinear resize used for the in-plane axes. That is a point sample at the middle of
+the slab, not an average through it: an odd read count returns exactly the central stored
+plane, an even one the mean of the two central planes, and the remaining voxels read are
+discarded. So the value's effective support is one or two stored planes at the centre of the
+slab, narrower than the extent `bbox` reports.
+
+To read a single stored plane with no interpolation along the normal, request a thin-axis
+resolution no coarser than the stored voxel size on that axis, which forces the read count
+to 1. Resolutions are per-axis, so this is independent of the in-plane resolution — e.g.
+`[4, 16, 16]` against a volume stored at 4 nm in `x` reads one `x` plane and resamples only
+in-plane. Pinning the thin axis this way also rules out coarser pyramid levels, so the
+in-plane read grows.
+
+> **Labels:** images are resampled trilinearly, but labels use nearest-neighbour, which for
+> a one-voxel output takes the *first* plane of the slab rather than the middle one. So when
+> the thin axis is resampled, the returned label plane comes from a different depth than the
+> image plane — by up to about half the plane's thickness (on 4×4×33 nm data, 4–8 nm inside
+> a 16 nm plane and 12–16 nm inside a 32 nm one, depending on where the sampled centre
+> falls). The label read count is resolved from the *label* pyramid independently of the
+> image, so forcing the image read count to 1 is not sufficient: check both. When the two
+> pyramids differ enough, the label plane can even fall outside the image slab.
+
+#### Notes
+
+- `samples_per_epoch` applies per sub-dataset, so `len(ConcatDataset)` is the sum of the
+  three. Set them unequally to bias the orientation mixture.
+- Each `VolumeDataset` builds its own TensorStore cache per worker, so three of them triple
+  the cache footprint — divide `cache_bytes` by three to keep it constant.
+- `aug_rot` is rejected, because it requires a cubic `patch_size` across `x`, `y`, `z`. Flip
+  and transpose the collated planes yourself.
+- Mixing labelled and unlabelled volumes in one config breaks collation either way: the
+  unlabelled samples carry an empty `label` tensor, which will not stack against a real one.
+- With `sampling: "sequential"`, any non-zero scalar `overlap` fails validation, since it
+  must be smaller than every `patch_size` entry — use a per-axis list with `0` on the thin
+  axis. The default `overlap: 0` is fine as a scalar. The grid steps one output plane's
+  worth of extent along the normal, which is one stored plane only when the read count is 1;
+  otherwise the stride can be shorter than the plane is thick, so planes overlap.
+- On anisotropic data the three orientations are not equivalent: for a volume stored at
+  4×4×33 nm, an `xy` plane is a stored section while `xz` and `yz` planes are mostly
+  interpolation along `z`.
+
 ### How it works
 
 Each sample:
@@ -155,7 +290,7 @@ Each sample:
 | `resolutions` | List of desired output resolutions, one tuple per scale. Each tuple is the output voxel size per spatial axis (physical units), in `output_axes` spatial order. The number of scales (the `l` dimension) is `len(resolutions)`. Mutually exclusive with `resolution_sampling` |
 | `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, ranges, n_scales, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
 | `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
-| `patch_size` | Voxel count per crop, in `output_axes` spatial order |
+| `patch_size` | Voxel count per crop, in `output_axes` spatial order. An entry of `1` makes the crop a plane — see "3. Create a 2D image dataset" |
 | `bbox_mode` | `"absolute"` (world coords, e.g. nm) or `"relative"` (relative to finest-level crop origin). Default: `"absolute"` |
 | `samples_per_epoch` | Number of samples per epoch |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
