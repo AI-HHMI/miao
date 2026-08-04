@@ -86,8 +86,7 @@ Per sample, miao:
    coordinate and resamples them to `patch_size` — trilinear for images, nearest for labels.
 
 Every crop thus holds the same voxel count while covering a wider physical extent at coarser
-scales. There is no `isotropic` flag: ask for an equal-valued tuple like `[8, 8, 8]` and each axis
-lands on that common voxel size.
+scales.
 
 ### Random resolution sampling
 
