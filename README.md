@@ -2,9 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/miao-io)](https://pypi.org/project/miao-io/)
 
-Scalable PyTorch data loaders for OME-NGFF zarr datasets, powered by TensorStore. Multi-scale
-patches are addressed by **physical resolution** rather than pyramid level, and sampled at random
-or on a deterministic grid across any number of weighted volumes.
+Scalable PyTorch data loaders for OME-NGFF zarr datasets, powered by TensorStore.
 
 ## Installation
 
