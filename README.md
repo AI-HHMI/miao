@@ -306,9 +306,7 @@ for batch in loader:
 ```
 
 `bbox` and `pixel_size` keep their full spatial rank, so a plane's position, orientation and
-physical thickness all survive collation. With a single scale, `batch["img"][:, 0]` gives
-the `(B, C, H, W)` a 2D model expects. A runnable version of all of this is available in
-[`examples/example_2d.ipynb`](examples/example_2d.ipynb).
+physical thickness all survive collation. To retrieve a single scale, we can do, *e.g.* `batch["img"][:, 0]`, which returns a `(B, C, H, W)` tensor. A runnable version of all of this is available in [`examples/example_2d.ipynb`](examples/example_2d.ipynb).
 
 #### Notes on 2D image datasets
 
