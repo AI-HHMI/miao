@@ -155,7 +155,7 @@ Each sample:
 | `resolutions` | List of desired output resolutions, one tuple per scale. Each tuple is the output voxel size per spatial axis (physical units), in `output_axes` spatial order. The number of scales (the `l` dimension) is `len(resolutions)`. Mutually exclusive with `resolution_sampling` |
 | `resolution_sampling` | Draw resolutions randomly per sample instead of a fixed list: `{strategy, ranges, n_scales, sort}`. See "Random resolution sampling" above. Mutually exclusive with `resolutions` |
 | `output_axes` | Full tensor dim order including `l` (levels), optional `c` (channel), and spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
-| `patch_size` | Voxel count per crop, in `output_axes` spatial order. An entry of `1` makes the crop a plane — see "3. Create a 2D image dataset" |
+| `patch_size` | Voxel count per crop, in `output_axes` spatial order |
 | `bbox_mode` | `"absolute"` (world coords, e.g. nm) or `"relative"` (relative to finest-level crop origin). Default: `"absolute"` |
 | `samples_per_epoch` | Number of samples per epoch |
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
