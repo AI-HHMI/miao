@@ -63,9 +63,7 @@ Runnable notebooks live in [`examples/`](examples/).
 | `pixel_size` | `(B, L, Nd_spatial)` | Physical output voxel size per level |
 | `meta` | dict | `name`, `coordinate`, `resolutions` (mirroring `pixel_size`), source pyramid levels, plus `grid_index` in sequential mode |
 
-Spatial axes follow `output_axes` throughout — tensors and every spatial field of `meta` alike.
-
-`pixel_size` sits at the top level rather than inside `meta` so default collate stacks it cleanly,
+Spatial axes follow `output_axes` throughout. `pixel_size` sits at the top level rather than inside `meta` so default collate stacks it cleanly,
 ready to feed a scale-conditioned model. It reports the resolutions *actually used* for that
 sample, which under random resolution sampling differ from sample to sample.
 
