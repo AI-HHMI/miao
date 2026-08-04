@@ -222,7 +222,10 @@ dimensions are picked up automatically when present.
 ## Recipe: 2D image datasets
 
 2D models are often strong baselines in 3D domains. Build one from three degenerate
-`VolumeDataset`s — `patch_size` `(1,P,P)`, `(P,1,P)`, `(P,P,1)` — glued with `ConcatDataset`:
+`VolumeDataset`s — `patch_size` `(1,P,P)`, `(P,1,P)`, `(P,P,1)` — glued with `ConcatDataset`.
+
+<details>
+<summary><b>Show the recipe</b></summary>
 
 ```python
 from torch.utils.data import ConcatDataset, DataLoader, default_collate
@@ -308,6 +311,8 @@ physical thickness all survive collation. Index a single scale out with `batch["
   to half a thickness. Read counts resolve from the *label* pyramid independently, so forcing the
   image count to 1 is not enough — check both. If the two pyramids differ enough, the label plane
   can fall outside the image slab entirely.
+
+</details>
 
 ## Requirements
 
