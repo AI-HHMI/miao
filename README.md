@@ -242,6 +242,93 @@ It is fine for the **underlying stored data** to be anisotropic — e.g. `z` coa
 
 > **Note:** `aug_rot` reorients the returned `img` and `label` tensors only. The `bbox` and `meta.coordinate` still describe the original (pre-augmentation) read location in the source volume; `pixel_size` is unaffected because it is isotropic by construction.
 
+### Creating a 2D image dataset
+
+2D models are often strong baselines in 3D domains. It is possible to create a 2D image dataset using the `VolumeDataset` class to train a 2D model. The basic idea is to create three degenerate `VolumeDataset`s with shapes `(1,P,P)`, `(P,1,P)`, and `(P,P,1)` and then concatenate them using the `ConcatDataset` machinery from `torch.utils.data`:
+
+```python
+from torch.utils.data import ConcatDataset, DataLoader, default_collate
+from miao import MiaoConfig, VolumeDataset, load_config
+
+base = load_config("config.yaml")
+P = 128
+spatial_order = "".join(c for c in base.output_axes if c in "xyzt")   # "xyz"
+
+def plane_config(cfg: MiaoConfig, thin_axis: str, size: int) -> MiaoConfig:
+    """Config for a one-voxel-thick patch, i.e. a plane normal to `thin_axis`."""
+    data = cfg.model_dump()
+    data["patch_size"] = [1 if c == thin_axis else size for c in spatial_order]
+    data["samples_per_epoch"] = cfg.samples_per_epoch // len(spatial_order)
+    return MiaoConfig(**data)
+
+dataset = ConcatDataset(
+    [VolumeDataset(plane_config(base, ax, P)) for ax in spatial_order]
+)
+```
+
+The three sub-datasets put the singleton on different axes, so a shuffled batch mixes shapes
+and the default collate function in `DataLoader` fails. To address this, we write a custom collate function:
+
+```python
+def make_plane_collate(output_axes: str):
+    """Collate 1-voxel-thick samples by squeezing away the singleton spatial axis."""
+    img_dim = {c: i for i, c in enumerate(output_axes) if c in "xyzt"}
+    label_axes = output_axes.replace("c", "")     # labels carry no channel axis
+
+    def collate(samples):
+        squeezed, planes = [], []
+        for sample in samples:
+            img = sample["img"]
+            thin = [c for c, d in img_dim.items() if img.shape[d] == 1]
+            if len(thin) != 1:
+                raise ValueError(f"expected one singleton spatial axis, found {thin}")
+            axis = thin[0]
+            sample = dict(sample)
+            sample["img"] = img.squeeze(img_dim[axis])
+            if sample["label"].numel():           # empty when a volume has no labels
+                sample["label"] = sample["label"].squeeze(label_axes.index(axis))
+            squeezed.append(sample)
+            planes.append("".join(c for c in img_dim if c != axis))
+        batch = default_collate(squeezed)
+        batch["plane"] = planes                   # e.g. "yz" — one entry per sample
+        return batch
+
+    return collate
+
+loader = DataLoader(dataset, batch_size=8, shuffle=True,
+                    collate_fn=make_plane_collate(base.output_axes))
+
+for batch in loader:
+    img = batch["img"]                # (B, L, C, P, P)
+    label = batch["label"]            # (B, L, P, P)
+    bbox = batch["bbox"]              # (B, L, 2, Nd_spatial) — still 3D
+    plane = batch["plane"]            # "yz" / "xz" / "xy", one per sample
+```
+
+`bbox` and `pixel_size` keep their full spatial rank, so a plane's position, orientation and
+physical thickness all survive collation. To retrieve a single scale, we can do, *e.g.* `batch["img"][:, 0]`, which returns a `(B, C, H, W)` tensor. A runnable version of all of this is available in [`examples/example_2d.ipynb`](examples/example_2d.ipynb).
+
+#### Notes on 2D image datasets
+
+- `samples_per_epoch` applies per sub-dataset, so `len(ConcatDataset)` is the sum of the
+  three. Set them unequally to bias the orientation mixture.
+- Each `VolumeDataset` builds its own TensorStore cache per worker, so three of them triple
+  the cache footprint — divide `cache_bytes` by three to keep it constant.
+- `aug_rot` is not available for image datasets, because it requires a cubic `patch_size` across `x`, `y`, `z`. Flip and transpose the collated planes yourself.
+- Mixing labelled and unlabelled volumes in one config breaks collation: the
+  unlabelled samples carry an empty `label` tensor, which will not stack against a real one.
+- With `sampling: "sequential"`, any non-zero scalar `overlap` fails validation, since it
+  must be smaller than every `patch_size` entry — use a per-axis list with `0` on the thin
+  axis. The default `overlap: 0` is fine as a scalar. The grid steps one output plane's
+  worth of extent along the normal, which is one stored plane only when the read count is 1;
+  otherwise the stride can be shorter than the plane is thick, so planes overlap.
+- On anisotropic data the three orientations are not equivalent: for a volume stored at
+  4×4×33 nm, an `xy` plane is a stored section while `xz` and `yz` planes are mostly
+  interpolation along `z`.
+- Images are resampled trilinearly, but labels use nearest-neighbor, which for a one-voxel 
+  output takes the *first* plane of the slab rather than the middle one. So when the thin axis is resampled, the returned label plane comes from a different depth than the image plane — by up to about half the plane's thickness. The label read count is resolved from the *label* pyramid independently of the image, so forcing the image read count to 1 is not sufficient: check both. When the two pyramids differ enough, the label plane can even fall outside the image slab.
+
+
 ## Requirements
 
 - Python >= 3.10
