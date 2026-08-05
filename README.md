@@ -22,15 +22,21 @@ volumes:
     image_key: "raw"
     zarr_version: "zarr2"      # or "zarr3" (default: "zarr2")
     label_key: "labels/seg"    # optional
-    weight: 0.7                # optional
+    weight: 0.5                # optional
 
   - name: "membrane"
     path: "/data/sample_B.zarr"
     image_key: "predictions"
     zarr_version: "zarr3"
+    weight: 0.2
+
+  - name: "expanded"
+    path: "/data/expanded.zarr"
+    image_key: "raw"
+    exp_factor: 4.0            # optional, default: 1.0 — see Effective voxel sizes
     weight: 0.3
 
-resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]  # output voxel size per scale
+resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]  # effective output voxel size per scale
 output_axes: "lcxyz"            # layer, channels, X, Y, Z. Shuffle as you please!!!
 patch_size: [64, 64, 64]
 samples_per_epoch: 1000
@@ -60,7 +66,7 @@ Runnable notebooks live in [`examples/`](examples/).
 | `img` | `(B, L, X, Y, Z)`, or `(B, L, C, X, Y, Z)` with a channel axis | Image patch per scale level |
 | `label` | `(B, L, X, Y, Z)`, empty without a `label_key` | Label patch per scale level |
 | `bbox` | `(B, L, 2, Nd_spatial)` | Patch extent per level, world or crop-relative (see `bbox_mode`) |
-| `pixel_size` | `(B, L, Nd_spatial)` | Physical output voxel size per level |
+| `pixel_size` | `(B, L, Nd_spatial)` | Effective physical output voxel size per level |
 | `meta` | dict | `name`, `coordinate`, `resolutions` (mirroring `pixel_size`), source pyramid levels, plus `grid_index` in sequential mode |
 
 Spatial axes follow `output_axes` throughout. `pixel_size` sits at the top level rather than inside `meta` so default collate stacks it cleanly,
@@ -74,14 +80,27 @@ OME `coordinateTransformations` unit (e.g. nanometers) — never by pyramid leve
 `resolutions` list therefore serves volumes with wildly different pyramid layouts, and any volume
 can override it with its own.
 
+### Effective voxel sizes
+
+**Every voxel size and resolution in this README is an *effective* voxel size: the size of one
+voxel in the specimen, not in the microscope.** For a volume with `exp_factor: F`, the effective
+voxel size is the stored `coordinateTransformations` scale divided by `F` — a 4× expanded sample
+imaged at 200 nm holds 50 nm of biology per voxel. `exp_factor` defaults to `1.0`, so for
+unexpanded data the stored and effective sizes are identical.
+
+Level selection, read extents, `pixel_size`, and `meta["resolutions"]` are all in effective units,
+which is what lets one `resolutions` list mix expanded and unexpanded volumes correctly.
+`bounding_box` and `meta["coordinate"]` are level-0 voxel *indices*, not physical sizes, so
+`exp_factor` does not affect them.
+
 Per sample, miao:
 
 1. draws a volume by `weight`, then a random coordinate in its finest-scale (level-0) space;
-2. for each requested resolution, picks the coarsest pyramid level whose voxel size is still ≤ the
-   target on every axis, preferring downsampling — or the finest stored level, upsampled, if the
-   target is finer than anything on disk;
-3. reads `ceil(patch_size × target_resolution / level_voxel_size)` voxels centered on that
-   coordinate and resamples them to `patch_size` — trilinear for images, nearest for labels.
+2. for each requested resolution, picks the coarsest pyramid level whose effective voxel size is
+   still ≤ the target on every axis, preferring downsampling — or the finest stored level,
+   upsampled, if the target is finer than anything on disk;
+3. reads `ceil(patch_size × target_resolution / effective_level_voxel_size)` voxels centered on
+   that coordinate and resamples them to `patch_size` — trilinear for images, nearest for labels.
 
 Every crop thus holds the same voxel count while covering a wider physical extent at coarser
 scales.
@@ -190,6 +209,7 @@ fine — e.g. coarse `z` upsampled to match — as long as the requested output 
 | `path` | Path to the OME-NGFF zarr container |
 | `image_key` | Group key within the zarr for image data |
 | `zarr_version` | `"zarr2"` or `"zarr3"` (default: `"zarr2"`) |
+| `exp_factor` | Divides the zarr's metadata voxel size to give the effective (pre-expansion) voxel size (default: `1.0`). For expansion microscopy the stored value is the microscope's; `stored / exp_factor` is the specimen's. Applies to image and labels, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
 | `label_key` | Optional group key for labels in the same zarr |
 | `weight` | Sampling probability weight (default: equal across volumes) |
 | `resolutions` | Optional per-volume override of the global `resolutions` (same format) |

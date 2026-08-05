@@ -82,6 +82,9 @@ class VolumeConfig(BaseModel):
     # Optional per-volume override of the global MiaoConfig.resolution_sampling.
     resolution_sampling: Optional[ResolutionSampling] = None
     zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
+    # Divides the voxel sizes read from the zarr's OME coordinateTransformations. Applied to the image and label pyramids
+    # alike, before any level selection or resampling. Leave at 1.0 for unexpanded data.
+    exp_factor: float = 1.0
     label_key: Optional[str] = None
     weight: float = 1.0
     normalize: bool = True  # scale images to [0, 1]; see normalize_min / normalize_max
@@ -113,6 +116,13 @@ class VolumeConfig(BaseModel):
     def validate_weight(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"weight must be positive, got {v}")
+        return v
+
+    @field_validator("exp_factor")
+    @classmethod
+    def validate_exp_factor(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"exp_factor must be positive, got {v}")
         return v
 
     @model_validator(mode="after")

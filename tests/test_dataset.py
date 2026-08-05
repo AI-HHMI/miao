@@ -1044,6 +1044,86 @@ class TestBoundingBox:
             VolumeDataset(cfg)
 
             
+class TestExpFactor:
+    """exp_factor divides metadata voxel sizes, so targets are effective (pre-expansion) units.
+
+    The 64^3 fixture stores level voxel sizes [1,1,1], [2,2,2], [4,4,4]; with exp_factor=4 the
+    effective sizes are [0.25,...], [0.5,...], [1.0,...].
+    """
+
+    def _cfg(self, zarr2_volume, resolutions, exp_factor=1.0, **kw):
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw"}
+        if exp_factor != 1.0:
+            vol["exp_factor"] = exp_factor
+        vol.update(kw.pop("vol", {}))
+        return MiaoConfig(
+            volumes=[vol],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=10,
+            resolutions=resolutions,
+            **kw,
+        )
+
+    def test_scales_metadata_voxel_sizes(self, zarr2_volume: Path):
+        ds = VolumeDataset(self._cfg(zarr2_volume, [[0.5, 0.5, 0.5]], exp_factor=4.0))
+        vi = ds._volumes[0]
+        assert np.allclose(vi.finest_voxel_size, [0.25, 0.25, 0.25])
+        assert np.allclose(vi.img_level_voxels[2], [1.0, 1.0, 1.0])
+
+    def test_selects_coarser_level_than_without(self, zarr2_volume: Path):
+        # 0.5 is finer than every stored size, so without exp_factor it falls back to level 0;
+        # with exp_factor=4 it matches the effective size of level 1 exactly.
+        plain = VolumeDataset(self._cfg(zarr2_volume, [[0.5, 0.5, 0.5]]))
+        assert plain._volumes[0].scales.chosen_levels == [0]
+
+        ds = VolumeDataset(self._cfg(zarr2_volume, [[0.5, 0.5, 0.5]], exp_factor=4.0))
+        scales = ds._volumes[0].scales
+        assert scales.chosen_levels == [1]
+        # target == effective level voxel size, so no resampling: read == patch_size
+        assert scales.read_shapes[0].tolist() == [8, 8, 8]
+
+    def test_equivalent_to_scaled_resolutions(self, zarr2_volume: Path):
+        """exp_factor=F at target R/F must behave exactly like exp_factor=1 at target R."""
+        res = [[1, 1, 1], [2, 2, 2], [4, 4, 4]]
+        scaled = [[r / 4.0 for r in lvl] for lvl in res]
+        plain = VolumeDataset(self._cfg(zarr2_volume, res))._volumes[0]
+        exp = VolumeDataset(self._cfg(zarr2_volume, scaled, exp_factor=4.0))._volumes[0]
+
+        assert exp.scales.chosen_levels == plain.scales.chosen_levels
+        for a, b in zip(exp.scales.read_shapes, plain.scales.read_shapes):
+            assert a.tolist() == b.tolist()
+        for a, b in zip(exp.scales.relative_scale_factors, plain.scales.relative_scale_factors):
+            assert np.allclose(a, b)
+        # Center bounds live in level-0 voxels, so they are identical too.
+        assert exp.min_center.tolist() == plain.min_center.tolist()
+        assert exp.max_center.tolist() == plain.max_center.tolist()
+
+    def test_labels_use_same_factor(self, zarr2_volume: Path):
+        cfg = self._cfg(
+            zarr2_volume,
+            [[0.25, 0.25, 0.25], [0.5, 0.5, 0.5]],
+            exp_factor=4.0,
+            vol={"label_key": "labels/seg"},
+        )
+        scales = VolumeDataset(cfg)._volumes[0].scales
+        assert scales.chosen_levels == [0, 1]
+        assert scales.label_chosen_levels == scales.chosen_levels
+
+    def test_reported_units_are_effective(self, zarr2_volume: Path):
+        cfg = self._cfg(zarr2_volume, [[0.5, 0.5, 0.5], [1.0, 1.0, 1.0]], exp_factor=4.0)
+        ds = VolumeDataset(cfg)
+        sample = ds[0]
+        assert np.allclose(sample["pixel_size"].numpy(), [[0.5] * 3, [1.0] * 3])
+        assert np.allclose(sample["meta"]["resolutions"], [[0.5] * 3, [1.0] * 3])
+        # coordinate stays in level-0 voxel indices, so it is bounded by the volume shape.
+        coord = np.array(sample["meta"]["coordinate"])
+        assert np.all(coord >= 0) and np.all(coord < 64)
+        # bbox is in effective physical units: extent == patch_size * pixel_size
+        bbox = sample["bbox"].numpy()  # (L, 2, 3)
+        assert np.allclose(bbox[:, 1, :] - bbox[:, 0, :], [[8 * 0.5] * 3, [8 * 1.0] * 3])
+
+
 class TestChunkAlignedSampling:
     """Tests for chunk_aligned=True random sampling."""
 

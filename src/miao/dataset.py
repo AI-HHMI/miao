@@ -374,6 +374,11 @@ class VolumeDataset(torch.utils.data.Dataset):
                 f"    image: axes={vi.img_axes!r}, shape={finest_meta.shape}, "
                 f"dtype={finest_meta.dtype}",
             ]
+            if vi.config.exp_factor != 1.0:
+                lines.append(
+                    f"    exp_factor: {vi.config.exp_factor} "
+                    "(voxel sizes below are effective, i.e. stored / exp_factor)"
+                )
             if vi.scales is not None:
                 # Fixed: target resolution -> chosen source level (voxel size, storage read shape)
                 sc = vi.scales
@@ -490,20 +495,23 @@ class VolumeDataset(torch.utils.data.Dataset):
             self.config.patch_size, img_spatial, output_spatial
         )
 
-        # Reference frame: finest pyramid level (index 0) absolute spatial voxel size.
-        finest_spatial_factors = np.array(
-            image_meta.scales[0].scale_factors, dtype=np.float64
-        )[img_sp_idx]
+        # exp_factor converts the stored (microscope) voxel size to the effective (specimen) one.
+        exp = vol_cfg.exp_factor
 
-        # Per-level absolute spatial voxel sizes (for level selection)
+        # Reference frame: finest pyramid level (index 0) absolute effective spatial voxel size.
+        finest_spatial_factors = (
+            np.array(image_meta.scales[0].scale_factors, dtype=np.float64)[img_sp_idx] / exp
+        )
+
+        # Per-level absolute effective spatial voxel sizes (for level selection)
         img_level_voxels: dict[int, np.ndarray] = {
-            lvl: np.array(m.scale_factors, dtype=np.float64)[img_sp_idx]
+            lvl: np.array(m.scale_factors, dtype=np.float64)[img_sp_idx] / exp
             for lvl, m in image_meta.scales.items()
         }
         lbl_level_voxels: dict[int, np.ndarray] | None = None
         if label_meta is not None and lbl_sp_idx is not None:
             lbl_level_voxels = {
-                lvl: np.array(m.scale_factors, dtype=np.float64)[lbl_sp_idx]
+                lvl: np.array(m.scale_factors, dtype=np.float64)[lbl_sp_idx] / exp
                 for lvl, m in label_meta.scales.items()
             }
 

@@ -26,6 +26,7 @@ class TestVolumeConfig:
         )
         assert v.weight == 1.0
         assert v.label_key is None
+        assert v.exp_factor == 1.0
 
     def test_negative_weight(self):
         with pytest.raises(ValueError, match="positive"):
@@ -34,6 +35,16 @@ class TestVolumeConfig:
                 path="/data/test.zarr",
                 image_key="raw",
                 weight=-1.0,
+            )
+
+    @pytest.mark.parametrize("bad", [0.0, -4.0])
+    def test_non_positive_exp_factor(self, bad):
+        with pytest.raises(ValueError, match="exp_factor must be positive"):
+            VolumeConfig(
+                name="raw",
+                path="/data/test.zarr",
+                image_key="raw",
+                exp_factor=bad,
             )
 
     def test_normalize_range_both_required(self):
