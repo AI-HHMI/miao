@@ -56,6 +56,27 @@ class TestApplyRot90:
         assert len(_SPATIAL_PERMS) == 6
         assert len(seen) == 48
 
+    def test_matches_builtin_aug_rot(self):
+        """Pin the library transform to dataset.py's aug_rot copy until they're consolidated:
+        the same (perm, flips, spatial_dims) must denote the same rotation in both."""
+        from miao.dataset import _apply_axis_aligned_aug
+
+        t = torch.arange(1 * 3 * 3 * 3).reshape(1, 3, 3, 3)
+        for perm in _SPATIAL_PERMS:
+            for fmask in range(8):
+                flips = (bool(fmask & 1), bool(fmask & 2), bool(fmask & 4))
+                assert torch.equal(
+                    _apply_rot90(t, perm, flips, spatial_dims=(3, 2, 1)),
+                    _apply_axis_aligned_aug(t, (3, 2, 1), perm, flips),
+                )
+
+    def test_low_rank_asserts(self):
+        # The empty no-label sentinel and 2D tensors must be rejected, not wrapped into
+        # duplicate dims by the negative-index modulo.
+        for bad in (torch.empty(0), torch.zeros(4, 4)):
+            with pytest.raises(AssertionError, match="at least 3 dims"):
+                _apply_rot90(bad, (0, 1, 2), (True, True, False))
+
 
 class TestRot90IsoCube:
     """Random axis-aligned rotations/flips (48 total)."""
@@ -126,6 +147,14 @@ class TestRot90IsoCube:
         with pytest.raises(AssertionError, match="cubic patch"):
             rot90isocube(rng, torch.zeros(1, 8, 8, 4))
 
+    def test_bad_pixel_size_shape_asserts(self):
+        # A scalar or transposed pixel_size would pass the isotropy check vacuously.
+        rng = np.random.default_rng(0)
+        img = torch.zeros(1, 8, 8, 8)
+        for bad in (2.0, np.array([[1.0], [1.0], [2.0]])):
+            with pytest.raises(AssertionError, match="3 spatial entries"):
+                rot90isocube(rng, img, pixel_size=bad)
+
 
 class TestIntensityJitter:
     def test_within_expected_scale_and_shift_bounds(self):
@@ -176,6 +205,10 @@ class TestVolumeDatasetAugmentFn:
         ident = VolumeDataset(self._cfg(zarr2_volume), augment_fn=lambda s: s)[0]
         assert torch.equal(plain["img"], ident["img"])
         assert torch.equal(plain["label"], ident["label"])
+
+    def test_non_callable_asserts_at_construction(self, zarr2_volume: Path):
+        with pytest.raises(AssertionError, match="callable"):
+            VolumeDataset(self._cfg(zarr2_volume), augment_fn=True)
 
     def test_rot90_and_jitter_closure(self, zarr2_volume: Path):
         """The intended usage: compose the pure fns in a closure with an rng closed over."""

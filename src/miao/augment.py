@@ -11,7 +11,7 @@ Geometric augmentations draw one transform and apply it to every tensor passed, 
 labels stay aligned. ``spatial_dims`` names the three spatial dims; the default ``(-3, -2, -1)``
 fits any layout with trailing spatial dims (`Z Y X`, `L Z Y X`, `B C Z Y X`). Tensors whose
 spatial dims sit at different positions (e.g. an image with a channel dim among them) get the
-same draw via ``draw_rot90`` + ``apply_rot90``.
+same draw via ``_draw_rot90`` + ``_apply_rot90``.
 """
 
 from __future__ import annotations
@@ -51,6 +51,10 @@ def _apply_rot90(
     (a cubic patch), and their voxels cubes — the axes only permute meaningfully at isotropic
     resolution, which is not derivable from the tensor, so it is the caller's responsibility.
     """
+    assert tensor.ndim >= 3, (
+        f"rot90 requires at least 3 dims, got shape {tuple(tensor.shape)}. Note the dataset's "
+        "empty no-label sentinel must be skipped by the caller, not rotated."
+    )
     dims = tuple(d % tensor.ndim for d in spatial_dims)
     sizes = [tensor.shape[d] for d in dims]
     assert len(set(sizes)) == 1, (
@@ -86,6 +90,11 @@ def rot90isocube(
     """
     if pixel_size is not None:
         ps = np.atleast_2d(np.asarray(pixel_size, dtype=np.float64))
+        assert ps.shape[1] == 3, (
+            f"pixel_size must have 3 spatial entries per scale (shape Nd or L Nd), got "
+            f"shape {ps.shape} — a scalar or transposed array would pass the isotropy "
+            "check vacuously."
+        )
         assert np.allclose(ps, ps[:, :1], rtol=1e-6, atol=1e-9), (
             f"rot90 requires isotropic output resolution, but pixel_size={ps.tolist()} is "
             "anisotropic. Axis-aligned rotations mix spatial axes, which is only valid when "
@@ -106,4 +115,5 @@ def intensity_jitter(
     The defaults assume normalized input (~[0, 1]); on raw wide-range data the shift is
     negligible and reduced-precision dtypes can overflow.
     """
-    return img * rng.uniform(*scale) + rng.uniform(*shift)
+    # add_ mutates only the fresh product of `img * scale`, so the input stays unmutated.
+    return (img * rng.uniform(*scale)).add_(rng.uniform(*shift))

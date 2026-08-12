@@ -335,6 +335,10 @@ class VolumeDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, config: MiaoConfig, augment_fn=None) -> None:
+        assert augment_fn is None or callable(augment_fn), (
+            f"augment_fn must be a callable augment_fn(sample) -> sample, "
+            f"got {type(augment_fn).__name__}"
+        )
         self.config = config
         self.augment_fn = augment_fn
 
