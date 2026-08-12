@@ -198,6 +198,35 @@ fine — e.g. coarse `z` upsampled to match — as long as the requested output 
 > **Note:** `aug_rot` reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
 > describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
+### Custom augmentations (`augment_fn`)
+
+For anything beyond `aug_rot`, pass a callable to the dataset. It is called once per sample on
+the finished sample dict, as `augment_fn(sample) -> sample`, and composes the pure functions in
+`miao/augment.py` with an rng of your choosing:
+
+```python
+import numpy as np
+from miao import VolumeDataset, load_config
+from miao.augment import intensity_jitter, rot90isocube
+
+def augment(sample):
+    rng = np.random  # the global numpy RNG; PyTorch reseeds it per DataLoader worker
+    img, lab = sample["img"], sample["label"]
+    img, lab = rot90isocube(rng, img, lab, pixel_size=sample["pixel_size"])
+    img = intensity_jitter(rng, img)
+    return {**sample, "img": img, "label": lab}
+
+dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
+```
+
+Using the `np.random` module keeps multi-worker loading correct for free; a
+`np.random.default_rng()` Generator closed over from the parent process works too, but
+fork-inherited copies draw identical streams across workers unless you reseed it in a
+`worker_init_fn`. Forwarding `sample["pixel_size"]` to `rot90isocube` enables its isotropy check.
+For volumes without labels, skip the empty label sentinel (`sample["label"].numel() == 0`)
+instead of rotating it. Don't enable `aug_rot: true` and a rotating `augment_fn` together — the
+sample would rotate twice.
+
 ## Configuration reference
 
 ### Per-volume fields

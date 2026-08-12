@@ -1,10 +1,14 @@
 """Tests for the pure-function augmentation library."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
 from miao.augment import _SPATIAL_PERMS, _apply_rot90, intensity_jitter, rot90isocube
+from miao.config import MiaoConfig
+from miao.dataset import VolumeDataset
 
 
 class TestApplyRot90:
@@ -148,3 +152,67 @@ class TestIntensityJitter:
         img = torch.ones(4, 4, 4)
         intensity_jitter(np.random.default_rng(0), img)
         assert torch.equal(img, torch.ones(4, 4, 4))
+
+
+class TestVolumeDatasetAugmentFn:
+    """The augment_fn arg: called per sample as augment_fn(sample) -> sample; rng closed over."""
+
+    def _cfg(self, zarr2_volume, resolutions=[[1, 1, 1]]):
+        return MiaoConfig(
+            volumes=[{
+                "name": "v",
+                "path": str(zarr2_volume),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+            }],
+            resolutions=resolutions,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",  # sample 0 is deterministic
+        )
+
+    def test_identity_fn_passthrough(self, zarr2_volume: Path):
+        plain = VolumeDataset(self._cfg(zarr2_volume))[0]
+        ident = VolumeDataset(self._cfg(zarr2_volume), augment_fn=lambda s: s)[0]
+        assert torch.equal(plain["img"], ident["img"])
+        assert torch.equal(plain["label"], ident["label"])
+
+    def test_rot90_and_jitter_closure(self, zarr2_volume: Path):
+        """The intended usage: compose the pure fns in a closure with an rng closed over."""
+        rng = np.random.default_rng(0)
+
+        def augment(sample):
+            img, label = rot90isocube(
+                rng, sample["img"], sample["label"], pixel_size=sample["pixel_size"]
+            )
+            return {**sample, "img": intensity_jitter(rng, img), "label": label}
+
+        plain = VolumeDataset(self._cfg(zarr2_volume))[0]
+        aug = VolumeDataset(self._cfg(zarr2_volume), augment_fn=augment)[0]
+
+        assert aug["img"].shape == plain["img"].shape
+        assert aug["label"].shape == plain["label"].shape
+        # Rotation is a bijection, so the label's voxel multiset is invariant.
+        assert torch.equal(
+            torch.sort(aug["label"].flatten()).values,
+            torch.sort(plain["label"].flatten()).values,
+        )
+        # Jitter changed the image values.
+        assert not torch.allclose(
+            torch.sort(aug["img"].flatten()).values,
+            torch.sort(plain["img"].flatten()).values,
+        )
+
+    def test_anisotropic_resolution_asserts_via_pixel_size(self, zarr2_volume: Path):
+        """Gary's anisotropy check fires at read time when the closure forwards pixel_size."""
+        rng = np.random.default_rng(0)
+
+        def augment(sample):
+            img, label = rot90isocube(
+                rng, sample["img"], sample["label"], pixel_size=sample["pixel_size"]
+            )
+            return {**sample, "img": img, "label": label}
+
+        ds = VolumeDataset(self._cfg(zarr2_volume, resolutions=[[1, 1, 2]]), augment_fn=augment)
+        with pytest.raises(AssertionError, match="isotropic output resolution"):
+            ds[0]
