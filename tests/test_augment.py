@@ -1,70 +1,150 @@
-"""Tests for augmentation of raw/label patches."""
+"""Tests for the pure-function augmentation library."""
 
 import numpy as np
+import pytest
+import torch
 
-from miao.augment import affine_noise, flip_rotatexy
+from miao.augment import _SPATIAL_PERMS, _apply_rot90, intensity_jitter, rot90isocube
 
 
-class TestSimpleAugment:
-    def test_no_flips_or_transpose_is_identity(self):
+class TestApplyRot90:
+    """Unit tests for the axis-aligned transform helper (no RNG)."""
+
+    def test_identity(self):
+        # "lzyx" → x=3, y=2, z=1
+        t = torch.arange(2 * 4 * 4 * 4).reshape(2, 4, 4, 4)
+        out = _apply_rot90(t, (0, 1, 2), (False, False, False), spatial_dims=(3, 2, 1))
+        assert torch.equal(out, t)
+
+    def test_flip_x_only(self):
+        t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
+        out = _apply_rot90(t, (0, 1, 2), (True, False, False), spatial_dims=(3, 2, 1))
+        assert torch.equal(out, torch.flip(t, dims=[3]))
+
+    def test_swap_x_z(self):
+        # perm (2,1,0) swaps the x and z slots → transpose of dims 1 (z) and 3 (x).
+        t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
+        out = _apply_rot90(t, (2, 1, 0), (False, False, False), spatial_dims=(3, 2, 1))
+        assert torch.equal(out, t.transpose(1, 3))
+
+    def test_leaves_nonspatial_dims(self):
+        # "lzyxc": l=0, z=1, y=2, x=3, c=4 → spatial dims (x,y,z)=(3,2,1); l and c untouched.
+        t = torch.arange(2 * 4 * 4 * 4 * 3).reshape(2, 4, 4, 4, 3)
+        out = _apply_rot90(t, (1, 2, 0), (True, False, True), spatial_dims=(3, 2, 1))
+        assert out.shape == t.shape
+
+    def test_negative_dims_default(self):
+        # The (-3, -2, -1) default addresses the trailing spatial dims of any layout:
+        # flipping spatial slot 2 (= dim -1) flips the last dim.
+        t = torch.arange(2 * 4 * 4 * 4).reshape(2, 4, 4, 4)
+        out = _apply_rot90(t, (0, 1, 2), (False, False, True))
+        assert torch.equal(out, torch.flip(t, dims=[3]))
+
+    def test_group_has_48_distinct_elements(self):
+        # Distinct labels per voxel so any two different transforms differ.
+        t = torch.arange(1 * 3 * 3 * 3).reshape(1, 3, 3, 3)
+        seen = set()
+        for perm in _SPATIAL_PERMS:
+            for fmask in range(8):
+                flips = (bool(fmask & 1), bool(fmask & 2), bool(fmask & 4))
+                out = _apply_rot90(t, perm, flips, spatial_dims=(3, 2, 1))
+                seen.add(out.numpy().tobytes())
+        assert len(_SPATIAL_PERMS) == 6
+        assert len(seen) == 48
+
+
+class TestRot90IsoCube:
+    """Random axis-aligned rotations/flips (48 total)."""
+
+    def test_shape_preserved(self):
         rng = np.random.default_rng(0)
-        raw = np.arange(2 * 3 * 4).reshape(2, 3, 4).astype(np.float32)
-        labels = np.arange(2 * 3 * 4).reshape(2, 3, 4)
+        img = torch.arange(2 * 8 * 8 * 8, dtype=torch.float32).reshape(2, 8, 8, 8)
+        for _ in range(20):
+            (out,) = rot90isocube(rng, img)
+            assert out.shape == img.shape
 
-        class AlwaysHigh:
-            def random(self):
-                return 0.9
+    def test_preserves_value_multiset(self):
+        """A signed permutation is a bijection over a cubic patch, so the sorted voxel values
+        are invariant."""
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(1, 8, 8, 8)
+        for i in range(10):
+            (out,) = rot90isocube(np.random.default_rng(i), img)
+            assert out.shape == img.shape
+            assert torch.allclose(
+                torch.sort(out.flatten()).values, torch.sort(img.flatten()).values
+            )
 
-        out_raw, out_labels = flip_rotatexy(raw, labels, AlwaysHigh())
-        np.testing.assert_array_equal(out_raw, raw)
-        np.testing.assert_array_equal(out_labels, labels)
-
-    def test_applies_same_transform_to_raw_and_labels(self):
+    def test_produces_variation(self):
+        """Over many draws of a fixed patch, more than one distinct orientation appears."""
         rng = np.random.default_rng(0)
-        raw = np.arange(2 * 3 * 4).reshape(2, 3, 4).astype(np.float32)
-        labels = raw.copy()
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(1, 8, 8, 8)
+        seen = {rot90isocube(rng, img)[0].numpy().tobytes() for _ in range(30)}
+        assert len(seen) > 1
 
-        out_raw, out_labels = flip_rotatexy(raw, labels, rng)
-        np.testing.assert_array_equal(out_raw, out_labels)
+    def test_image_and_label_share_transform(self):
+        """Image and label get the same transform. Distinct value at every voxel so the
+        orientation is recoverable, and img/label stay aligned."""
+        data = torch.arange(8 * 8 * 8).reshape(1, 8, 8, 8)
+        for i in range(10):
+            out_img, out_lbl = rot90isocube(
+                np.random.default_rng(i), data.float(), data.clone()
+            )
+            assert torch.equal(out_img, out_lbl.float())
 
-    def test_output_is_contiguous(self):
-        rng = np.random.default_rng(1)
-        raw = np.arange(2 * 3 * 4).reshape(2, 3, 4).astype(np.float32)
-        labels = raw.copy()
+    def test_deterministic_given_rng(self):
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(1, 8, 8, 8)
+        (a,) = rot90isocube(np.random.default_rng(7), img)
+        (b,) = rot90isocube(np.random.default_rng(7), img)
+        assert torch.equal(a, b)
 
-        out_raw, out_labels = flip_rotatexy(raw, labels, rng)
-        assert out_raw.flags["C_CONTIGUOUS"]
-        assert out_labels.flags["C_CONTIGUOUS"]
+    def test_input_not_mutated(self):
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(1, 8, 8, 8)
+        original = img.clone()
+        rot90isocube(np.random.default_rng(0), img)
+        assert torch.equal(img, original)
 
-    def test_flip_reverses_axis(self):
-        raw = np.arange(4).reshape(1, 1, 4).astype(np.float32)
-        labels = raw.copy()
+    def test_isotropic_pixel_size_ok(self):
+        rng = np.random.default_rng(0)
+        img = torch.zeros(1, 8, 8, 8)
+        for ps in ([1.0, 1.0, 1.0], [[1, 1, 1], [4, 4, 4]], torch.ones(2, 3) * 5.0):
+            rot90isocube(rng, img, pixel_size=ps)
 
-        class FlipFirstAxisOnly:
-            def __init__(self):
-                self.calls = 0
+    def test_anisotropic_pixel_size_asserts(self):
+        """Anisotropic output resolution → error at apply time."""
+        rng = np.random.default_rng(0)
+        img = torch.zeros(1, 8, 8, 8)
+        for bad in ([1, 1, 2], [[1, 1, 1], [2, 4, 4]]):
+            with pytest.raises(AssertionError, match="isotropic output resolution"):
+                rot90isocube(rng, img, pixel_size=bad)
 
-            def random(self):
-                self.calls += 1
-                return 0.0 if self.calls == 3 else 0.9
-
-        out_raw, _ = flip_rotatexy(raw, labels, FlipFirstAxisOnly())
-        np.testing.assert_array_equal(out_raw, raw[:, :, ::-1])
+    def test_non_cubic_patch_asserts(self):
+        rng = np.random.default_rng(0)
+        with pytest.raises(AssertionError, match="cubic patch"):
+            rot90isocube(rng, torch.zeros(1, 8, 8, 4))
 
 
-class TestIntensityAugment:
+class TestIntensityJitter:
     def test_within_expected_scale_and_shift_bounds(self):
         rng = np.random.default_rng(0)
-        raw = np.ones((4, 4, 4), dtype=np.float32)
-
-        out = affine_noise(raw, rng)
+        img = torch.ones(4, 4, 4)
+        out = intensity_jitter(rng, img)
         assert out.min() >= 1 * 0.9 - 0.1
         assert out.max() <= 1 * 1.1 + 0.1
 
     def test_is_affine_transform_of_input(self):
         rng = np.random.default_rng(0)
-        raw = np.array([0.0, 1.0, 2.0], dtype=np.float32)
-
-        out = affine_noise(raw, rng)
+        img = torch.tensor([0.0, 1.0, 2.0])
+        out = intensity_jitter(rng, img)
         scale = out[1] - out[0]
-        np.testing.assert_allclose(out[2] - out[1], scale, atol=1e-6)
+        assert torch.allclose(out[2] - out[1], scale, atol=1e-6)
+
+    def test_params_respected(self):
+        rng = np.random.default_rng(0)
+        img = torch.ones(4, 4, 4)
+        out = intensity_jitter(rng, img, scale=(2.0, 2.0), shift=(0.0, 0.0))
+        assert torch.allclose(out, 2 * img)
+
+    def test_input_not_mutated(self):
+        img = torch.ones(4, 4, 4)
+        intensity_jitter(np.random.default_rng(0), img)
+        assert torch.equal(img, torch.ones(4, 4, 4))
