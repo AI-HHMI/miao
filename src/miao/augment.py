@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 
+import numpy as np
 import torch
 
 # The 6 permutations of the three spatial axes. Combined with the 2^3 = 8 per-axis flip masks,
@@ -67,14 +68,29 @@ def _apply_rot90(
 
 
 def rot90isocube(
-    rng, *tensors: torch.Tensor, spatial_dims: tuple[int, int, int] = (-3, -2, -1)
+    rng,
+    *tensors: torch.Tensor,
+    spatial_dims: tuple[int, int, int] = (-3, -2, -1),
+    pixel_size=None,
 ) -> tuple[torch.Tensor, ...]:
     """Random axis-aligned rotation/flip for isotropic cubes: one of the 48 signed permutations of the spatial axes.
 
     One transform is drawn and applied identically to every tensor (e.g. image and labels), so
     alignment survives. All tensors must have their spatial dims at ``spatial_dims``; for mixed
-    layouts, draw once with ``draw_rot90`` and call ``apply_rot90`` per tensor.
+    layouts, draw once with ``_draw_rot90`` and call ``_apply_rot90`` per tensor.
+
+    ``pixel_size`` is the per-axis output voxel size, shape ``Nd_spatial`` or ``L Nd_spatial``
+    (the sample dict's "pixel_size"). When given, isotropy is asserted — permuting axes only
+    means something when voxels are cubes, and under resolution_sampling the voxel size varies
+    per sample. When omitted, isotropy is the caller's responsibility.
     """
+    if pixel_size is not None:
+        ps = np.atleast_2d(np.asarray(pixel_size, dtype=np.float64))
+        assert np.allclose(ps, ps[:, :1], rtol=1e-6, atol=1e-9), (
+            f"rot90 requires isotropic output resolution, but pixel_size={ps.tolist()} is "
+            "anisotropic. Axis-aligned rotations mix spatial axes, which is only valid when "
+            "the voxel size is equal on every axis."
+        )
     perm, flips = _draw_rot90(rng)
     return tuple(_apply_rot90(t, perm, flips, spatial_dims) for t in tensors)
 
