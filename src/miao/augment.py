@@ -1,20 +1,93 @@
-"""Geometric and intensity augmentation for raw/label patches."""
+"""Data augmentations as pure functions: deterministic given rng, tensors in -> tensors out.
 
-import numpy as np
+An augmentation generates plausible new data from existing examples, typically to enhance
+generalization during model training. The output shares the input's structure (tensor shapes,
+label semantics), so it suits the same training task. Functions never mutate their inputs, draw
+randomness only from the ``rng`` argument (anything with ``random()`` / ``uniform()`` — a
+``np.random.default_rng()`` Generator, a RandomState, or the ``np.random`` module), and take any
+further parameters as keyword arguments with usable defaults.
+
+Geometric augmentations draw one transform and apply it to every tensor passed, so images and
+labels stay aligned. ``spatial_dims`` names the three spatial dims; the default ``(-3, -2, -1)``
+fits any layout with trailing spatial dims (`Z Y X`, `L Z Y X`, `B C Z Y X`). Tensors whose
+spatial dims sit at different positions (e.g. an image with a channel dim among them) get the
+same draw via ``draw_rot90`` + ``apply_rot90``.
+"""
+
+from __future__ import annotations
+
+import itertools
+
+import torch
+
+# The 6 permutations of the three spatial axes. Combined with the 2^3 = 8 per-axis flip masks,
+# these enumerate the 48 signed permutations of the cube (axis-aligned 3D rotations and
+# reflections) that rot90 draws from.
+_SPATIAL_PERMS: tuple[tuple[int, int, int], ...] = tuple(itertools.permutations(range(3)))
 
 
-def flip_rotatexy(raw, labels, rng):
-    """Apply the same in-plane transpose and per-axis flips to raw and labels. Assume dims = ZYX."""
-    for axis in range(3):
-        if rng.random() < 0.5:
-            raw = np.flip(raw, axis)
-            labels = np.flip(labels, axis)
-    if rng.random() < 0.5:
-        raw = raw.swapaxes(1, 2)
-        labels = labels.swapaxes(1, 2)
-    return np.ascontiguousarray(raw), np.ascontiguousarray(labels)
+def _draw_rot90(rng) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
+    """Draw one of the 48 axis-aligned 3D rotations/reflections uniformly: (perm, flips)."""
+    perm = _SPATIAL_PERMS[int(rng.random() * len(_SPATIAL_PERMS))]
+    flips = (
+        bool(rng.random() < 0.5),
+        bool(rng.random() < 0.5),
+        bool(rng.random() < 0.5),
+    )
+    return perm, flips
 
 
-def affine_noise(raw, rng):
-    """Randomly rescale and shift raw intensities. Assume values in [0,1]"""
-    return raw * rng.uniform(0.9, 1.1) + rng.uniform(-0.1, 0.1)
+def _apply_rot90(
+    tensor: torch.Tensor,
+    perm: tuple[int, int, int],
+    flips: tuple[bool, bool, bool],
+    spatial_dims: tuple[int, int, int] = (-3, -2, -1),
+) -> torch.Tensor:
+    """Apply one axis-aligned rotation/flip (a signed permutation of the spatial axes).
+
+    ``perm`` is a permutation of ``(0, 1, 2)`` reordering the three ``spatial_dims`` slots;
+    ``flips`` reverses each. Other dims are left untouched. The spatial dims must be equal-sized
+    (a cubic patch), and their voxels cubes — the axes only permute meaningfully at isotropic
+    resolution, which is not derivable from the tensor, so it is the caller's responsibility.
+    """
+    dims = tuple(d % tensor.ndim for d in spatial_dims)
+    sizes = [tensor.shape[d] for d in dims]
+    assert len(set(sizes)) == 1, (
+        f"rot90 requires a cubic patch (axis permutations must preserve shape), but the "
+        f"spatial sizes are {sizes} at dims {dims} of a {tuple(tensor.shape)} tensor."
+    )
+    flip_dims = [dims[i] for i in range(3) if flips[i]]
+    if flip_dims:
+        tensor = torch.flip(tensor, dims=flip_dims)
+    # Place the axis currently at spatial slot perm[i] into spatial slot i; identity elsewhere.
+    full_perm = list(range(tensor.ndim))
+    for i in range(3):
+        full_perm[dims[i]] = dims[perm[i]]
+    return tensor.permute(full_perm).contiguous()
+
+
+def rot90isocube(
+    rng, *tensors: torch.Tensor, spatial_dims: tuple[int, int, int] = (-3, -2, -1)
+) -> tuple[torch.Tensor, ...]:
+    """Random axis-aligned rotation/flip for isotropic cubes: one of the 48 signed permutations of the spatial axes.
+
+    One transform is drawn and applied identically to every tensor (e.g. image and labels), so
+    alignment survives. All tensors must have their spatial dims at ``spatial_dims``; for mixed
+    layouts, draw once with ``draw_rot90`` and call ``apply_rot90`` per tensor.
+    """
+    perm, flips = _draw_rot90(rng)
+    return tuple(_apply_rot90(t, perm, flips, spatial_dims) for t in tensors)
+
+
+def intensity_jitter(
+    rng,
+    img: torch.Tensor,
+    scale: tuple[float, float] = (0.9, 1.1),
+    shift: tuple[float, float] = (-0.1, 0.1),
+) -> torch.Tensor:
+    """Random affine rescale/shift of image intensities: ``img * U(*scale) + U(*shift)``.
+
+    The defaults assume normalized input (~[0, 1]); on raw wide-range data the shift is
+    negligible and reduced-precision dtypes can overflow.
+    """
+    return img * rng.uniform(*scale) + rng.uniform(*shift)
