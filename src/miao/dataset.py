@@ -329,8 +329,9 @@ class VolumeDataset(torch.utils.data.Dataset):
     Input axes are auto-detected from OME-NGFF metadata.
     """
 
-    def __init__(self, config: MiaoConfig) -> None:
+    def __init__(self, config: MiaoConfig, augment_fn=None) -> None:
         self.config = config
+        self.augment_fn = augment_fn
 
         # Normalize sampling weights to probabilities
         weights = np.array([v.weight for v in config.volumes])
@@ -1271,7 +1272,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             else None
         )
 
-        return {
+        x = {
             "img": img_tensor,
             "label": label_tensor,
             "bbox": bbox_tensor,
@@ -1285,3 +1286,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 **({"grid_index": grid_index_out} if grid_index_out is not None else {}),
             },
         }
+
+        if self.augment_fn:
+            x = self.augment_fn(x)
+
+        return x
