@@ -219,7 +219,11 @@ def augment(sample):
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
-Using the `np.random` module keeps multi-worker loading correct for free; a
+`augment_fn` runs inside each DataLoader worker process, so augmentation parallelizes across
+`num_workers` for free — which means it must be self-contained and picklable: a module-level
+`def`, not a lambda or nested closure (those fail with `num_workers > 0` under the `spawn` start
+method used on macOS/Windows), and anything it captures is copied per worker, never shared.
+Using the `np.random` module keeps multi-worker randomness correct for free; a
 `np.random.default_rng()` Generator closed over from the parent process works too, but
 fork-inherited copies draw identical streams across workers unless you reseed it in a
 `worker_init_fn`. Forwarding `sample["pixel_size"]` to `rot90isocube` enables its isotropy check.

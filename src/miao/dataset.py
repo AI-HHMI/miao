@@ -331,7 +331,9 @@ class VolumeDataset(torch.utils.data.Dataset):
     ``augment_fn`` (optional) is called once per sample on the finished dict, as
     ``augment_fn(sample) -> sample``. Compose the pure functions from ``miao.augment`` in a
     closure with an rng you close over — e.g. forward ``sample["pixel_size"]`` to
-    ``rot90isocube`` — and skip the label when it is the empty no-label sentinel.
+    ``rot90isocube`` — and skip the label when it is the empty no-label sentinel. It runs
+    inside DataLoader worker processes, so it must be picklable (a module-level def, not a
+    lambda) and must not rely on state shared across workers.
     """
 
     def __init__(self, config: MiaoConfig, augment_fn=None) -> None:
