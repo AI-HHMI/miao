@@ -3,7 +3,7 @@
 Unlike ``miao.augment`` these take no rng — they change what the target *is* (a label encoding),
 not how the sample looks. Compose them in the same ``augment_fn`` closure, after the stochastic
 augmentations: affinity channels are direction-dependent, so encode after any rotation, with
-``grow_boundary`` before ``affinities``. Functions take one ``Z Y X`` volume and never mutate
+``erode_labels`` before ``affinities``. Functions take one ``Z Y X`` volume and never mutate
 their input; loop over the scale dim in the closure.
 
 Ported from lsd_neuron_segmentation's transforms.py (itself gunpowder's GrowBoundary /
@@ -18,28 +18,31 @@ import torch
 NEAREST_NEIGHBORHOOD: tuple[tuple[int, int, int], ...] = ((-1, 0, 0), (0, -1, 0), (0, 0, -1))
 
 
-def grow_boundary(labels: torch.Tensor, only_xy: bool = False) -> torch.Tensor:
-    """Replace instance borders with background: a 1-voxel gap between touching labels.
+def erode_labels(labels: torch.Tensor, steps: int = 1, only_xy: bool = False) -> torch.Tensor:
+    """Replace instance borders with background: a ``steps``-voxel gap on each side of a touch.
 
-    A voxel becomes background iff any in-volume face-neighbor holds a different label —
-    equivalent to the reference's per-instance ``binary_erosion(..., border_value=1)`` union
-    (patch borders are not eroded), but O(volume) instead of O(n_labels x volume). With
-    ``only_xy`` (for anisotropic data) only in-plane neighbors are compared, matching the
-    reference's per-Z-slice 2D erosion.
+    Per step, a voxel becomes background iff any in-volume face-neighbor holds a different
+    label — iterated, this equals the reference's per-instance
+    ``binary_erosion(..., iterations=steps, border_value=1)`` union (patch borders are not
+    eroded), but O(steps x volume) instead of O(n_labels x volume). With ``only_xy`` (for
+    anisotropic data) only in-plane neighbors are compared, matching the reference's
+    per-Z-slice 2D erosion.
     """
-    assert labels.ndim == 3, f"grow_boundary expects Z Y X labels, got shape {tuple(labels.shape)}"
-    boundary = torch.zeros_like(labels, dtype=torch.bool)
-    for axis in (1, 2) if only_xy else (0, 1, 2):
-        lo = [slice(None)] * 3
-        hi = [slice(None)] * 3
-        lo[axis] = slice(None, -1)
-        hi[axis] = slice(1, None)
-        # A differing face erodes the voxels on both of its sides.
-        diff = labels[tuple(lo)] != labels[tuple(hi)]
-        boundary[tuple(lo)] |= diff
-        boundary[tuple(hi)] |= diff
+    assert labels.ndim == 3, f"erode_labels expects Z Y X labels, got shape {tuple(labels.shape)}"
+    assert steps >= 0, f"steps must be non-negative, got {steps}"
     out = labels.clone()
-    out[boundary] = 0
+    for _ in range(steps):
+        boundary = torch.zeros_like(out, dtype=torch.bool)
+        for axis in (1, 2) if only_xy else (0, 1, 2):
+            lo = [slice(None)] * 3
+            hi = [slice(None)] * 3
+            lo[axis] = slice(None, -1)
+            hi[axis] = slice(1, None)
+            # A differing face erodes the voxels on both of its sides.
+            diff = out[tuple(lo)] != out[tuple(hi)]
+            boundary[tuple(lo)] |= diff
+            boundary[tuple(hi)] |= diff
+        out[boundary] = 0
     return out
 
 

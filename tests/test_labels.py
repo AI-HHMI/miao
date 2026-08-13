@@ -9,7 +9,7 @@ from scipy import ndimage
 from miao.augment import rot90isocube
 from miao.config import MiaoConfig
 from miao.dataset import VolumeDataset
-from miao.labels import NEAREST_NEIGHBORHOOD, affinities, grow_boundary
+from miao.labels import NEAREST_NEIGHBORHOOD, affinities, erode_labels
 
 LONG_RANGE = ((-1, 0, 0), (0, -1, 0), (0, 0, -1), (-2, 0, 0), (0, 2, 0), (0, 0, -3))
 
@@ -18,21 +18,23 @@ LONG_RANGE = ((-1, 0, 0), (0, -1, 0), (0, 0, -1), (-2, 0, 0), (0, 2, 0), (0, 0, 
 #    lsd_neuron_segmentation/src/data/transforms.py (gunpowder GrowBoundary lineage) ──
 
 
-def _ref_grow_boundary(labels, only_xy=False):
+def _ref_erode_labels(labels, steps=1, only_xy=False):
     labels = np.array(labels)
     if only_xy:
         for z in range(labels.shape[0]):
-            _ref_grow(labels[z])
+            _ref_grow(labels[z], steps)
     else:
-        _ref_grow(labels)
+        _ref_grow(labels, steps)
     return labels
 
 
-def _ref_grow(labels):
+def _ref_grow(labels, steps=1):
     foreground = np.zeros(labels.shape, dtype=bool)
     for label in np.unique(labels):
         if label:
-            foreground |= ndimage.binary_erosion(labels == label, border_value=1)
+            foreground |= ndimage.binary_erosion(
+                labels == label, iterations=steps, border_value=1
+            )
     labels[~foreground] = 0
 
 
@@ -60,12 +62,15 @@ def _volumes():
 
 
 class TestOracleEquivalence:
-    def test_grow_boundary_matches_reference(self):
+    def test_erode_labels_matches_reference(self):
         for vol in _volumes():
             for only_xy in (False, True):
-                ours = grow_boundary(torch.from_numpy(vol), only_xy=only_xy)
-                ref = _ref_grow_boundary(vol, only_xy=only_xy)
-                assert np.array_equal(ours.numpy(), ref), f"only_xy={only_xy}"
+                for steps in (1, 2, 3):
+                    ours = erode_labels(torch.from_numpy(vol), steps=steps, only_xy=only_xy)
+                    ref = _ref_erode_labels(vol, steps=steps, only_xy=only_xy)
+                    assert np.array_equal(ours.numpy(), ref), (
+                        f"only_xy={only_xy}, steps={steps}"
+                    )
 
     def test_affinities_match_reference(self):
         for vol in _volumes():
@@ -75,33 +80,48 @@ class TestOracleEquivalence:
                 assert np.array_equal(ours.numpy(), ref)
 
 
-class TestGrowBoundary:
+class TestErodeLabels:
     def test_touching_instances_get_two_voxel_gap(self):
         # Two blocks meeting at y=2: the facing rows y=1 and y=2 erode, the rest survive.
         labels = torch.zeros(3, 4, 4, dtype=torch.int64)
         labels[:, :2, :] = 1
         labels[:, 2:, :] = 2
-        out = grow_boundary(labels)
+        out = erode_labels(labels)
         assert torch.all(out[:, 0, :] == 1)
         assert torch.all(out[:, 1:3, :] == 0)
         assert torch.all(out[:, 3, :] == 2)
 
+    def test_iterated_erosion_widens_gap(self):
+        # 3-wide blocks meeting at y=3: steps=2 erodes rows within L1 distance 2 of the
+        # other label (y=1..4), leaving only the outermost rows.
+        labels = torch.zeros(3, 6, 4, dtype=torch.int64)
+        labels[:, :3, :] = 1
+        labels[:, 3:, :] = 2
+        out = erode_labels(labels, steps=2)
+        assert torch.all(out[:, 0, :] == 1)
+        assert torch.all(out[:, 1:5, :] == 0)
+        assert torch.all(out[:, 5, :] == 2)
+
+    def test_zero_steps_is_noop(self):
+        labels = torch.randint(0, 4, (4, 4, 4))
+        assert torch.equal(erode_labels(labels, steps=0), labels)
+
     def test_patch_border_not_eroded(self):
         # A single label filling the volume touches only the patch border -> unchanged.
         labels = torch.ones(4, 4, 4, dtype=torch.int64)
-        assert torch.equal(grow_boundary(labels), labels)
+        assert torch.equal(erode_labels(labels), labels)
 
     def test_only_xy_ignores_z_interfaces(self):
         # Two labels stacked along z: full-3D erodes both slices, only_xy leaves them alone.
         labels = torch.stack([torch.ones(4, 4), torch.full((4, 4), 2)]).long()  # Z Y X = 2 4 4
-        assert torch.equal(grow_boundary(labels, only_xy=True), labels)
-        assert torch.all(grow_boundary(labels, only_xy=False) == 0)
+        assert torch.equal(erode_labels(labels, only_xy=True), labels)
+        assert torch.all(erode_labels(labels, only_xy=False) == 0)
 
     def test_background_unchanged_and_input_unmutated(self):
         labels = torch.zeros(4, 4, 4, dtype=torch.int64)
         labels[1:3, 1:3, 1:3] = 7
         original = labels.clone()
-        out = grow_boundary(labels)
+        out = erode_labels(labels)
         assert torch.equal(labels, original)
         assert torch.all(out[labels == 0] == 0)
 
@@ -137,7 +157,7 @@ class TestAugmentFnWithLabelTargets:
             img, lab = rot90isocube(
                 rng, sample["img"], sample["label"], pixel_size=sample["pixel_size"]
             )
-            lab = torch.stack([grow_boundary(l) for l in lab])
+            lab = torch.stack([erode_labels(l) for l in lab])
             aff = torch.stack([affinities(l) for l in lab])  # L C Z Y X
             return {**sample, "img": img, "label": lab, "affinities": aff}
 

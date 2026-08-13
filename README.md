@@ -232,17 +232,18 @@ direction-dependent, so encode after rotating):
 
 ```python
 import torch
-from miao.labels import affinities, grow_boundary
+from miao.labels import affinities, erode_labels
 
 def augment(sample):
     # ... geometric / intensity augmentations first ...
-    lab = torch.stack([grow_boundary(l) for l in sample["label"]])  # per level; output_axes lzyx
+    lab = torch.stack([erode_labels(l) for l in sample["label"]])  # per level; output_axes lzyx
     aff = torch.stack([affinities(l) for l in lab])                 # L C Z Y X
     return {**sample, "label": lab, "affinities": aff}
 ```
 
-`grow_boundary(labels, only_xy=False)` erodes a 1-voxel background gap between touching instances
-(`only_xy=True` restricts erosion to in-plane neighbors, for anisotropic data).
+`erode_labels(labels, steps=1, only_xy=False)` erodes a `steps`-voxel background gap on each side
+of touching instances (`only_xy=True` restricts erosion to in-plane neighbors, for anisotropic
+data).
 `affinities(labels, neighborhood=NEAREST_NEIGHBORHOOD)` returns one map per `Z Y X` voxel offset
 as `C Z Y X` float32 — the default is nearest-neighbor (`(-1,0,0), (0,-1,0), (0,0,-1)`); for
 long-range affinities pass your own offsets. New sample keys with fixed shapes collate normally.
