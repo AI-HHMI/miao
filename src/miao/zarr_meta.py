@@ -32,6 +32,7 @@ class OmeMetadata:
     axis_names: list[str]
     scales: dict[int, ScaleMetadata]  # level index -> metadata
     zarr_version: ZarrVersion
+    outer_scale: list[float]  # multiscale-level coordinateTransformations scale; identity if absent
 
 
 def detect_zarr_version(path: Path | str) -> ZarrVersion:
@@ -203,4 +204,5 @@ def read_ome_metadata(
         axis_names=axis_names,
         scales=scales,
         zarr_version=zarr_version,
+        outer_scale=outer_scale,
     )
