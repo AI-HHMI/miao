@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from miao.augment import _SPATIAL_PERMS, apply_rot90, intensity_jitter, rot90isocube
+from miao.augment import _SPATIAL_PERMS, apply_rot90, draw_rot90, intensity_jitter, rot90isocube
 from miao.config import MiaoConfig
 from miao.dataset import VolumeDataset
 
@@ -62,6 +62,33 @@ class TestApplyRot90:
         for bad in (torch.empty(0), torch.zeros(4, 4)):
             with pytest.raises(AssertionError, match="at least 3 dims"):
                 apply_rot90(bad, (0, 1, 2), (True, True, False))
+
+
+class TestDrawApplyRot90:
+    """One draw applied across separately-held tensors (per-level lists, mixed layouts)."""
+
+    def test_same_draw_across_levels_matches_stacked(self):
+        # Looping apply_rot90 over per-level tensors with one draw equals rotating the
+        # stacked L Z Y X tensor in a single rot90isocube call (same rng seed, same draw).
+        levels = [torch.randn(5, 5, 5) for _ in range(4)]
+        perm, flips = draw_rot90(np.random.default_rng(3))
+        looped = torch.stack([apply_rot90(lvl, perm, flips) for lvl in levels])
+        (stacked,) = rot90isocube(np.random.default_rng(3), torch.stack(levels))
+        assert torch.equal(looped, stacked)
+
+    def test_mixed_layouts_stay_aligned(self):
+        # An L Z Y X C image and an L Z Y X label share one draw via per-tensor spatial_dims.
+        label = torch.arange(3 * 3 * 3).reshape(1, 3, 3, 3)
+        img = label.unsqueeze(-1).float()  # L Z Y X C
+        perm, flips = draw_rot90(np.random.default_rng(5))
+        out_img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))
+        out_label = apply_rot90(label, perm, flips)
+        assert torch.equal(out_img.squeeze(-1).long(), out_label)
+
+    def test_recorded_draw_replays_identically(self):
+        t = torch.arange(4 * 4 * 4).reshape(4, 4, 4)
+        perm, flips = draw_rot90(np.random.default_rng(9))
+        assert torch.equal(apply_rot90(t, perm, flips), apply_rot90(t, perm, flips))
 
 
 class TestRot90IsoCube:

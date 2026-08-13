@@ -222,6 +222,23 @@ resolution each call; use isotropic single-value bounds).
 > **Note:** rotation reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
 > describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
+### `draw_rot90` + `apply_rot90`
+
+`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
+tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
+once and apply the same transform per tensor:
+
+```python
+from miao.augment import apply_rot90, draw_rot90
+
+perm, flips = draw_rot90(rng)
+levels = [apply_rot90(lvl, perm, flips) for lvl in per_level_tensors]  # same rotation across L
+img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X C layout
+```
+
+`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later —
+e.g. to apply the identical rotation to tensors produced further down the pipeline.
+
 ### Label targets (`miao/labels.py`)
 
 ```python
