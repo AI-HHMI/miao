@@ -175,9 +175,16 @@ Those sampled origins stay strictly inside any per-volume `bounding_box`. `resol
 finest to coarsest (non-decreasing voxel size per axis, e.g. `[[8,8,8], [16,16,16]]`); putting a
 coarser resolution first raises.
 
-## Augmentation (`aug_rot`)
+## Augmentations
 
-Set `aug_rot: true` on a volume to reorient every sample at random:
+Three composable ways to augment a sample:
+
+- **`aug_rot`** — config flag; random axis-aligned rotation/flip, applied inside the dataset.
+- **[`miao/augment.py`](src/miao/augment.py)** — a callable you pass to `VolumeDataset` for image level augementations.
+- **[`miao/labels.py`](src/miao/labels.py)** — deterministic (non-random) label-target
+  transforms, composed in the same `augment_fn`.
+
+### `aug_rot`
 
 ```yaml
 volumes:
@@ -188,25 +195,15 @@ volumes:
     aug_rot: true            # optional, default: false
 ```
 
-Each `__getitem__` draws **one** transform uniformly from the 48 symmetries of the cube (3! axis
-permutations × 2³ per-axis flips) — the largest augmentation set reachable without interpolation,
-since every such transform maps voxels exactly onto voxels. The draw applies to image and labels
-together, and to every scale, so alignment and nesting survive.
-
-**Isotropic output is required**, since permuting axes only means something when voxels are cubes.
-Two checks enforce it: `patch_size` must be equal across `x`, `y`, `z` (at config load), and the
-resolution being read must be equal on all axes (per sample, because `resolution_sampling` can
-draw a fresh one each call — use isotropic single-value bounds). Anisotropic data *on disk* is
-fine — e.g. coarse `z` upsampled to match — as long as the requested output is isotropic.
-
-> **Note:** `aug_rot` reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
-> describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
+Rotates/flips image and labels together, at every scale, drawing one of the 48 cube symmetries
+per sample. Requires isotropic `patch_size` and output resolution. See the `aug_rot` validators
+in [`config.py`](src/miao/config.py) and [`rot90isocube`](src/miao/augment.py) for exact
+behavior.
 
 ### Custom augmentations (`augment_fn`)
 
-For anything beyond `aug_rot`, pass a callable to the dataset. It is called once per sample on
-the finished sample dict, as `augment_fn(sample) -> sample`, and composes the pure functions in
-`miao/augment.py` with an rng of your choosing:
+For anything beyond `aug_rot`, pass a callable to the dataset, called once per sample as
+`augment_fn(sample) -> sample`:
 
 ```python
 import numpy as np
@@ -223,16 +220,11 @@ def augment(sample):
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
-`augment_fn` runs inside each DataLoader worker process, so augmentation parallelizes across
-`num_workers` for free — which means it must be self-contained and picklable: a module-level
-`def`, not a lambda or nested closure (those fail with `num_workers > 0` under the `spawn` start
-method used on macOS/Windows), and anything it captures is copied per worker, never shared.
+See [`miao/augment.py`](src/miao/augment.py) for the available
+functions and their exact behavior. Don't combine `aug_rot: true` with a rotating `augment_fn` —
+the sample would rotate twice.
 
 ### Label targets (`miao/labels.py`)
-
-`miao/labels.py` holds deterministic label transforms — no rng — for building training targets,
-composed in the same `augment_fn` *after* the stochastic augmentations (affinity channels are
-direction-dependent, so encode after rotating):
 
 ```python
 import torch
@@ -245,19 +237,9 @@ def augment(sample):
     return {**sample, "label": lab, "affinities": aff}
 ```
 
-`erode_labels(labels, steps=1, only_xy=False)` erodes a `steps`-voxel background gap on each side
-of touching instances (`only_xy=True` restricts erosion to in-plane neighbors, for anisotropic
-data).
-`affinities(labels, neighborhood=NEAREST_NEIGHBORHOOD)` returns one map per `Z Y X` voxel offset
-as `C Z Y X` float32 — the default is nearest-neighbor (`(-1,0,0), (0,-1,0), (0,0,-1)`); for
-long-range affinities pass your own offsets. New sample keys with fixed shapes collate normally.
-Using the `np.random` module keeps multi-worker randomness correct for free; a
-`np.random.default_rng()` Generator closed over from the parent process works too, but
-fork-inherited copies draw identical streams across workers unless you reseed it in a
-`worker_init_fn`. Forwarding `sample["pixel_size"]` to `rot90isocube` enables its isotropy check.
-For volumes without labels, skip the empty label sentinel (`sample["label"].numel() == 0`)
-instead of rotating it. Don't enable `aug_rot: true` and a rotating `augment_fn` together — the
-sample would rotate twice.
+Compose after the stochastic augmentations, since affinity channels are direction-dependent. See
+[`erode_labels`](src/miao/labels.py) and [`affinities`](src/miao/labels.py) docstrings for exact
+behavior.
 
 ## Configuration reference
 
@@ -276,7 +258,7 @@ sample would rotate twice.
 | `normalize` | Scale images to [0, 1] by dtype max (default: `true`); `normalize_min` / `normalize_max` set the bounds explicitly |
 | `patch_normalize` | Standardize each sample to zero mean / unit variance after `normalize` (default: `false`). Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | Optional `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window, or construction raises |
-| `aug_rot` | Random axis-aligned rotation/flip per sample (default: `false`) — see [Augmentation](#augmentation-aug_rot) |
+| `aug_rot` | Random axis-aligned rotation/flip per sample (default: `false`) — see [Augmentation](#augmentation) |
 
 ### Dataset fields
 
