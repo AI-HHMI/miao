@@ -177,33 +177,16 @@ coarser resolution first raises.
 
 ## Augmentations
 
-Three composable ways to augment a sample:
+Two composable ways to augment a sample:
 
-- **`aug_rot`** — config flag; random axis-aligned rotation/flip, applied inside the dataset.
-- **[`miao/augment.py`](src/miao/augment.py)** — a callable you pass to `VolumeDataset` for image level augementations.
+- **[`miao/augment.py`](src/miao/augment.py)** — stochastic image augmentations, composed in a
+  callable you pass to `VolumeDataset`.
 - **[`miao/labels.py`](src/miao/labels.py)** — deterministic (non-random) label-target
   transforms, composed in the same `augment_fn`.
 
-### `aug_rot`
-
-```yaml
-volumes:
-  - name: "raw"
-    path: "/data/sample_A.zarr"
-    image_key: "raw"
-    label_key: "labels/seg"
-    aug_rot: true            # optional, default: false
-```
-
-Rotates/flips image and labels together, at every scale, drawing one of the 48 cube symmetries
-per sample. Requires isotropic `patch_size` and output resolution. See the `aug_rot` validators
-in [`config.py`](src/miao/config.py) and [`rot90isocube`](src/miao/augment.py) for exact
-behavior.
-
 ### Custom augmentations (`augment_fn`)
 
-For anything beyond `aug_rot`, pass a callable to the dataset, called once per sample as
-`augment_fn(sample) -> sample`:
+Pass a callable to the dataset, called once per sample as `augment_fn(sample) -> sample`:
 
 ```python
 import numpy as np
@@ -221,8 +204,23 @@ dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
 See [`miao/augment.py`](src/miao/augment.py) for the available
-functions and their exact behavior. Don't combine `aug_rot: true` with a rotating `augment_fn` —
-the sample would rotate twice.
+functions and their exact behavior.
+
+Using the `np.random` module keeps multi-worker randomness correct for free; a
+`np.random.default_rng()` Generator closed over from the parent process works too, but
+fork-inherited copies draw identical streams across workers unless you reseed it in a
+`worker_init_fn`. For volumes without labels, skip the empty label sentinel
+(`sample["label"].numel() == 0`) instead of rotating it.
+
+### `rot90isocube`
+
+Rotates/flips all tensors passed together, at every scale, drawing one of the 48 cube symmetries
+per sample. Requires a cubic patch and isotropic output resolution — forward
+`sample["pixel_size"]` to have that asserted per sample (`resolution_sampling` can draw a fresh
+resolution each call; use isotropic single-value bounds).
+
+> **Note:** rotation reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
+> describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
 ### Label targets (`miao/labels.py`)
 
@@ -258,7 +256,6 @@ behavior.
 | `normalize` | Scale images to [0, 1] by dtype max (default: `true`); `normalize_min` / `normalize_max` set the bounds explicitly |
 | `patch_normalize` | Standardize each sample to zero mean / unit variance after `normalize` (default: `false`). Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | Optional `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window, or construction raises |
-| `aug_rot` | Random axis-aligned rotation/flip per sample (default: `false`) — see [Augmentation](#augmentation) |
 
 ### Dataset fields
 
@@ -355,8 +352,8 @@ physical thickness all survive collation. Index a single scale out with `batch["
   them unequally to bias the orientation mix.
 - Each `VolumeDataset` opens its own TensorStore cache per worker — divide `cache_bytes` by three
   to hold the footprint constant.
-- `aug_rot` is out, since it wants a cubic `patch_size`. Flip and transpose the collated planes
-  yourself.
+- `rot90isocube` is out, since it wants a cubic `patch_size`. Flip and transpose the collated
+  planes yourself.
 - Mixing labelled and unlabelled volumes breaks collation: an empty `label` tensor will not stack
   against a real one.
 - Under `sampling: "sequential"`, a non-zero scalar `overlap` fails validation — it must be

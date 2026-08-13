@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from miao.augment import _SPATIAL_PERMS, _apply_rot90, intensity_jitter, rot90isocube
+from miao.augment import _SPATIAL_PERMS, apply_rot90, intensity_jitter, rot90isocube
 from miao.config import MiaoConfig
 from miao.dataset import VolumeDataset
 
@@ -17,31 +17,31 @@ class TestApplyRot90:
     def test_identity(self):
         # "lzyx" → x=3, y=2, z=1
         t = torch.arange(2 * 4 * 4 * 4).reshape(2, 4, 4, 4)
-        out = _apply_rot90(t, (0, 1, 2), (False, False, False), spatial_dims=(3, 2, 1))
+        out = apply_rot90(t, (0, 1, 2), (False, False, False), spatial_dims=(3, 2, 1))
         assert torch.equal(out, t)
 
     def test_flip_x_only(self):
         t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
-        out = _apply_rot90(t, (0, 1, 2), (True, False, False), spatial_dims=(3, 2, 1))
+        out = apply_rot90(t, (0, 1, 2), (True, False, False), spatial_dims=(3, 2, 1))
         assert torch.equal(out, torch.flip(t, dims=[3]))
 
     def test_swap_x_z(self):
         # perm (2,1,0) swaps the x and z slots → transpose of dims 1 (z) and 3 (x).
         t = torch.arange(1 * 4 * 4 * 4).reshape(1, 4, 4, 4)
-        out = _apply_rot90(t, (2, 1, 0), (False, False, False), spatial_dims=(3, 2, 1))
+        out = apply_rot90(t, (2, 1, 0), (False, False, False), spatial_dims=(3, 2, 1))
         assert torch.equal(out, t.transpose(1, 3))
 
     def test_leaves_nonspatial_dims(self):
         # "lzyxc": l=0, z=1, y=2, x=3, c=4 → spatial dims (x,y,z)=(3,2,1); l and c untouched.
         t = torch.arange(2 * 4 * 4 * 4 * 3).reshape(2, 4, 4, 4, 3)
-        out = _apply_rot90(t, (1, 2, 0), (True, False, True), spatial_dims=(3, 2, 1))
+        out = apply_rot90(t, (1, 2, 0), (True, False, True), spatial_dims=(3, 2, 1))
         assert out.shape == t.shape
 
     def test_negative_dims_default(self):
         # The (-3, -2, -1) default addresses the trailing spatial dims of any layout:
         # flipping spatial slot 2 (= dim -1) flips the last dim.
         t = torch.arange(2 * 4 * 4 * 4).reshape(2, 4, 4, 4)
-        out = _apply_rot90(t, (0, 1, 2), (False, False, True))
+        out = apply_rot90(t, (0, 1, 2), (False, False, True))
         assert torch.equal(out, torch.flip(t, dims=[3]))
 
     def test_group_has_48_distinct_elements(self):
@@ -51,31 +51,17 @@ class TestApplyRot90:
         for perm in _SPATIAL_PERMS:
             for fmask in range(8):
                 flips = (bool(fmask & 1), bool(fmask & 2), bool(fmask & 4))
-                out = _apply_rot90(t, perm, flips, spatial_dims=(3, 2, 1))
+                out = apply_rot90(t, perm, flips, spatial_dims=(3, 2, 1))
                 seen.add(out.numpy().tobytes())
         assert len(_SPATIAL_PERMS) == 6
         assert len(seen) == 48
-
-    def test_matches_builtin_aug_rot(self):
-        """Pin the library transform to dataset.py's aug_rot copy until they're consolidated:
-        the same (perm, flips, spatial_dims) must denote the same rotation in both."""
-        from miao.dataset import _apply_axis_aligned_aug
-
-        t = torch.arange(1 * 3 * 3 * 3).reshape(1, 3, 3, 3)
-        for perm in _SPATIAL_PERMS:
-            for fmask in range(8):
-                flips = (bool(fmask & 1), bool(fmask & 2), bool(fmask & 4))
-                assert torch.equal(
-                    _apply_rot90(t, perm, flips, spatial_dims=(3, 2, 1)),
-                    _apply_axis_aligned_aug(t, (3, 2, 1), perm, flips),
-                )
 
     def test_low_rank_asserts(self):
         # The empty no-label sentinel and 2D tensors must be rejected, not wrapped into
         # duplicate dims by the negative-index modulo.
         for bad in (torch.empty(0), torch.zeros(4, 4)):
             with pytest.raises(AssertionError, match="at least 3 dims"):
-                _apply_rot90(bad, (0, 1, 2), (True, True, False))
+                apply_rot90(bad, (0, 1, 2), (True, True, False))
 
 
 class TestRot90IsoCube:

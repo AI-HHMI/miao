@@ -11,7 +11,7 @@ Geometric augmentations draw one transform and apply it to every tensor passed, 
 labels stay aligned. ``spatial_dims`` names the three spatial dims; the default ``(-3, -2, -1)``
 fits any layout with trailing spatial dims (`Z Y X`, `L Z Y X`, `B C Z Y X`). Tensors whose
 spatial dims sit at different positions (e.g. an image with a channel dim among them) get the
-same draw via ``_draw_rot90`` + ``_apply_rot90``.
+same draw via ``draw_rot90`` + ``apply_rot90``.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import torch
 _SPATIAL_PERMS: tuple[tuple[int, int, int], ...] = tuple(itertools.permutations(range(3)))
 
 
-def _draw_rot90(rng) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
+def draw_rot90(rng) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
     """Draw one of the 48 axis-aligned 3D rotations/reflections uniformly: (perm, flips)."""
     perm = _SPATIAL_PERMS[int(rng.random() * len(_SPATIAL_PERMS))]
     flips = (
@@ -38,7 +38,7 @@ def _draw_rot90(rng) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
     return perm, flips
 
 
-def _apply_rot90(
+def apply_rot90(
     tensor: torch.Tensor,
     perm: tuple[int, int, int],
     flips: tuple[bool, bool, bool],
@@ -81,7 +81,7 @@ def rot90isocube(
 
     One transform is drawn and applied identically to every tensor (e.g. image and labels), so
     alignment survives. All tensors must have their spatial dims at ``spatial_dims``; for mixed
-    layouts, draw once with ``_draw_rot90`` and call ``_apply_rot90`` per tensor.
+    layouts, draw once with ``draw_rot90`` and call ``apply_rot90`` per tensor.
 
     ``pixel_size`` is the per-axis output voxel size, shape ``Nd_spatial`` or ``L Nd_spatial``
     (the sample dict's "pixel_size"). When given, isotropy is asserted — permuting axes only
@@ -100,8 +100,8 @@ def rot90isocube(
             "anisotropic. Axis-aligned rotations mix spatial axes, which is only valid when "
             "the voxel size is equal on every axis."
         )
-    perm, flips = _draw_rot90(rng)
-    return tuple(_apply_rot90(t, perm, flips, spatial_dims) for t in tensors)
+    perm, flips = draw_rot90(rng)
+    return tuple(apply_rot90(t, perm, flips, spatial_dims) for t in tensors)
 
 
 def intensity_jitter(
