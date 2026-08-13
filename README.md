@@ -87,6 +87,10 @@ voxel size is the stored `coordinateTransformations` scale divided by `F` — a 
 imaged at 200 nm holds 50 nm of biology per voxel. `exp_factor` defaults to `1.0`, so for
 unexpanded data the stored and effective sizes are identical.
 
+If the zarr's OME metadata already carries the correction as a multiscale-level (outer)
+`coordinateTransformations` scale, it is applied automatically — set `exp_factor` only for
+stores that lack that metadata, or the correction would be applied twice.
+
 Level selection, read extents, `pixel_size`, and `meta["resolutions"]` are all in effective units,
 which is what lets one `resolutions` list mix expanded and unexpanded volumes correctly.
 `bounding_box` and `meta["coordinate"]` are level-0 voxel *indices*, not physical sizes, so
@@ -208,7 +212,7 @@ fine — e.g. coarse `z` upsampled to match — as long as the requested output 
 | `path` | Path to the OME-NGFF zarr container |
 | `image_key` | Group key within the zarr for image data |
 | `zarr_version` | `"zarr2"` or `"zarr3"` (default: `"zarr2"`) |
-| `exp_factor` | Divides the zarr's metadata voxel size to give the effective (pre-expansion) voxel size (default: `1.0`). For expansion microscopy the stored value is the microscope's; `stored / exp_factor` is the specimen's. Applies to image and labels, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
+| `exp_factor` | Divides the zarr's metadata voxel size to give the effective (pre-expansion) voxel size (default: `1.0`). For expansion microscopy the stored value is the microscope's; `stored / exp_factor` is the specimen's. Applies to image and labels, before level selection. Not needed when the OME metadata already carries a multiscale-level `coordinateTransformations` scale — that is applied automatically — see [Effective voxel sizes](#effective-voxel-sizes) |
 | `label_key` | Optional group key for labels in the same zarr |
 | `weight` | Sampling probability weight (default: equal across volumes) |
 | `resolutions` | Optional per-volume override of the global `resolutions` (same format) |

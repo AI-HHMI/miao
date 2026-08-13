@@ -57,3 +57,22 @@ class TestReadOmeMetadata:
     def test_missing_group(self, zarr2_volume: Path):
         with pytest.raises(FileNotFoundError):
             read_ome_metadata(zarr2_volume, "nonexistent", "zarr2")
+
+    def test_multiscale_level_transform(self, tmp_path: Path):
+        """A multiscale-level (outer) scale transform multiplies every level's factors."""
+        from conftest import _create_ome_ngff_zarr2
+
+        zarr_path = tmp_path / "outer_scale.zarr"
+        _create_ome_ngff_zarr2(
+            zarr_path,
+            group_key="raw",
+            base_shape=(64, 64, 64),
+            num_scales=3,
+            base_scale_factors=[4.0, 2.0, 2.0],
+            outer_scale=[0.5, 0.5, 0.5],
+        )
+
+        meta = read_ome_metadata(zarr_path, "raw", "zarr2")
+        assert meta.scales[0].scale_factors == [2.0, 1.0, 1.0]
+        assert meta.scales[1].scale_factors == [4.0, 2.0, 2.0]
+        assert meta.scales[2].scale_factors == [8.0, 4.0, 4.0]
