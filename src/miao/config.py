@@ -7,7 +7,7 @@ from typing import Literal, Optional, Union
 
 import torch
 import yaml
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 # Mapping from config string to torch dtype for image tensors.
 IMAGE_DTYPE_MAP: dict[str, torch.dtype] = {
@@ -35,6 +35,9 @@ class ResolutionSampling(BaseModel):
     range) or a scalar applied to every range. The total number of scales (the stacked 'l'
     dimension) is the sum.
     """
+
+    # Reject unknown keys so typos and removed fields fail loudly.
+    model_config = ConfigDict(extra="forbid")
 
     # Sampling strategy. Only "log_uniform" is implemented; the dataset dispatches through a
     # registry, so additional strategies (e.g. gaussian) can be added without schema changes.
@@ -72,6 +75,9 @@ class ResolutionSampling(BaseModel):
 class VolumeConfig(BaseModel):
     """Configuration for a single zarr volume."""
 
+    # Reject unknown keys so typos and removed fields (e.g. the old aug_rot) fail loudly.
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     path: str
     image_key: str
@@ -97,15 +103,6 @@ class VolumeConfig(BaseModel):
     # statistics are taken from the coarsest-resolution (largest physical extent) crop and
     # applied to every scale, so the scales stay on a common intensity scale.
     patch_normalize: bool = False
-    # If True, apply a random axis-aligned rotation/flip augmentation to each returned patch —
-    # one of the 48 signed permutations of the x/y/z axes (the full symmetry group of the cube:
-    # 3! axis permutations x 2^3 per-axis flips). The same transform is applied to the image and
-    # its labels. Requires isotropic output (checked per sample): the patch must be cubic across
-    # x/y/z and the resolution being read must be equal on all spatial axes — otherwise a
-    # permutation would mix axes of unequal physical size. It is fine for the underlying stored
-    # data to be anisotropic (e.g. z coarser than x/y and upsampled) as long as the requested
-    # output resolution is isotropic.
-    aug_rot: bool = False
     # [[min_0, max_0], ...] in finest-scale voxels, output_axes spatial order (like patch_size).
     # Strictly contains every window's read extent (all scales, including coarser sample_windows
     # patches), not just the patch center. Must be at least as large as the coarsest window.
@@ -142,6 +139,9 @@ class VolumeConfig(BaseModel):
 
 class MiaoConfig(BaseModel):
     """Top-level configuration for miaio dataset."""
+
+    # Reject unknown keys so typos and removed fields fail loudly.
+    model_config = ConfigDict(extra="forbid")
 
     volumes: list[VolumeConfig]
     # Desired output resolutions, one per scale. Each inner list is the output voxel size per
@@ -376,34 +376,6 @@ class MiaoConfig(BaseModel):
                         f"(non-decreasing per axis). For volume {vol.name!r}, resolution "
                         f"index {i - 1}->{i} is {prev} -> {curr}."
                     )
-        return self
-
-    @model_validator(mode="after")
-    def validate_aug_rot(self) -> "MiaoConfig":
-        """Static checks for volumes with aug_rot: the output must be able to hold the full set
-        of 48 axis-aligned 3D transforms. Per-sample resolution isotropy is checked at read
-        time (it can vary with resolution_sampling)."""
-        from miao.axes import spatial_axes
-
-        if not any(v.aug_rot for v in self.volumes):
-            return self
-        out_spatial = spatial_axes(self.output_axes)
-        missing = [c for c in "xyz" if c not in out_spatial]
-        if missing:
-            raise ValueError(
-                f"aug_rot requires output_axes to contain all of x, y, z (for the full set of "
-                f"48 axis-aligned 3D rotations/flips), but output_axes={self.output_axes!r} is "
-                f"missing {missing}"
-            )
-        # patch_size is in output_axes spatial order; the x/y/z extents must match so that an
-        # axis permutation preserves the tensor shape.
-        xyz_sizes = {c: self.patch_size[out_spatial.index(c)] for c in "xyz"}
-        if len(set(xyz_sizes.values())) != 1:
-            raise ValueError(
-                f"aug_rot requires a cubic patch_size across x, y, z (axis permutations must "
-                f"preserve shape), but got {xyz_sizes} from patch_size={self.patch_size} "
-                f"(output_axes={self.output_axes!r})"
-            )
         return self
 
     @model_validator(mode="after")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -141,35 +140,6 @@ def _sample_resolutions(
     if spec.sort:
         raw = _sort_fine_to_coarse(raw)
     return [row.tolist() for row in raw]
-
-
-# The 6 permutations of the three spatial axes (x, y, z). Combined with the 2^3 = 8 per-axis
-# flip masks below, these enumerate the 48 signed permutations of the cube (axis-aligned 3D
-# rotations and reflections) that aug_rot draws from.
-_SPATIAL_PERMS: tuple[tuple[int, int, int], ...] = tuple(itertools.permutations(range(3)))
-
-
-def _apply_axis_aligned_aug(
-    tensor: torch.Tensor,
-    spatial_dims: tuple[int, int, int],
-    perm: tuple[int, int, int],
-    flips: tuple[bool, bool, bool],
-) -> torch.Tensor:
-    """Apply one axis-aligned rotation/flip (a signed permutation of the x/y/z axes) to ``tensor``.
-
-    ``spatial_dims`` are the tensor dim indices of (x, y, z). ``perm`` is a permutation of
-    ``(0, 1, 2)`` reordering those three axes; ``flips`` reverses each. Non-spatial dims (l, t, c)
-    are left untouched. Only valid for a cubic patch at isotropic resolution — the caller
-    guarantees this before calling.
-    """
-    flip_dims = [spatial_dims[i] for i in range(3) if flips[i]]
-    if flip_dims:
-        tensor = torch.flip(tensor, dims=flip_dims)
-    # Place the axis currently at spatial slot perm[i] into spatial slot i; identity elsewhere.
-    full_perm = list(range(tensor.ndim))
-    for i in range(3):
-        full_perm[spatial_dims[i]] = spatial_dims[perm[i]]
-    return tensor.permute(full_perm).contiguous()
 
 
 def _normalize_image_tensor(
@@ -730,25 +700,6 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         return min_center, max_center
 
-    def _assert_aug_rot_isotropic(
-        self, vol_info: VolumeInfo, scales: ScaleResolution
-    ) -> None:
-        """Ensure every scale's output resolution is isotropic before applying aug_rot.
-
-        Axis permutations mix spatial axes, so they are only valid when the voxels read for the
-        output are cubic. Checked per __getitem__ because resolutions may be drawn per sample in
-        resolution_sampling mode. The cubic-patch requirement is enforced statically in config.
-        """
-        for s, res in enumerate(scales.resolutions):
-            r = np.asarray(res, dtype=np.float64)
-            if not np.allclose(r, r[0], rtol=1e-6, atol=1e-9):
-                raise ValueError(
-                    f"Volume {vol_info.config.name!r}: aug_rot requires isotropic output "
-                    f"resolution, but scale {s} resolution {r.tolist()} is anisotropic. "
-                    "Axis-aligned rotations mix spatial axes, which is only valid when the "
-                    "voxel size read for the output is equal on every axis."
-                )
-
     def _build_sequential_grid(self) -> None:
         """Precompute flat list of (vol_idx, center, grid_index) for sequential sampling.
 
@@ -1222,35 +1173,6 @@ class VolumeDataset(torch.utils.data.Dataset):
         else:
             # Keep output collate-friendly for default PyTorch DataLoader.
             label_tensor = torch.empty(0, dtype=vol_info.label_torch_dtype)
-
-        # Axis-aligned rotation/flip augmentation: draw one of the 48 signed permutations of the
-        # x/y/z axes and apply the same transform to the image and its labels. Requires isotropic
-        # output (cubic patch enforced in config; resolution checked here).
-        if vol_info.config.aug_rot:
-            self._assert_aug_rot_isotropic(vol_info, scales)
-            perm = _SPATIAL_PERMS[np.random.randint(len(_SPATIAL_PERMS))]
-            flips = (
-                bool(np.random.randint(2)),
-                bool(np.random.randint(2)),
-                bool(np.random.randint(2)),
-            )
-            img_out_axes = self.config.output_axes
-            img_spatial_dims = (
-                img_out_axes.index("x"),
-                img_out_axes.index("y"),
-                img_out_axes.index("z"),
-            )
-            img_tensor = _apply_axis_aligned_aug(img_tensor, img_spatial_dims, perm, flips)
-            if label_crops:
-                lbl_out_axes = self.config.output_axes.replace("c", "")
-                lbl_spatial_dims = (
-                    lbl_out_axes.index("x"),
-                    lbl_out_axes.index("y"),
-                    lbl_out_axes.index("z"),
-                )
-                label_tensor = _apply_axis_aligned_aug(
-                    label_tensor, lbl_spatial_dims, perm, flips
-                )
 
         # Stack bboxes: (L, 2, Nd_spatial) in output spatial order, physical units
         bbox_arr = np.stack(bboxes)
