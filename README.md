@@ -198,6 +198,63 @@ fine — e.g. coarse `z` upsampled to match — as long as the requested output 
 > **Note:** `aug_rot` reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
 > describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
+### Custom augmentations (`augment_fn`)
+
+For anything beyond `aug_rot`, pass a callable to the dataset. It is called once per sample on
+the finished sample dict, as `augment_fn(sample) -> sample`, and composes the pure functions in
+`miao/augment.py` with an rng of your choosing:
+
+```python
+import numpy as np
+from miao import VolumeDataset, load_config
+from miao.augment import intensity_jitter, rot90isocube
+
+def augment(sample):
+    rng = np.random  # the global numpy RNG; PyTorch reseeds it per DataLoader worker
+    img, lab = sample["img"], sample["label"]
+    img, lab = rot90isocube(rng, img, lab, pixel_size=sample["pixel_size"])
+    img = intensity_jitter(rng, img)
+    return {**sample, "img": img, "label": lab}
+
+dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
+```
+
+`augment_fn` runs inside each DataLoader worker process, so augmentation parallelizes across
+`num_workers` for free — which means it must be self-contained and picklable: a module-level
+`def`, not a lambda or nested closure (those fail with `num_workers > 0` under the `spawn` start
+method used on macOS/Windows), and anything it captures is copied per worker, never shared.
+
+### Label targets (`miao/labels.py`)
+
+`miao/labels.py` holds deterministic label transforms — no rng — for building training targets,
+composed in the same `augment_fn` *after* the stochastic augmentations (affinity channels are
+direction-dependent, so encode after rotating):
+
+```python
+import torch
+from miao.labels import affinities, erode_labels
+
+def augment(sample):
+    # ... geometric / intensity augmentations first ...
+    lab = torch.stack([erode_labels(l) for l in sample["label"]])  # per level; output_axes lzyx
+    aff = torch.stack([affinities(l) for l in lab])                 # L C Z Y X
+    return {**sample, "label": lab, "affinities": aff}
+```
+
+`erode_labels(labels, steps=1, only_xy=False)` erodes a `steps`-voxel background gap on each side
+of touching instances (`only_xy=True` restricts erosion to in-plane neighbors, for anisotropic
+data).
+`affinities(labels, neighborhood=NEAREST_NEIGHBORHOOD)` returns one map per `Z Y X` voxel offset
+as `C Z Y X` float32 — the default is nearest-neighbor (`(-1,0,0), (0,-1,0), (0,0,-1)`); for
+long-range affinities pass your own offsets. New sample keys with fixed shapes collate normally.
+Using the `np.random` module keeps multi-worker randomness correct for free; a
+`np.random.default_rng()` Generator closed over from the parent process works too, but
+fork-inherited copies draw identical streams across workers unless you reseed it in a
+`worker_init_fn`. Forwarding `sample["pixel_size"]` to `rot90isocube` enables its isotropy check.
+For volumes without labels, skip the empty label sentinel (`sample["label"].numel() == 0`)
+instead of rotating it. Don't enable `aug_rot: true` and a rotating `augment_fn` together — the
+sample would rotate twice.
+
 ## Configuration reference
 
 ### Per-volume fields

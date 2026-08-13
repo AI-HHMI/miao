@@ -327,10 +327,22 @@ class VolumeDataset(torch.utils.data.Dataset):
 
     Tensor shapes are (1, L, *output_axes_dims) where L = number of scale levels.
     Input axes are auto-detected from OME-NGFF metadata.
+
+    ``augment_fn`` (optional) is called once per sample on the finished dict, as
+    ``augment_fn(sample) -> sample``. Compose the pure functions from ``miao.augment`` in a
+    closure with an rng you close over — e.g. forward ``sample["pixel_size"]`` to
+    ``rot90isocube`` — and skip the label when it is the empty no-label sentinel. It runs
+    inside DataLoader worker processes, so it must be picklable (a module-level def, not a
+    lambda) and must not rely on state shared across workers.
     """
 
-    def __init__(self, config: MiaoConfig) -> None:
+    def __init__(self, config: MiaoConfig, augment_fn=None) -> None:
+        assert augment_fn is None or callable(augment_fn), (
+            f"augment_fn must be a callable augment_fn(sample) -> sample, "
+            f"got {type(augment_fn).__name__}"
+        )
         self.config = config
+        self.augment_fn = augment_fn
 
         # Normalize sampling weights to probabilities
         weights = np.array([v.weight for v in config.volumes])
@@ -1271,7 +1283,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             else None
         )
 
-        return {
+        x = {
             "img": img_tensor,
             "label": label_tensor,
             "bbox": bbox_tensor,
@@ -1285,3 +1297,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 **({"grid_index": grid_index_out} if grid_index_out is not None else {}),
             },
         }
+
+        if self.augment_fn:
+            x = self.augment_fn(x)
+
+        return x

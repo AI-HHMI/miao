@@ -6,3 +6,5 @@ dist/
 **/.ipynb_checkpoints/
 Screenshot*
 smoke_test_sequential.py
+.ignore
+uv.lock
