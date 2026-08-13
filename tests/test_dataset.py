@@ -1,7 +1,6 @@
 """Tests for VolumeDataset."""
 
 from pathlib import Path
-from itertools import product as iproduct
 
 import numpy as np
 import pytest

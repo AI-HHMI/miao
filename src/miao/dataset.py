@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +15,6 @@ import torch.utils.data
 from miao.axes import (
     compute_permutation,
     map_patch_size_to_input,
-    reorient,
     spatial_axes,
     spatial_indices,
 )
@@ -838,7 +837,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         """Build slices for image array: spatial dims get crop, channel gets slice(None)."""
         slices = []
         sp_i = 0
-        for dim_i, ax_char in enumerate(vol_info.img_axes):
+        for dim_i, _ax_char in enumerate(vol_info.img_axes):
             if dim_i in vol_info.img_spatial_idx:
                 slices.append(slice(int(origin[sp_i]), int(origin[sp_i] + read_shape[sp_i])))
                 sp_i += 1

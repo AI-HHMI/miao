@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from miao.config import MiaoConfig, ResolutionSampling, VolumeConfig, load_config
+from miao.config import MiaoConfig, VolumeConfig, load_config
 
 
 def _vol(name="a", **kw):
