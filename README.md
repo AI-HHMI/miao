@@ -223,6 +223,29 @@ dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 `num_workers` for free — which means it must be self-contained and picklable: a module-level
 `def`, not a lambda or nested closure (those fail with `num_workers > 0` under the `spawn` start
 method used on macOS/Windows), and anything it captures is copied per worker, never shared.
+
+### Label targets (`miao/labels.py`)
+
+`miao/labels.py` holds deterministic label transforms — no rng — for building training targets,
+composed in the same `augment_fn` *after* the stochastic augmentations (affinity channels are
+direction-dependent, so encode after rotating):
+
+```python
+import torch
+from miao.labels import affinities, grow_boundary
+
+def augment(sample):
+    # ... geometric / intensity augmentations first ...
+    lab = torch.stack([grow_boundary(l) for l in sample["label"]])  # per level; output_axes lzyx
+    aff = torch.stack([affinities(l) for l in lab])                 # L C Z Y X
+    return {**sample, "label": lab, "affinities": aff}
+```
+
+`grow_boundary(labels, only_xy=False)` erodes a 1-voxel background gap between touching instances
+(`only_xy=True` restricts erosion to in-plane neighbors, for anisotropic data).
+`affinities(labels, neighborhood=NEAREST_NEIGHBORHOOD)` returns one map per `Z Y X` voxel offset
+as `C Z Y X` float32 — the default is nearest-neighbor (`(-1,0,0), (0,-1,0), (0,0,-1)`); for
+long-range affinities pass your own offsets. New sample keys with fixed shapes collate normally.
 Using the `np.random` module keeps multi-worker randomness correct for free; a
 `np.random.default_rng()` Generator closed over from the parent process works too, but
 fork-inherited copies draw identical streams across workers unless you reseed it in a
