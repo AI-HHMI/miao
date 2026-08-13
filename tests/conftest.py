@@ -20,11 +20,13 @@ def _create_ome_ngff_zarr2(
     dtype: str = "float32",
     fill_value: float | None = None,
     base_scale_factors: list[float] | None = None,
+    outer_scale: list[float] | None = None,
 ) -> None:
     """Create an OME-NGFF compliant zarr2 multiscale group.
 
     Each scale level is downsampled by 2x in all dimensions.
     base_scale_factors sets the voxel size at level 0 (e.g., [5, 1, 1] for anisotropic).
+    outer_scale writes a multiscale-level coordinateTransformations scale entry.
     """
     if axes is None:
         ndim = len(base_shape)
@@ -77,13 +79,16 @@ def _create_ome_ngff_zarr2(
     # Write OME-NGFF .zattrs manually (zarr 3.x attrs API may not write to .zattrs correctly for v2)
     zattrs_path = root_path / group_key / ".zattrs"
     existing = json.loads(zattrs_path.read_text()) if zattrs_path.exists() else {}
-    existing["multiscales"] = [
-        {
-            "version": "0.4",
-            "axes": axes,
-            "datasets": datasets,
-        }
-    ]
+    multiscales: dict = {
+        "version": "0.4",
+        "axes": axes,
+        "datasets": datasets,
+    }
+    if outer_scale is not None:
+        multiscales["coordinateTransformations"] = [
+            {"type": "scale", "scale": outer_scale}
+        ]
+    existing["multiscales"] = [multiscales]
     zattrs_path.write_text(json.dumps(existing))
 
 

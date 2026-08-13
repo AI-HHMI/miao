@@ -158,6 +158,13 @@ def read_ome_metadata(
     axis_names = [ax["name"] for ax in axes]
     datasets = multiscales["datasets"]
 
+    # Multiscale-level (outer) transform
+    outer_scale = [1.0] * len(axis_names)
+    for transform in multiscales.get("coordinateTransformations", []):
+        if transform["type"] == "scale":
+            outer_scale = transform["scale"]
+            break
+
     # Parse scale-level metadata
     if requested_scales is None:
         requested_scales = list(range(len(datasets)))
@@ -179,6 +186,7 @@ def read_ome_metadata(
             if transform["type"] == "scale":
                 scale_factors = transform["scale"]
                 break
+        scale_factors = [s * o for s, o in zip(scale_factors, outer_scale)]
 
         shape, chunks, dtype = _read_array_metadata(array_path, zarr_version)
 
