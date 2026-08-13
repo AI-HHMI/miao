@@ -280,6 +280,12 @@ class VolumeInfo:
     scales: ScaleResolution | None = None
     # Resolution sampling spec (sampling mode); None when resolutions are fixed
     sampling_spec: ResolutionSampling | None = None
+
+    # Number of distinct stored voxels the sampler can reach, counted on the finest pyramid level
+    # any configured scale reads. Unlike a raw voxel count it reflects what this volume can
+    # actually deliver: a crop that only admits one patch centre scores one patch window, not its
+    # whole array. Drives MiaoConfig.size_weighting_exponent.
+    size: float = 1.0
     
     # Smallest safe dtypes for label data (derived from on-disk dtype)
     label_np_dtype: np.dtype = np.dtype(np.int64)
@@ -344,14 +350,17 @@ class VolumeDataset(torch.utils.data.Dataset):
         self.config = config
         self.augment_fn = augment_fn
 
-        # Normalize sampling weights to probabilities
-        weights = np.array([v.weight for v in config.volumes])
-        self._probabilities = weights / weights.sum()
-
         # Read metadata and precompute sampling bounds for each volume
         self._volumes: list[VolumeInfo] = []
         for vol_cfg in config.volumes:
             self._volumes.append(self._resolve_volume(vol_cfg))
+
+        # Normalize sampling weights to probabilities. Runs after resolution because the size
+        # term needs each volume's reachable extent.
+        weights = np.array(
+            [v.config.weight * v.size**config.size_weighting_exponent for v in self._volumes]
+        )
+        self._probabilities = weights / weights.sum()
 
         # Build sequential grid before printing summary (summary reports grid size)
         self._grid: list[tuple[int, np.ndarray, tuple]] = []
@@ -374,9 +383,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         print(f"VolumeDataset: {len(self._volumes)} volume(s), "
               f"{mode_str}, "
               f"patch_size={self.config.patch_size}")
-        for vi in self._volumes:
+        for vi, prob in zip(self._volumes, self._probabilities):
             finest_meta = vi.image_meta.scales[0]
-            prob = self._probabilities[self._volumes.index(vi)]
             # Get axis unit from OME-NGFF metadata
             units = [ax.get("unit", "") for ax in vi.image_meta.axes]
             unit_str = units[0] if units and all(u == units[0] for u in units if u) else ""
@@ -419,7 +427,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                     f"    label: axes={vi.lbl_axes!r}, shape={lbl_meta.shape}, "
                     f"dtype={lbl_meta.dtype} -> {vi.label_np_dtype}"
                 )
-            lines.append(f"    sampling: weight={prob:.2f}, "
+            lines.append(f"    sampling: p={prob:.4g}, size={vi.size:.4g} reachable voxels, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
             if self.config.chunk_aligned:
                 sp_chunks = [finest_meta.chunks[i] for i in vi.img_spatial_idx]
@@ -596,6 +604,27 @@ class VolumeDataset(torch.utils.data.Dataset):
                 f"max_center={vol_info.max_center.tolist()}). Use a finer max resolution, a "
                 f"smaller patch_size, or a larger volume."
             )
+
+        # Reachable stored voxels, measured on the finest level any scale reads. In sampling mode
+        # the centre bounds come from the coarsest resolution, but a sampled draw may read a finer
+        # level, so measure there instead — otherwise `size` is understated.
+        if sampling_spec is not None:
+            size_res = self._resolve_scales(
+                vol_info, [sampling_spec.min_resolution(len(output_spatial))]
+            )
+        else:
+            size_res = scale_res
+        finest_level = min(size_res.chosen_levels)
+        at_finest = [i for i, lv in enumerate(size_res.chosen_levels) if lv == finest_level]
+        # Several scales can resolve to one level; take the largest window so `size` does not
+        # depend on the order `resolutions` happens to be written in.
+        window = np.max([size_res.read_shapes[i] for i in at_finest], axis=0).astype(np.float64)
+        rel = size_res.relative_scale_factors[at_finest[0]]
+        level_shape = np.array(
+            image_meta.scales[finest_level].shape, dtype=np.float64
+        )[img_sp_idx]
+        reachable = (vol_info.max_center - vol_info.min_center) / rel + window
+        vol_info.size = float(np.prod(np.minimum(reachable, level_shape)))
         return vol_info
 
     def _resolve_scales(

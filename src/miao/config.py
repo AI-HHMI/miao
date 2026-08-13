@@ -68,6 +68,14 @@ class ResolutionSampling(BaseModel):
             out = [max(out[i], hi_axes[i]) for i in range(n_axes)]
         return out
 
+    def min_resolution(self, n_axes: int) -> list[float]:
+        """Per-axis finest (smallest) lower bound across all ranges (output spatial order)."""
+        out = [float("inf")] * n_axes
+        for lo, _hi in self.ranges:
+            lo_axes = lo * n_axes if len(lo) == 1 else lo
+            out = [min(out[i], lo_axes[i]) for i in range(n_axes)]
+        return out
+
 
 class VolumeConfig(BaseModel):
     """Configuration for a single zarr volume."""
@@ -161,6 +169,15 @@ class MiaoConfig(BaseModel):
     cache_bytes: int = 1 << 30  # 1 GB
     file_io_concurrency: int = 64
     sampling: Literal["random", "sequential"] = "random"
+    # Exponent for automatic volume-size weighting in `sampling: random` mode. Volume i is drawn
+    # with probability proportional to
+    #     volumes[i].weight * size_i ** size_weighting_exponent
+    # where size_i is the number of distinct stored voxels the sampler can reach in that volume
+    # (see VolumeInfo.size). 0.0 ignores size and reproduces weight-only sampling; 1.0 is exactly
+    # proportional to reachable content; 0.3-0.5 is the usual choice for a corpus spanning several
+    # orders of magnitude in size. Ignored when sampling == "sequential", whose grid is already
+    # size-proportional.
+    size_weighting_exponent: float = 0.0
     overlap: Union[int, list[int]] = 0  # voxels; in output_axes spatial order (same as patch_size)
 
     # If True, each coarser scale's patch origin is sampled uniformly at random such that the patch
@@ -169,6 +186,13 @@ class MiaoConfig(BaseModel):
     sample_windows: bool = False
     image_dtype: str = "float32"  # output image tensor dtype: "float32", "bfloat16", or "float16"
     chunk_aligned: bool = False  # constrain random patches to stay within a single chunk
+
+    @field_validator("size_weighting_exponent")
+    @classmethod
+    def validate_size_weighting_exponent(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"size_weighting_exponent must be >= 0, got {v}")
+        return v
 
     @field_validator("image_dtype")
     @classmethod

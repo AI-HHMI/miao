@@ -98,7 +98,8 @@ which is what lets one `resolutions` list mix expanded and unexpanded volumes co
 
 Per sample, miao:
 
-1. draws a volume by `weight`, then a random coordinate in its finest-scale (level-0) space;
+1. draws a volume with probability ∝ `weight * size ** size_weighting_exponent`, then a random
+   coordinate in its finest-scale (level-0) space;
 2. for each requested resolution, picks the coarsest pyramid level whose effective voxel size is
    still ≤ the target on every axis, preferring downsampling — or the finest stored level,
    upsampled, if the target is finer than anything on disk;
@@ -159,7 +160,33 @@ for batch in loader:
 
 The grid tiles the volume at the **first scale's** target resolution, striding one output patch
 minus `overlap` worth of physical extent. Coverage is gap-free even on anisotropic source data.
-`samples_per_epoch` and `weight` are ignored here, and volumes are exhausted in order.
+`samples_per_epoch`, `weight` and `size_weighting_exponent` are ignored here, and volumes are
+exhausted in order. The grid already visits each volume in proportion to its sampleable extent.
+
+### Size-weighted volume sampling
+
+In `random` mode each sample picks a volume first. By default that draw is uniform, so a 512³
+ground-truth crop is chosen as often as a whole brain, which biases training toward small
+volumes. `size_weighting_exponent` tempers the draw by how much data each volume actually holds:
+
+```yaml
+size_weighting_exponent: 0.3   # p ∝ weight * size ** size_weighting_exponent
+```
+
+`size` is the number of distinct stored voxels the sampler can reach, measured on the finest
+pyramid level any configured scale reads. It is not the raw array size: it accounts for the patch
+window, `bounding_box`, and the pyramid level actually used, so a crop that admits only one patch
+center scores one patch window rather than its whole array. It is reported per volume in the
+dataset summary, alongside the resulting probability.
+
+| `size_weighting_exponent` | effect |
+| --- | --- |
+| `0.0` (default) | size ignored; probabilities come from `weight` alone |
+| `0.3` – `0.5` | tempered; the usual choice for a corpus spanning orders of magnitude |
+| `1.0` | exactly proportional to reachable content; the largest volumes dominate |
+
+`weight` still applies and multiplies the size term, so per-volume overrides keep working. At the
+default the probabilities are bit-identical to weight-only sampling.
 
 ### Multi-scale windows (`sample_windows`)
 
@@ -253,7 +280,7 @@ behavior.
 | `zarr_version` | `"zarr2"` or `"zarr3"` (default: `"zarr2"`) |
 | `exp_factor` | Divides the zarr's metadata voxel size to give the effective (pre-expansion) voxel size (default: `1.0`). For expansion microscopy the stored value is the microscope's; `stored / exp_factor` is the specimen's. Applies to image and labels, before level selection. Not needed when the OME metadata already carries a multiscale-level `coordinateTransformations` scale — that is applied automatically — see [Effective voxel sizes](#effective-voxel-sizes) |
 | `label_key` | Optional group key for labels in the same zarr |
-| `weight` | Sampling probability weight (default: equal across volumes) |
+| `weight` | Sampling probability weight (default: equal across volumes). Multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` — see [Size-weighted volume sampling](#size-weighted-volume-sampling) |
 | `resolutions` | Optional per-volume override of the global `resolutions` (same format) |
 | `normalize` | Scale images to [0, 1] by dtype max (default: `true`); `normalize_min` / `normalize_max` set the bounds explicitly |
 | `patch_normalize` | Standardize each sample to zero mean / unit variance after `normalize` (default: `false`). Multi-scale: statistics come from the coarsest crop and apply to all scales |
@@ -272,6 +299,7 @@ behavior.
 | `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
 | `bbox_mode` | `"absolute"` world coords (default) or `"relative"` to the finest-level crop origin |
 | `sampling` | `"random"` (default) or `"sequential"` — see [Sampling](#sampling) |
+| `size_weighting_exponent` | Weight volumes by how much data they hold (default: `0.0`, off) — see [Size-weighted volume sampling](#size-weighted-volume-sampling) |
 | `overlap` | Patch overlap in voxels, sequential mode only (default: `0`). Integer or per-axis list |
 | `sample_windows` | Randomize each coarser scale's patch origin (default: `false`) — see [above](#multi-scale-windows-sample_windows) |
 
