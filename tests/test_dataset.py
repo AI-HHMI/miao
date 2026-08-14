@@ -1,7 +1,6 @@
 """Tests for VolumeDataset."""
 
 from pathlib import Path
-from itertools import product as iproduct
 
 import numpy as np
 import pytest
@@ -1122,6 +1121,29 @@ class TestExpFactor:
         # bbox is in effective physical units: extent == patch_size * pixel_size
         bbox = sample["bbox"].numpy()  # (L, 2, 3)
         assert np.allclose(bbox[:, 1, :] - bbox[:, 0, :], [[8 * 0.5] * 3, [8 * 1.0] * 3])
+
+    def test_warns_when_outer_transform_also_present(self, tmp_path: Path):
+        """exp_factor + a non-trivial outer OME-NGFF transform on the same volume risks
+        applying the expansion factor twice."""
+        from conftest import _create_ome_ngff_zarr2
+
+        zarr_path = tmp_path / "outer_and_exp.zarr"
+        _create_ome_ngff_zarr2(
+            zarr_path,
+            group_key="raw",
+            base_shape=(64, 64, 64),
+            num_scales=3,
+            outer_scale=[0.25, 0.25, 0.25],
+        )
+        cfg = self._cfg(zarr_path, [[0.5, 0.5, 0.5]], exp_factor=4.0)
+        with pytest.warns(UserWarning, match="exp_factor"):
+            VolumeDataset(cfg)
+
+    def test_no_warning_without_outer_transform(self, zarr2_volume: Path, recwarn):
+        """The default fixture has no outer transform, so exp_factor alone should not warn."""
+        cfg = self._cfg(zarr2_volume, [[0.5, 0.5, 0.5]], exp_factor=4.0)
+        VolumeDataset(cfg)
+        assert len(recwarn) == 0
 
 
 class TestChunkAlignedSampling:

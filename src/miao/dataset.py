@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +15,6 @@ import torch.utils.data
 from miao.axes import (
     compute_permutation,
     map_patch_size_to_input,
-    reorient,
     spatial_axes,
     spatial_indices,
 )
@@ -488,6 +488,21 @@ class VolumeDataset(torch.utils.data.Dataset):
         # exp_factor converts the stored (microscope) voxel size to the effective (specimen) one.
         exp = vol_cfg.exp_factor
 
+        # exp_factor and a non-trivial outer (multiscale-level) OME-NGFF transform are two
+        # different ways of encoding the same expansion-factor correction. If a zarr's outer
+        # transform already carries it, applying exp_factor as well applies it twice.
+        if exp != 1.0 and (
+            any(s != 1.0 for s in image_meta.outer_scale)
+            or (label_meta is not None and any(s != 1.0 for s in label_meta.outer_scale))
+        ):
+            warnings.warn(
+                f"Volume {vol_cfg.name!r}: exp_factor={exp} is set in the config, but this "
+                "zarr's OME-NGFF metadata already has a non-trivial multiscale-level (outer) "
+                "coordinateTransformations scale. If that outer transform was written to store "
+                "the expansion factor, applying exp_factor as well will apply it twice.",
+                stacklevel=2,
+            )
+
         # Reference frame: finest pyramid level (index 0) absolute effective spatial voxel size.
         finest_spatial_factors = (
             np.array(image_meta.scales[0].scale_factors, dtype=np.float64)[img_sp_idx] / exp
@@ -572,7 +587,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 f"fit the volume at the requested {window} (patch_size={self.config.patch_size}, "
                 f"min_center={vol_info.min_center.tolist()} > "
                 f"max_center={vol_info.max_center.tolist()}). Use a finer max resolution, a "
-                f"smaller patch_size, or a larger volume."
+                f"smaller patch_size, or a larger volume. This also may happen if exp_factor and the OME-NGFF outer transform both encode the same expansion factor, effectively applying it twice."
             )
 
         # Reachable stored voxels, measured on the finest level any scale reads. In sampling mode
@@ -851,7 +866,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         """Build slices for image array: spatial dims get crop, channel gets slice(None)."""
         slices = []
         sp_i = 0
-        for dim_i, ax_char in enumerate(vol_info.img_axes):
+        for dim_i, _ax_char in enumerate(vol_info.img_axes):
             if dim_i in vol_info.img_spatial_idx:
                 slices.append(slice(int(origin[sp_i]), int(origin[sp_i] + read_shape[sp_i])))
                 sp_i += 1

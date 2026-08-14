@@ -135,27 +135,6 @@ def zarr2_volume(tmp_path: Path, request: pytest.FixtureRequest) -> Path:
 
 
 @pytest.fixture
-def zarr2_volume_xyz(tmp_path: Path) -> Path:
-    """Create a zarr2 OME-NGFF volume stored in xyz order."""
-    zarr_path = tmp_path / "test_volume_xyz.zarr"
-
-    _create_ome_ngff_zarr2(
-        zarr_path,
-        group_key="raw",
-        base_shape=(64, 64, 64),
-        num_scales=2,
-        axes=[
-            {"name": "x", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-        ],
-        dtype="float32",
-    )
-
-    return zarr_path
-
-
-@pytest.fixture
 def zarr2_volume_anisotropic(tmp_path: Path) -> Path:
     """Create a zarr2 OME-NGFF volume with anisotropic voxel sizes.
 
