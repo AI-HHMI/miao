@@ -206,9 +206,9 @@ coarser resolution first raises.
 
 Two composable ways to augment a sample:
 
-- **[`miao/augment.py`](src/miao/augment.py)** — stochastic image augmentations, composed in a
+- **[`miao/augment.py`](src/miao/augment.py)** — image augmentations, composed in a
   callable you pass to `VolumeDataset`.
-- **[`miao/labels.py`](src/miao/labels.py)** — deterministic (non-random) label-target
+- **[`miao/labels.py`](src/miao/labels.py)** — label-target
   transforms, composed in the same `augment_fn`.
 
 ### Custom augmentations (`augment_fn`)
@@ -230,30 +230,20 @@ def augment(sample):
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
-See [`miao/augment.py`](src/miao/augment.py) for the available
-functions and their exact behavior.
-
 Using the `np.random` module keeps multi-worker randomness correct for free; a
 `np.random.default_rng()` Generator closed over from the parent process works too, but
 fork-inherited copies draw identical streams across workers unless you reseed it in a
 `worker_init_fn`. For volumes without labels, skip the empty label sentinel
 (`sample["label"].numel() == 0`) instead of rotating it.
 
-### `rot90isocube`
+Available functions (see [`miao/augment.py`](src/miao/augment.py) docstrings for exact behavior):
 
-Rotates/flips all tensors passed together, at every scale, drawing one of the 48 cube symmetries
-per sample. Requires a cubic patch and isotropic output resolution — forward
-`sample["pixel_size"]` to have that asserted per sample (`resolution_sampling` can draw a fresh
-resolution each call; use isotropic single-value bounds).
-
-> **Note:** rotation reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
-> describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
-
-### `draw_rot90` + `apply_rot90`
-
-`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
-tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
-once and apply the same transform per tensor:
+| Function | Description |
+|---|---|
+| `rot90isocube` | Draws one of the 48 cube symmetries and rotates/flips every tensor passed together, at every scale. Requires a cubic patch and isotropic output resolution. |
+| `draw_rot90` / `apply_rot90` | Split draw and apply, for tensors that can't share one `rot90isocube` call — per-level tensors not yet stacked, or spatial dims at different positions. |
+| `intensity_jitter` | Random affine rescale/shift of intensities: `img * U(scale) + U(shift)`. |
+| `percentile_normalize` | Percentile-based rescaling of intensities to [0, 1]. |
 
 ```python
 from miao.augment import apply_rot90, draw_rot90
@@ -263,10 +253,14 @@ levels = [apply_rot90(lvl, perm, flips) for lvl in per_level_tensors]  # same ro
 img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X C layout
 ```
 
-`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later —
-e.g. to apply the identical rotation to tensors produced further down the pipeline.
-
 ### Label targets (`miao/labels.py`)
+
+Available functions (see [`miao/labels.py`](src/miao/labels.py) docstrings for exact behavior):
+
+| Function | Description |
+|---|---|
+| `erode_labels` | Replaces instance borders with background — a `steps`-voxel gap on each side of a touch. |
+| `affinities` | One foreground affinity map per neighbor offset (default nearest-neighbor), stacked as `C Z Y X`. |
 
 ```python
 import torch
@@ -279,9 +273,7 @@ def augment(sample):
     return {**sample, "label": lab, "affinities": aff}
 ```
 
-Compose after the stochastic augmentations, since affinity channels are direction-dependent. See
-[`erode_labels`](src/miao/labels.py) and [`affinities`](src/miao/labels.py) docstrings for exact
-behavior.
+Compose after the stochastic augmentations, since affinity channels are direction-dependent.
 
 ## Configuration reference
 

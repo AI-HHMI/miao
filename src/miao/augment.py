@@ -117,3 +117,29 @@ def intensity_jitter(
     """
     # add_ mutates only the fresh product of `img * scale`, so the input stays unmutated.
     return (img * rng.uniform(*scale)).add_(rng.uniform(*shift))
+
+
+def percentile_normalize(
+    img: torch.Tensor,
+    lower: float = 1.0,
+    upper: float = 99.0,
+    clamp: bool = True,
+) -> torch.Tensor:
+    """Normalize intensities to [0, 1] via percentiles: ``(img - p_lower) / (p_upper - p_lower)``.
+
+    Percentiles are computed over the whole tensor (a multi-scale ``L Z Y X`` sample pools all
+    levels, keeping them on a common intensity scale). With ``clamp`` (the default) values
+    outside the percentile range are clipped to [0, 1]; ``clamp=False`` leaves them outside.
+    Deterministic, hence no ``rng``. Integer inputs are promoted to float32. A constant image
+    maps to all zeros.
+    """
+    assert 0.0 <= lower < upper <= 100.0, (
+        f"percentiles must satisfy 0 <= lower < upper <= 100, got lower={lower}, upper={upper}."
+    )
+    x = img.float() if not img.is_floating_point() else img
+    lo = torch.quantile(x, lower / 100.0)
+    hi = torch.quantile(x, upper / 100.0)
+    # clamp_min guards the constant-image case (hi == lo) without mutating anything shared.
+    out = (x - lo) / (hi - lo).clamp_min(1e-8)
+    # clamp_ mutates only the fresh quotient above, so the input stays unmutated.
+    return out.clamp_(0.0, 1.0) if clamp else out
