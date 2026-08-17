@@ -28,16 +28,34 @@ _SPATIAL_PERMS: tuple[tuple[int, int, int], ...] = tuple(itertools.permutations(
 
 
 def spatial_dims_for(axes: str) -> tuple[int, int, int]:
-    """Negative offsets of z, y, x for a tensor laid out as `axes`, e.g. "lczyx" -> (-3, -2, -1).
+    """`spatial_dims` for a tensor laid out as `axes`, e.g. "lcxyz" -> (-3, -2, -1).
 
-    Offsets are counted from the end so that one value serves tensors with different numbers of
-    leading axes -- but only when the spatial axes are trailing. They are not always: `output_axes`
-    is a config field, and `"lzyxc"` puts the channel last, which pushes z/y/x to (-4, -3, -2)
-    while the label, carrying no channel axis, keeps (-3, -2, -1). Deriving the pair from the two
-    layout strings is what keeps image and labels transformed identically; assuming (-3, -2, -1)
-    for both silently rolls them apart. See `shift_sections` for the failure that motivated this.
+    The offsets are listed **in the order the spatial axes appear in `axes`**, not in a fixed
+    z/y/x order, because every other part of this module indexes them positionally against that
+    same order:
+
+    * ``apply_rot90`` permutes *slots*, so slot ``i`` is the ``i``-th spatial axis of the tensor;
+    * ``rot90inplane`` reads ``pixel_size[:, slot]``, and ``pixel_size`` follows the dataset's
+      ``output_axes`` spatial order;
+    * the ``(-3, -2, -1)`` default is the trailing three axes in tensor order.
+
+    Normalising to z/y/x instead would agree with all of those only for layouts that happen to
+    list z before y before x -- ``"lcxyz"`` would compare the wrong pair of voxel sizes.
+
+    Counting from the end is what lets one value serve tensors with different leading axes, but
+    that only holds while the spatial axes are trailing, and `output_axes` is a config field that
+    need not put them there. `"lzyxc"` gives the image `(-4, -3, -2)` while the label, carrying no
+    channel axis, keeps `(-3, -2, -1)`. Deriving the pair from the two layout strings is what keeps
+    image and labels transformed identically; assuming one for both silently moves them apart.
+
+    A caller naming a particular axis -- ``rot90inplane``'s ``fixed_axis``, say -- wants its slot
+    in the same ordering::
+
+        fixed_axis = [a for a in axes if a in "zyx"].index("z")   # 2 for "lcxyz", 0 for "lczyx"
     """
-    return tuple(axes.index(a) - len(axes) for a in "zyx")  # type: ignore[return-value]
+    return tuple(  # type: ignore[return-value]
+        i - len(axes) for i, axis in enumerate(axes) if axis in "zyx"
+    )
 
 
 def _per_tensor_dims(

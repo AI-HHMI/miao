@@ -256,11 +256,21 @@ slot in `spatial_dims` that is never exchanged (typically the sectioning axis), 
 rotations times the one swap of the two free axes, so 16 of the 48 symmetries. Only the two free
 axes need a shared voxel size, which is what `pixel_size` asserts.
 
-```python
-from miao.augment import rot90inplane
+`fixed_axis` is a slot index, so it depends on where z sits in the spatial layout: *e.g.* 0 for `"lczyx"`, 2
+for `"lcxyz"`. Derive it rather than hard-code it:
 
-# Serial-section EM at 5x1x1 (Z Y X): z is coarser, so it must not be permuted into y or x.
-img, lab = rot90inplane(rng, img, lab, fixed_axis=0, pixel_size=sample["pixel_size"])
+```python
+from miao.augment import rot90inplane, spatial_dims_for
+
+# Serial-section EM: z is coarser, so it must not be permuted into y or x.
+axes = "lczyx"                                   # the dataset's output_axes
+spatial = [a for a in axes if a in "zyx"]        # -> ['z', 'y', 'x']
+img, lab = rot90inplane(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for(axes), spatial_dims_for(axes.replace("c", ""))],
+    fixed_axis=spatial.index("z"),               # 0 here, 2 for "lcxyz"
+    pixel_size=sample["pixel_size"],
+)
 ```
 
 Exchanging axes of unequal voxel size would relabel a 5-unit neighbour relationship as a 1-unit
@@ -269,9 +279,14 @@ simply yields a subgroup of the full 48.
 
 ### Mixed axis layouts (`spatial_dims`)
 
-Every geometric augmentation takes `spatial_dims`, the positions of z/y/x counted from the end.
+Every geometric augmentation takes `spatial_dims`, the positions of the spatial axes counted from
+the end, listed in the order they appear in the layout, *e.g.* `"lcxyz"` gives x, y, z and `"lczyx"`
+gives z, y, x, both `(-3, -2, -1)`. The order matters because everything indexes these slots
+positionally: `apply_rot90` permutes slots, `rot90inplane`'s `fixed_axis` names one, and
+`pixel_size` follows the same `output_axes` order.
+
 The default `(-3, -2, -1)` is right when `output_axes` puts the spatial axes last (`"lczyx"`,
-`"lzyx"`), but wrong otherwise: *e.g.* `"lzyxc"` pushes the image's to `(-4, -3, -2)`, while the
+`"lcxyz"`), but wrong otherwise: *e.g.* `"lzyxc"` pushes the image's to `(-4, -3, -2)`, while the
 label, carrying no channel axis, keeps `(-3, -2, -1)`.
 
 Pass one tuple per tensor when they differ; a single tuple still means "the same axes in every

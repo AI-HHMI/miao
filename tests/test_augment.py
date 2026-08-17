@@ -563,7 +563,11 @@ class TestMixedLayouts:
         index = (tensor == 1.0).nonzero()[0].tolist()
         return [index[axes.index(a)] for a in "zyx"]
 
-    @pytest.mark.parametrize("axes", ["lczyx", "lzyxc", "zyxl", "czyxl", "zyxlc"])
+    @pytest.mark.parametrize(
+        # Both orderings of the spatial axes. Every layout here was once z-before-y-before-x,
+        # which hid an ordering bug in `spatial_dims_for`: the x-first ones are the coverage.
+        "axes", ["lczyx", "lcxyz", "lzyxc", "lxyzc", "zyxl", "czyxl", "zyxlc"]
+    )
     @pytest.mark.parametrize("op", ["rot90isocube", "rot90inplane", "shift_sections"])
     def test_image_and_label_stay_aligned_under_any_layout(self, axes, op):
         img, label, img_dims, label_dims = self._pair(axes)
@@ -614,3 +618,91 @@ class TestMixedLayouts:
         moved_img = self._marker(out_img, "lzyxc")
         assert moved_img != [2, 2, 2], "nothing moved, so the test proves nothing"
         assert moved_img == self._marker(out_label, "lzyx")
+
+
+class TestSlotOrdering:
+    """`spatial_dims` slots are indexed positionally against the tensor's own spatial order.
+
+    Three things agree on that ordering and would disagree with a fixed z/y/x one: `apply_rot90`
+    permutes slots, `rot90inplane` reads `pixel_size[:, slot]`, and `pixel_size` follows the
+    dataset's `output_axes`. Listing the offsets in any other order compares the wrong pair of
+    voxel sizes -- for `"lcxyz"`, y against z rather than x against y.
+    """
+
+    @pytest.mark.parametrize(
+        ("axes", "expected"),
+        [("lcxyz", (-3, -2, -1)), ("lczyx", (-3, -2, -1)), ("lzyx", (-3, -2, -1)),
+         ("lzyxc", (-4, -3, -2)), ("lxyzc", (-4, -3, -2)), ("zyxl", (-4, -3, -2)),
+         ("zyxlc", (-5, -4, -3))],
+    )
+    def test_offsets_follow_the_layout(self, axes, expected):
+        assert spatial_dims_for(axes) == expected
+
+    @pytest.mark.parametrize("axes", ["lcxyz", "lczyx", "lzyx", "lzyxc", "lxyzc", "zyxl"])
+    def test_slot_i_is_the_i_th_spatial_axis(self, axes):
+        """The invariant everything else relies on."""
+        dims = spatial_dims_for(axes)
+        resolved = "".join(axes[offset % len(axes)] for offset in dims)
+        assert resolved == "".join(a for a in axes if a in "zyx")
+
+    @pytest.mark.parametrize(
+        ("axes", "pixel_size"),
+        # pixel_size follows output_axes spatial order, so z's entry moves with the layout.
+        [("lcxyz", [[9.0, 9.0, 20.0]]),      # x, y, z -- z coarse, and last
+         ("lczyx", [[20.0, 9.0, 9.0]])],     # z, y, x -- z coarse, and first
+    )
+    def test_inplane_accepts_anisotropy_on_the_axis_it_holds_fixed(self, axes, pixel_size):
+        """The case the ordering bug broke: `"lcxyz"` compared y against z instead of x against y.
+
+        Serial-section EM at 9x9x20 nm is exactly this shape, so it failed for the layout every
+        real config uses while passing for the one the tests happened to cover.
+        """
+        spatial = [a for a in axes if a in "zyx"]
+        img = torch.zeros(tuple({"l": 1, "c": 1}.get(a, 6) for a in axes))
+        rot90inplane(
+            np.random.default_rng(0), img,
+            spatial_dims=spatial_dims_for(axes),
+            fixed_axis=spatial.index("z"),
+            pixel_size=pixel_size,
+        )
+
+    def test_inplane_still_rejects_anisotropy_between_the_axes_it_exchanges(self):
+        """The check must stay live: only the fixed axis may differ."""
+        spatial = [a for a in "lcxyz" if a in "zyx"]
+        with pytest.raises(AssertionError, match="share a voxel size"):
+            rot90inplane(
+                np.random.default_rng(0), torch.zeros(1, 1, 6, 6, 6),
+                spatial_dims=spatial_dims_for("lcxyz"),
+                fixed_axis=spatial.index("z"),
+                pixel_size=[[9.0, 11.0, 20.0]],       # x != y, which it exchanges
+            )
+
+    @pytest.mark.parametrize("axes", ["lcxyz", "lczyx", "lzyxc"])
+    def test_inplane_holds_the_named_axis_fixed_whatever_the_layout(self, axes):
+        """Not just that the voxel-size check passes -- that the right axis is actually held.
+
+        A slot ordering that disagrees with the layout still satisfies the `pixel_size` assertion
+        when the two exchanged axes happen to match; what it gets wrong is *which* axis is fixed.
+        Here the volume varies along z alone, so if z were permuted into a free slot the variation
+        would move with it.
+        """
+        spatial = [a for a in axes if a in "zyx"]
+        z_at = axes.index("z")
+        shape = tuple({"l": 1, "c": 1}.get(a, 6) for a in axes)
+        ramp = torch.arange(6, dtype=torch.float32)
+        img = ramp.reshape([6 if i == z_at else 1 for i in range(len(axes))]).expand(shape)
+
+        # Swept, not drawn once: the in-plane swap fires on only half the draws, so a single
+        # seed can leave z where it started even when the slot ordering is wrong.
+        for seed in range(20):
+            (out,) = rot90inplane(
+                np.random.default_rng(seed), img.contiguous(),
+                spatial_dims=spatial_dims_for(axes),
+                fixed_axis=spatial.index("z"),
+                pixel_size=[[20.0 if a == "z" else 9.0 for a in spatial]],
+            )
+            # Each z-slice must still be constant across the two in-plane axes.
+            per_slice = out.movedim(z_at, 0).reshape(6, -1)
+            assert torch.allclose(per_slice.std(dim=1), torch.zeros(6), atol=1e-6), (
+                f"z was permuted away under {axes!r} at seed {seed}"
+            )
