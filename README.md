@@ -267,11 +267,30 @@ Exchanging axes of unequal voxel size would relabel a 5-unit neighbour relations
 one, producing object shapes that do not occur in the data. Passing isotropic data is fine and
 simply yields a subgroup of the full 48.
 
+### Mixed axis layouts (`spatial_dims`)
+
+Every geometric augmentation takes `spatial_dims`, the positions of z/y/x counted from the end.
+The default `(-3, -2, -1)` is right when `output_axes` puts the spatial axes last (`"lczyx"`,
+`"lzyx"`), but wrong otherwise: *e.g.* `"lzyxc"` pushes the image's to `(-4, -3, -2)`, while the
+label, carrying no channel axis, keeps `(-3, -2, -1)`.
+
+Pass one tuple per tensor when they differ; a single tuple still means "the same axes in every
+tensor". `spatial_dims_for` derives it from a layout string:
+
+```python
+from miao.augment import rot90isocube, spatial_dims_for
+
+img, lab = rot90isocube(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for("lzyxc"), spatial_dims_for("lzyx")],   # image, label
+)
+```
+
 ### `draw_rot90` + `apply_rot90`
 
-`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
-tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
-once and apply the same transform per tensor:
+`rot90isocube` draws and applies in one call, including for tensors whose spatial dims sit at
+different positions (see above). When one call still can't cover everything, *e.g.* per-level 
+tensors that aren't stacked yet, draw once and apply the same transform per tensor:
 
 ```python
 from miao.augment import apply_rot90, draw_rot90
@@ -281,8 +300,8 @@ levels = [apply_rot90(lvl, perm, flips) for lvl in per_level_tensors]  # same ro
 img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X C layout
 ```
 
-`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later —
-e.g. to apply the identical rotation to tensors produced further down the pipeline.
+`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later,
+*e.g.* to apply the identical rotation to tensors produced further down the pipeline.
 
 ### Section augmentations + generic photometric augmentations
 

@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from miao.augment import (
+    spatial_dims_for,
     _SPATIAL_PERMS,
     additive_noise,
     apply_rot90,
@@ -533,3 +534,83 @@ class TestSerialSectionRecipeIntegration:
             torch.sort(aug["img"].flatten()).values,
             torch.sort(plain["img"].flatten()).values,
         )
+
+
+class TestMixedLayouts:
+    """Tensors handed to one call need not share an axis layout.
+
+    `output_axes` is a config field, and only some of its values put the spatial axes last. A
+    label carries no channel axis, so under `"lzyxc"` the image's z/y/x sit at (-4, -3, -2) while
+    the label's sit at (-3, -2, -1). Every geometric augmentation therefore has to be told each
+    tensor's axes separately; assuming one layout for both moved them apart silently, which is the
+    worst available failure -- no exception, just targets that no longer describe the image.
+    """
+
+    @staticmethod
+    def _pair(axes):
+        """(img, label) for `axes`, each holding a single marker at the same voxel."""
+        label_axes = axes.replace("c", "")
+        sizes = {"l": 1, "c": 1}
+        img = torch.zeros(tuple(sizes.get(a, 6) for a in axes))
+        label = torch.zeros(tuple(sizes.get(a, 6) for a in label_axes))
+        img[tuple(0 if a in "lc" else 2 for a in axes)] = 1.0
+        label[tuple(0 if a in "l" else 2 for a in label_axes)] = 1.0
+        return img, label, spatial_dims_for(axes), spatial_dims_for(label_axes)
+
+    @staticmethod
+    def _marker(tensor, axes):
+        """Where the marker sits, in z/y/x only, so tensors of different rank compare."""
+        index = (tensor == 1.0).nonzero()[0].tolist()
+        return [index[axes.index(a)] for a in "zyx"]
+
+    @pytest.mark.parametrize("axes", ["lczyx", "lzyxc", "zyxl", "czyxl", "zyxlc"])
+    @pytest.mark.parametrize("op", ["rot90isocube", "rot90inplane", "shift_sections"])
+    def test_image_and_label_stay_aligned_under_any_layout(self, axes, op):
+        img, label, img_dims, label_dims = self._pair(axes)
+        call = {
+            "rot90isocube": lambda: rot90isocube(
+                np.random.default_rng(0), img, label, spatial_dims=[img_dims, label_dims]),
+            "rot90inplane": lambda: rot90inplane(
+                np.random.default_rng(0), img, label, spatial_dims=[img_dims, label_dims]),
+            "shift_sections": lambda: shift_sections(
+                np.random.default_rng(0), img, label, prob=1.0, magnitude=2,
+                spatial_dims=[img_dims, label_dims]),
+        }[op]
+        out_img, out_label = call()
+
+        assert out_img.shape == img.shape and out_label.shape == label.shape
+        assert self._marker(out_img, axes) == self._marker(out_label, axes.replace("c", "")), (
+            "the marker moved to different voxels in image and label, so the targets no longer "
+            "describe the image"
+        )
+
+    def test_a_shared_tuple_still_means_the_same_axes_for_every_tensor(self):
+        """The old signature stays valid: one tuple broadcasts, which is what trailing layouts want."""
+        img, label = torch.rand(1, 6, 6, 6), torch.rand(1, 6, 6, 6)
+        shared = rot90isocube(np.random.default_rng(0), img, label, spatial_dims=(-3, -2, -1))
+        per_tensor = rot90isocube(
+            np.random.default_rng(0), img, label, spatial_dims=[(-3, -2, -1), (-3, -2, -1)]
+        )
+        assert all(torch.equal(a, b) for a, b in zip(shared, per_tensor))
+
+    def test_a_wrong_number_of_layouts_is_refused(self):
+        with pytest.raises(AssertionError, match="one tuple per tensor"):
+            rot90isocube(
+                np.random.default_rng(0), torch.rand(6, 6, 6), torch.rand(6, 6, 6),
+                spatial_dims=[(-3, -2, -1)],
+            )
+
+    def test_shift_rolls_the_two_free_spatial_axes_not_the_trailing_two(self):
+        """The specific bug: with a trailing channel, `dims=(-2,-1)` meant (x, channel).
+
+        A size-1 channel makes that roll a no-op, so the image moved along one axis while the
+        label moved along two -- no error, just a displacement between them.
+        """
+        img, label, img_dims, label_dims = self._pair("lzyxc")
+        out_img, out_label = shift_sections(
+            np.random.default_rng(0), img, label, prob=1.0, magnitude=2,
+            spatial_dims=[img_dims, label_dims],
+        )
+        moved_img = self._marker(out_img, "lzyxc")
+        assert moved_img != [2, 2, 2], "nothing moved, so the test proves nothing"
+        assert moved_img == self._marker(out_label, "lzyx")

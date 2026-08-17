@@ -27,6 +27,39 @@ import torch
 _SPATIAL_PERMS: tuple[tuple[int, int, int], ...] = tuple(itertools.permutations(range(3)))
 
 
+def spatial_dims_for(axes: str) -> tuple[int, int, int]:
+    """Negative offsets of z, y, x for a tensor laid out as `axes`, e.g. "lczyx" -> (-3, -2, -1).
+
+    Offsets are counted from the end so that one value serves tensors with different numbers of
+    leading axes -- but only when the spatial axes are trailing. They are not always: `output_axes`
+    is a config field, and `"lzyxc"` puts the channel last, which pushes z/y/x to (-4, -3, -2)
+    while the label, carrying no channel axis, keeps (-3, -2, -1). Deriving the pair from the two
+    layout strings is what keeps image and labels transformed identically; assuming (-3, -2, -1)
+    for both silently rolls them apart. See `shift_sections` for the failure that motivated this.
+    """
+    return tuple(axes.index(a) - len(axes) for a in "zyx")  # type: ignore[return-value]
+
+
+def _per_tensor_dims(
+    spatial_dims, count: int
+) -> list[tuple[int, int, int]]:
+    """Normalize `spatial_dims` to one entry per tensor.
+
+    Accepts a single tuple, meaning "the same axes in every tensor", or a sequence of tuples, one
+    per tensor. The second form exists because the tensors handed to one call need not agree:
+    labels carry no channel axis, so under a channel-last layout their spatial axes sit one
+    position later than the image's.
+    """
+    if spatial_dims and isinstance(spatial_dims[0], (tuple, list)):
+        dims = [tuple(d) for d in spatial_dims]
+        assert len(dims) == count, (
+            f"spatial_dims has {len(dims)} entries for {count} tensors. Pass one tuple to use the "
+            "same axes for every tensor, or exactly one tuple per tensor."
+        )
+        return dims
+    return [tuple(spatial_dims)] * count
+
+
 def draw_rot90(rng) -> tuple[tuple[int, int, int], tuple[bool, bool, bool]]:
     """Draw one of the 48 axis-aligned 3D rotations/reflections uniformly: (perm, flips)."""
     perm = _SPATIAL_PERMS[int(rng.random() * len(_SPATIAL_PERMS))]
@@ -101,7 +134,8 @@ def rot90isocube(
             "the voxel size is equal on every axis."
         )
     perm, flips = draw_rot90(rng)
-    return tuple(apply_rot90(t, perm, flips, spatial_dims) for t in tensors)
+    dims = _per_tensor_dims(spatial_dims, len(tensors))
+    return tuple(apply_rot90(t, perm, flips, d) for t, d in zip(tensors, dims, strict=True))
 
 
 def intensity_jitter(
@@ -166,8 +200,10 @@ def rot90inplane(
     if rng.random() < 0.5:
         perm[free[0]], perm[free[1]] = perm[free[1]], perm[free[0]]
     flips = (rng.random() < 0.5, rng.random() < 0.5, rng.random() < 0.5)
+    dims = _per_tensor_dims(spatial_dims, len(tensors))
     return tuple(
-        apply_rot90(t, tuple(perm), tuple(bool(f) for f in flips), spatial_dims) for t in tensors
+        apply_rot90(t, tuple(perm), tuple(bool(f) for f in flips), d)
+        for t, d in zip(tensors, dims, strict=True)
     )
 
 
@@ -220,7 +256,8 @@ def shift_sections(
         return tensors
 
     slot = int(rng.random() * 3)
-    extent = tensors[0].shape[spatial_dims[slot] % tensors[0].ndim]
+    dims = _per_tensor_dims(spatial_dims, len(tensors))
+    extent = tensors[0].shape[dims[0][slot] % tensors[0].ndim]
     # One draw per section, shared by every tensor, so image and labels stay registered.
     shifts = {
         index: (
@@ -234,14 +271,19 @@ def shift_sections(
         return tensors
 
     out = []
-    for tensor in tensors:
-        axis = spatial_dims[slot] % tensor.ndim
+    for tensor, tensor_dims in zip(tensors, dims, strict=True):
+        absolute = [d % tensor.ndim for d in tensor_dims]
+        axis = absolute[slot]
+        # Where the other two spatial axes land once `axis` is moved to the front and indexed
+        # away: an axis at `a` shifts down by one only if it sat after the one removed. Derived
+        # rather than assumed to be the trailing two -- that assumption holds for `output_axes`
+        # like "lczyx" and fails for "lzyxc", where it would roll the image in (x, channel) while
+        # rolling the label in (y, x), leaving the two silently misaligned.
+        rolled_dims = tuple(a if a < axis else a - 1 for a in absolute if a != axis)
         moved = tensor.clone().movedim(axis, 0)
         for index, shift in shifts.items():
-            # After movedim the chosen axis is indexed away, leaving the other two spatial axes
-            # as the final two dims in their original relative order -- whichever axis was drawn.
             section = moved[index]
-            section.copy_(torch.roll(section, shifts=shift, dims=(-2, -1)))
+            section.copy_(torch.roll(section, shifts=shift, dims=rolled_dims))
         out.append(moved.movedim(0, axis))
     return tuple(out)
 
