@@ -249,6 +249,24 @@ resolution each call; use isotropic single-value bounds).
 > **Note:** rotation reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
 > describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
+### `rot90inplane`
+
+The subgroup for **anisotropic** data, where `rot90isocube` cannot apply. `fixed_axis` names the
+slot in `spatial_dims` that is never exchanged (typically the sectioning axis), leaving the 8
+rotations times the one swap of the two free axes, so 16 of the 48 symmetries. Only the two free
+axes need a shared voxel size, which is what `pixel_size` asserts.
+
+```python
+from miao.augment import rot90inplane
+
+# Serial-section EM at 5x1x1 (Z Y X): z is coarser, so it must not be permuted into y or x.
+img, lab = rot90inplane(rng, img, lab, fixed_axis=0, pixel_size=sample["pixel_size"])
+```
+
+Exchanging axes of unequal voxel size would relabel a 5-unit neighbour relationship as a 1-unit
+one, producing object shapes that do not occur in the data. Passing isotropic data is fine and
+simply yields a subgroup of the full 48.
+
 ### `draw_rot90` + `apply_rot90`
 
 `rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
@@ -265,6 +283,33 @@ img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X
 
 `apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later —
 e.g. to apply the identical rotation to tensors produced further down the pipeline.
+
+### Section augmentations + generic photometric augmentations
+
+Four data augmentations modeling serial-section EM and generic photometric variation are available. None is gated
+internally (apply your own probability in the closure).
+
+| Function | Applies to | Effect |
+|---|---|---|
+| `shift_sections(rng, *tensors, prob, magnitude)` | image **and** labels | Offsets whole sections within their own plane, modeling imperfect alignment between separately imaged sections. |
+| `drop_sections(rng, img, prob)` | image **only** | Blanks whole sections with given probability, modeling lost or unusable sections. |
+| `intensity_jitter(rng, img, scale, shift)` | image **only** | `img * U(*scale) + U(*shift)`. |
+| `additive_noise(rng, img, scale)` | image **only** | Zero-mean Gaussian, deviation drawn in `[0, scale]`. |
+
+Each augmentation draws one axis (or one transform) per call and applies it to every tensor passed, so
+`shift_sections` keeps image and labels registered. `drop_sections` is deliberately image-only:
+an object still passes through a lost section, so blanking its label would mistakenly teach the model that a
+gap is a boundary.
+
+```python
+img, lab = rot90inplane(rng, img, lab, fixed_axis=0, pixel_size=sample["pixel_size"])
+img, lab = shift_sections(rng, img, lab, prob=0.05, magnitude=10)
+img = drop_sections(rng, img, prob=0.05)
+img = additive_noise(rng, intensity_jitter(rng, img), scale=0.1)
+```
+
+Geometric operations first and given both tensors; photometric ones last and given only the
+image. `scale`/`shift`/`magnitude` defaults assume normalized input (~[0, 1]).
 
 ### Label targets (`miao/labels.py`)
 

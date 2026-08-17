@@ -117,3 +117,158 @@ def intensity_jitter(
     """
     # add_ mutates only the fresh product of `img * scale`, so the input stays unmutated.
     return (img * rng.uniform(*scale)).add_(rng.uniform(*shift))
+
+
+def rot90inplane(
+    rng,
+    *tensors: torch.Tensor,
+    spatial_dims: tuple[int, int, int] = (-3, -2, -1),
+    fixed_axis: int = 0,
+    pixel_size=None,
+) -> tuple[torch.Tensor, ...]:
+    """Random rotation/flip that never exchanges one distinguished axis: 16 of the 48 transforms.
+
+    The subgroup ``rot90isocube`` cannot offer on anisotropic data. Serial-section EM is the
+    motivating case: at 9x9x20 nm the sectioning axis has a voxel size the in-plane axes do not
+    share, and a permutation exchanging it with x or y relabels a 20 nm neighbour relationship as
+    a 9 nm one, producing object shapes that do not occur in the data. Excluding that axis from
+    the permutation leaves the 8 per-axis flips times the one swap of the two free axes.
+
+    ``fixed_axis`` indexes ``spatial_dims``, naming the slot never exchanged -- 0 for the
+    ``Z Y X`` layouts this library's docstrings use, 2 for an ``X Y Z`` one. It is a slot index
+    rather than a named axis because ``spatial_dims`` is already how a caller says where its
+    spatial axes are.
+
+    ``pixel_size`` checks the weaker condition this subgroup actually needs: the two *free* axes
+    must share a voxel size, the fixed one is unconstrained. Passing an isotropic volume is fine
+    and simply yields a subgroup of the full 48.
+    """
+    assert 0 <= fixed_axis < 3, (
+        f"fixed_axis indexes the three spatial_dims slots, so it must be 0, 1 or 2, got "
+        f"{fixed_axis}."
+    )
+    free = tuple(i for i in range(3) if i != fixed_axis)
+
+    if pixel_size is not None:
+        ps = np.atleast_2d(np.asarray(pixel_size, dtype=np.float64))
+        assert ps.shape[1] == 3, (
+            f"pixel_size must have 3 spatial entries per scale (shape Nd or L Nd), got "
+            f"shape {ps.shape} — a scalar or transposed array would pass the check vacuously."
+        )
+        assert np.allclose(ps[:, free[0]], ps[:, free[1]], rtol=1e-6, atol=1e-9), (
+            f"rot90inplane exchanges spatial slots {free}, so those two must share a voxel "
+            f"size, but pixel_size={ps.tolist()} gives {ps[:, free[0]].tolist()} and "
+            f"{ps[:, free[1]].tolist()}. The fixed axis {fixed_axis} may differ freely; that is "
+            "the point of this subgroup."
+        )
+
+    perm = list(range(3))
+    if rng.random() < 0.5:
+        perm[free[0]], perm[free[1]] = perm[free[1]], perm[free[0]]
+    flips = (rng.random() < 0.5, rng.random() < 0.5, rng.random() < 0.5)
+    return tuple(
+        apply_rot90(t, tuple(perm), tuple(bool(f) for f in flips), spatial_dims) for t in tensors
+    )
+
+
+def drop_sections(
+    rng,
+    img: torch.Tensor,
+    prob: float = 0.05,
+    spatial_dims: tuple[int, int, int] = (-3, -2, -1),
+) -> torch.Tensor:
+    """Blank whole sections of an image, each drawn independently with probability ``prob``.
+
+    Models a lost or unusable section in serial-section EM. One axis is drawn per call, then
+    every index along it is dropped or kept independently.
+
+    Deliberately image-only, and the asymmetry is the point: an object still passes through a
+    lost section, so blanking the label with it would teach the model that a gap is a boundary.
+    Pass only the image -- unlike the geometric augmentations here, this one must *not* be given
+    the labels.
+    """
+    assert 0.0 <= prob <= 1.0, f"prob is a probability in [0, 1], got {prob}."
+    axis = spatial_dims[int(rng.random() * 3)] % img.ndim
+    dropped = np.nonzero(np.asarray([rng.random() for _ in range(img.shape[axis])]) < prob)[0]
+    if len(dropped) == 0:
+        return img
+    # index_fill_ on a fresh copy: the contract is that inputs are never mutated.
+    return img.clone().index_fill_(axis, torch.from_numpy(dropped).to(img.device), 0.0)
+
+
+def shift_sections(
+    rng,
+    *tensors: torch.Tensor,
+    prob: float = 0.05,
+    magnitude: int = 10,
+    spatial_dims: tuple[int, int, int] = (-3, -2, -1),
+) -> tuple[torch.Tensor, ...]:
+    """Offset individual sections within their own plane, image and labels together.
+
+    Models imperfect alignment between separately imaged sections. One axis is drawn per call;
+    each index along it is selected with probability ``prob`` and rolled by an independent draw
+    in ``[-magnitude, magnitude]`` on each of the two in-plane axes.
+
+    Every tensor passed receives the same shifts, which is a deliberate divergence from the
+    reference implementations that shift the image and leave the labels behind: desynchronising
+    them by up to ``magnitude`` voxels trains the model against targets that no longer describe
+    the image it is shown, and boundary localisation is the first thing that costs.
+    """
+    assert 0.0 <= prob <= 1.0, f"prob is a probability in [0, 1], got {prob}."
+    assert magnitude >= 0, f"magnitude is a voxel count, so it must be >= 0, got {magnitude}."
+    if magnitude == 0:
+        return tensors
+
+    slot = int(rng.random() * 3)
+    extent = tensors[0].shape[spatial_dims[slot] % tensors[0].ndim]
+    # One draw per section, shared by every tensor, so image and labels stay registered.
+    shifts = {
+        index: (
+            int(rng.uniform(-magnitude, magnitude + 1)),
+            int(rng.uniform(-magnitude, magnitude + 1)),
+        )
+        for index in range(extent)
+        if rng.random() < prob
+    }
+    if not shifts:
+        return tensors
+
+    out = []
+    for tensor in tensors:
+        axis = spatial_dims[slot] % tensor.ndim
+        moved = tensor.clone().movedim(axis, 0)
+        for index, shift in shifts.items():
+            # After movedim the chosen axis is indexed away, leaving the other two spatial axes
+            # as the final two dims in their original relative order -- whichever axis was drawn.
+            section = moved[index]
+            section.copy_(torch.roll(section, shifts=shift, dims=(-2, -1)))
+        out.append(moved.movedim(0, axis))
+    return tuple(out)
+
+
+def additive_noise(
+    rng,
+    img: torch.Tensor,
+    scale: float = 0.1,
+) -> torch.Tensor:
+    """Add zero-mean Gaussian noise whose standard deviation is drawn in ``[0, scale]``.
+
+    The deviation is itself random, so most affected samples get considerably less than
+    ``scale``; that follows the reference recipes, where a fixed severe deviation was found to
+    dominate the signal. ``scale`` is in units of the image's intensity range, so the default
+    assumes normalized input (~[0, 1]).
+
+    The sample is drawn through a torch generator seeded from ``rng`` rather than from ``rng``
+    directly. It is the same determinism -- one draw off ``rng`` fixes the whole field -- but it
+    keeps a 256^3 volume's worth of normals on torch's generator, which is several times faster
+    than materializing them in numpy and converting, on an operation that runs per sample inside
+    a dataloader worker.
+    """
+    assert scale >= 0.0, f"scale is a standard deviation, so it must be >= 0, got {scale}."
+    if scale == 0.0:
+        return img
+    generator = torch.Generator(device=img.device).manual_seed(int(rng.random() * 2**53))
+    noise = torch.randn(
+        img.shape, generator=generator, dtype=img.dtype, device=img.device
+    )
+    return img + noise * (rng.random() * scale)
