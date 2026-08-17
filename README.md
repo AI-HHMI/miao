@@ -293,8 +293,8 @@ internally (apply your own probability in the closure).
 |---|---|---|
 | `shift_sections(rng, *tensors, prob, magnitude)` | image **and** labels | Offsets whole sections within their own plane, modeling imperfect alignment between separately imaged sections. |
 | `drop_sections(rng, img, prob)` | image **only** | Blanks whole sections with given probability, modeling lost or unusable sections. |
-| `intensity_jitter(rng, img, scale, shift)` | image **only** | `img * U(*scale) + U(*shift)`. |
-| `additive_noise(rng, img, scale)` | image **only** | Zero-mean Gaussian, deviation drawn in `[0, scale]`. |
+| `intensity_jitter(rng, img, scale, shift)` | image **only** | Per-sample intensity jitter: `img * U(*scale) + U(*shift)`. |
+| `additive_noise(rng, img, scale)` | image **only** | Per-voxel additive Gaussian noise with std drawn uniformly from `[0, scale]` for each sample. |
 
 Each augmentation draws one axis (or one transform) per call and applies it to every tensor passed, so
 `shift_sections` keeps image and labels registered. `drop_sections` is deliberately image-only:
