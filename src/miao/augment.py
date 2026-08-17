@@ -119,26 +119,43 @@ def intensity_jitter(
     return (img * rng.uniform(*scale)).add_(rng.uniform(*shift))
 
 
+# torch.quantile refuses inputs with more elements than this (a single 256**3 multi-scale level
+# already hits it exactly), so larger tensors estimate percentiles from a subsample instead.
+_QUANTILE_MAX_ELEMENTS = 2**24
+
+
 def percentile_normalize(
     img: torch.Tensor,
     lower: float = 1.0,
     upper: float = 99.0,
     clamp: bool = True,
+    sample_size: int = 10_000,
 ) -> torch.Tensor:
     """Normalize intensities to [0, 1] via percentiles: ``(img - p_lower) / (p_upper - p_lower)``.
 
     Percentiles are computed over the whole tensor (a multi-scale ``L Z Y X`` sample pools all
-    levels, keeping them on a common intensity scale). With ``clamp`` (the default) values
-    outside the percentile range are clipped to [0, 1]; ``clamp=False`` leaves them outside.
-    Deterministic, hence no ``rng``. Integer inputs are promoted to float32. A constant image
+    levels, keeping them on a common intensity scale) — except above ``torch.quantile``'s
+    2**24-element limit, where ``p_lower``/``p_upper`` are instead estimated from ``sample_size``
+    values drawn uniformly at random (a fixed-seed generator, so the estimate stays deterministic
+    given ``img``; a strided subsample was considered but risks aliasing against periodic
+    structure in the data). With ``clamp`` (the default) values outside the percentile range are
+    clipped to [0, 1]; ``clamp=False`` leaves them outside. Deterministic, hence no ``rng``.
+    Non-float32 inputs — integer, float64, and float16/bfloat16 (unsupported by
+    ``torch.quantile`` despite being floating-point) — are promoted to float32. A constant image
     maps to all zeros.
     """
     assert 0.0 <= lower < upper <= 100.0, (
         f"percentiles must satisfy 0 <= lower < upper <= 100, got lower={lower}, upper={upper}."
     )
-    x = img.float() if not img.is_floating_point() else img
-    lo = torch.quantile(x, lower / 100.0)
-    hi = torch.quantile(x, upper / 100.0)
+    x = img.float()
+    flat = x.reshape(-1)
+    if flat.numel() > _QUANTILE_MAX_ELEMENTS:
+        idx = torch.randint(
+            flat.numel(), (sample_size,), generator=torch.Generator().manual_seed(0)
+        )
+        flat = flat[idx.to(flat.device)]
+    lo = torch.quantile(flat, lower / 100.0)
+    hi = torch.quantile(flat, upper / 100.0)
     # clamp_min guards the constant-image case (hi == lo) without mutating anything shared.
     out = (x - lo) / (hi - lo).clamp_min(1e-8)
     # clamp_ mutates only the fresh quotient above, so the input stays unmutated.

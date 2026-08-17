@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from miao.augment import (
+    _QUANTILE_MAX_ELEMENTS,
     _SPATIAL_PERMS,
     apply_rot90,
     draw_rot90,
@@ -257,6 +258,27 @@ class TestPercentileNormalize:
         for lower, upper in ((99.0, 1.0), (50.0, 50.0), (-1.0, 99.0), (1.0, 101.0)):
             with pytest.raises(AssertionError, match="lower < upper"):
                 percentile_normalize(img, lower=lower, upper=upper)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_half_dtype_input_does_not_crash(self, dtype):
+        # torch.quantile rejects half dtypes even though img.is_floating_point() is True for them.
+        img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4).to(dtype)
+        out = percentile_normalize(img)
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+
+    def test_oversized_tensor_falls_back_to_subsample(self):
+        # torch.quantile refuses inputs above _QUANTILE_MAX_ELEMENTS; a stacked multi-scale
+        # sample can easily exceed it even though a single level fits.
+        img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)
+        out = percentile_normalize(img)
+        assert torch.isfinite(out).all()
+
+    def test_oversized_tensor_subsample_estimate_is_deterministic(self):
+        img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)
+        first = percentile_normalize(img)
+        second = percentile_normalize(img)
+        assert torch.equal(first, second)
 
 
 class TestVolumeDatasetAugmentFn:

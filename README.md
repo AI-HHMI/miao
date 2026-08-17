@@ -240,10 +240,14 @@ Available functions (see [`miao/augment.py`](src/miao/augment.py) docstrings for
 
 | Function | Description |
 |---|---|
-| `rot90isocube` | Draws one of the 48 cube symmetries and rotates/flips every tensor passed together, at every scale. Requires a cubic patch and isotropic output resolution. |
+| `rot90isocube` | Draws one of the 48 cube symmetries and rotates/flips every tensor passed together, at every scale. Requires a cubic patch and isotropic output resolution. `bbox` and `meta["coordinate"]` are not rotated — they still describe the original read location. |
 | `draw_rot90` / `apply_rot90` | Split draw and apply, for tensors that can't share one `rot90isocube` call — per-level tensors not yet stacked, or spatial dims at different positions. |
 | `intensity_jitter` | Random affine rescale/shift of intensities: `img * U(scale) + U(shift)`. |
 | `percentile_normalize` | Percentile-based rescaling of intensities to [0, 1]. |
+
+`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
+tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
+once and apply the same transform per tensor:
 
 ```python
 from miao.augment import apply_rot90, draw_rot90
