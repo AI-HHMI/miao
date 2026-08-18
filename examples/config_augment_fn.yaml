@@ -1,4 +1,4 @@
-# `factory` receives `kwargs` once at VolumeDataset construction and returns
+# `factory` receives `kwargs` once in each DataLoader worker and returns
 # augment_fn(sample) -> sample. (A bare string instead of this mapping names a ready
 # augment_fn directly — factories always need the mapping form.)
 # em_default rotates by default, which requires isotropic resolutions and a cubic

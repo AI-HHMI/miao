@@ -146,7 +146,7 @@ class VolumeConfig(BaseModel):
 
 
 class AugmentFnConfig(BaseModel):
-    """A dotted-path factory plus kwargs, resolved to an augment_fn at dataset construction.
+    """A dotted-path factory plus kwargs, resolved to an augment_fn once in each worker.
 
     ``factory`` names a callable (e.g. ``myproject.augs.make_em_default``) that is imported and
     called once with ``kwargs``; it must return a callable ``augment_fn(sample) -> sample``.
@@ -154,7 +154,9 @@ class AugmentFnConfig(BaseModel):
     experiments live here, diffable across configs.
 
     The factory is called once per DataLoader worker process, so its return value never
-    crosses a process boundary — it may be any callable, a nested closure included.
+    crosses a process boundary — it may be any callable, a nested closure included. The dotted
+    path is validated at dataset construction; the call itself — and therefore any kwargs
+    error — surfaces at the first sample in each worker.
     """
 
     # Reject unknown keys so typos fail loudly.
@@ -172,8 +174,8 @@ class MiaoConfig(BaseModel):
 
     volumes: list[VolumeConfig]
     # A dotted string names an augment_fn(sample) -> sample directly. A {factory, kwargs}
-    # mapping is called at dataset construction and must return that callable. Mutually exclusive
-    # with passing augment_fn= to VolumeDataset directly.
+    # mapping is called once in each DataLoader worker and must return that callable. Mutually
+    # exclusive with passing augment_fn= to VolumeDataset directly.
     augment_fn: Optional[Union[str, AugmentFnConfig]] = None
 
     # Desired output resolutions, one per scale. Each inner list is the output voxel size per

@@ -336,7 +336,7 @@ class VolumeDataset(torch.utils.data.Dataset):
     ``augment_fn`` (optional) is called once per sample on the finished dict, as
     ``augment_fn(sample) -> sample``. It comes from either the constructor argument or
     ``config.augment_fn`` (a dotted path to a ready augment_fn, or a {factory, kwargs} mapping
-    resolved here at construction) — never both. Compose the pure functions from
+    called once in each worker process) — never both. Compose the pure functions from
     ``miao.augment`` in a module-level function (draw randomness from the ``np.random`` module,
     which PyTorch reseeds per worker), forward ``sample["pixel_size"]`` to ``rot90isocube``, and
     skip the label when it is the empty no-label sentinel. A directly passed callable is
