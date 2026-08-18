@@ -339,23 +339,30 @@ class VolumeDataset(torch.utils.data.Dataset):
     resolved here at construction) — never both. Compose the pure functions from
     ``miao.augment`` in a module-level function (draw randomness from the ``np.random`` module,
     which PyTorch reseeds per worker), forward ``sample["pixel_size"]`` to ``rot90isocube``, and
-    skip the label when it is the empty no-label sentinel. The callable is pickled to DataLoader
-    workers, so it must be a module-level function, ``functools.partial``, or class instance —
-    not a lambda or nested closure — and must not rely on state shared across workers.
+    skip the label when it is the empty no-label sentinel. A directly passed callable is
+    pickled to DataLoader workers, so it must be a module-level function, ``functools.partial``,
+    or class instance; a configured factory is instead called once per worker, so it may return
+    any callable. Neither may rely on state shared across workers.
     """
 
     def __init__(self, config: MiaoConfig, augment_fn=None) -> None:
         assert augment_fn is None or config.augment_fn is None, (
             "augmentation may come from the augment_fn argument or config.augment_fn, not both"
         )
-        if augment_fn is None and config.augment_fn is not None:
-            augment_fn = _resolve_augment_fn(config.augment_fn)
         assert augment_fn is None or callable(augment_fn), (
             f"augment_fn must be a callable augment_fn(sample) -> sample, "
             f"got {type(augment_fn).__name__}"
         )
+        if config.augment_fn is not None:
+            # Validate the dotted path now (typos fail at construction); the factory call itself
+            # is deferred to _get_augment_fn, once per worker process, so its return value never
+            # needs to survive pickling.
+            spec = config.augment_fn
+            _import_augment_fn(spec if isinstance(spec, str) else spec.factory)
         self.config = config
         self.augment_fn = augment_fn
+        # Per-worker cache of the factory-built augment_fn (may be an unpicklable closure).
+        self._worker_augment_fns: dict[int, object] = {}
 
         # Read metadata and precompute sampling bounds for each volume
         self._volumes: list[VolumeInfo] = []
@@ -390,7 +397,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         print(f"VolumeDataset: {len(self._volumes)} volume(s), "
               f"{mode_str}, "
               f"patch_size={self.config.patch_size}")
-        if self.augment_fn is not None:
+        if self.augment_fn is not None or self.config.augment_fn is not None:
             spec = self.config.augment_fn
             if isinstance(spec, AugmentFnConfig):
                 print(f"  augment_fn: factory={spec.factory!r}, kwargs={spec.kwargs!r}")
@@ -847,6 +854,24 @@ class VolumeDataset(torch.utils.data.Dataset):
     def _get_worker_id(self) -> int:
         worker_info = torch.utils.data.get_worker_info()
         return worker_info.id if worker_info is not None else 0
+
+    def _get_augment_fn(self):
+        """The effective augment_fn: the argument, or the configured factory built per worker.
+
+        The factory call runs once in each worker process (like the tensorstore handles), so
+        its return value never crosses a process boundary and may be any callable — a nested
+        closure included.
+        """
+        if self.augment_fn is not None or self.config.augment_fn is None:
+            return self.augment_fn
+        worker_id = self._get_worker_id()
+        if worker_id not in self._worker_augment_fns:
+            self._worker_augment_fns[worker_id] = _resolve_augment_fn(self.config.augment_fn)
+        return self._worker_augment_fns[worker_id]
+
+    def __getstate__(self):
+        # Factory-built augment_fns may be unpicklable closures; workers rebuild their own.
+        return {**self.__dict__, "_worker_augment_fns": {}}
 
     def _get_stores(self) -> dict:
         """Lazily create tensorstore handles for the current worker."""
@@ -1310,8 +1335,9 @@ class VolumeDataset(torch.utils.data.Dataset):
             },
         }
 
-        if self.augment_fn:
-            x = self.augment_fn(x)
+        augment_fn = self._get_augment_fn()
+        if augment_fn:
+            x = augment_fn(x)
             assert isinstance(x, dict) and "img" in x, (
                 f"augment_fn must return the sample dict, got {type(x).__name__}. If "
                 "config.augment_fn is a bare dotted path, it must name a ready "

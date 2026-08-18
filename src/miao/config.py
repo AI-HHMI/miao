@@ -153,9 +153,8 @@ class AugmentFnConfig(BaseModel):
     Composition stays in code (the factory body); the parameters worth sweeping between
     experiments live here, diffable across configs.
 
-    The returned callable is pickled to DataLoader workers, so the factory must return a
-    ``functools.partial`` over a module-level function or a class instance — a nested closure
-    fails at worker startup under the spawn start method (macOS/Windows default).
+    The factory is called once per DataLoader worker process, so its return value never
+    crosses a process boundary — it may be any callable, a nested closure included.
     """
 
     # Reject unknown keys so typos fail loudly.

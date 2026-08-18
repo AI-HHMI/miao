@@ -371,10 +371,35 @@ sampling: sequential
         with pytest.raises(AssertionError, match="not both"):
             VolumeDataset(cfg, augment_fn=identity)
 
-    def test_bad_kwarg_fails_at_construction(self, zarr2_volume: Path):
+    def test_bad_kwarg_fails_at_first_sample(self, zarr2_volume: Path):
+        # The factory call is deferred per worker, so kwarg errors surface at the first sample.
         spec = {"factory": "test_augment.HalveFactory", "kwargs": {"scal": [0.5, 0.5]}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
         with pytest.raises(TypeError):
+            ds[0]
+
+    def test_bad_factory_path_in_mapping_fails_at_construction(self, zarr2_volume: Path):
+        spec = {"factory": "test_augment.NoSuchFactory", "kwargs": {}}
+        with pytest.raises(AssertionError, match="augment_fn"):
             VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+
+    def test_closure_factory_works_through_pickle(self, zarr2_volume: Path):
+        # The v3 selling point: factories may return closures because only the recipe pickles.
+        spec = {"factory": "test_augment._closure_factory", "kwargs": {}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        ds[0]  # resolve in the parent, populating the per-worker cache with a closure
+        import pickle
+
+        clone = pickle.loads(pickle.dumps(ds))  # __getstate__ drops the cached closure
+        assert torch.equal(clone[0]["img"], ds[0]["img"])
+
+    def test_closure_factory_runs_in_spawned_dataloader(self, zarr2_volume: Path):
+        spec = {"factory": "test_augment._closure_factory", "kwargs": {}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        batch = next(iter(torch.utils.data.DataLoader(
+            ds, batch_size=1, num_workers=1, multiprocessing_context="spawn"
+        )))
+        assert batch["img"].shape == (1, 1, 8, 8, 8)
 
     def test_bad_path_fails_at_construction(self, zarr2_volume: Path):
         for bad in ("test_augment.NoSuchFactory", "test_augment.", ".rel.path", "nodots"):

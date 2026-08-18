@@ -246,9 +246,9 @@ augment_fn:
     scale: [0.8, 1.2]
 ```
 
-The factory's return value is pickled to DataLoader workers, so return a `functools.partial`
-over a module-level function or a class instance — not a nested closure, which fails at worker
-startup under the `spawn` start method (macOS/Windows default). `em_default` rotates by default,
+The factory is called once per DataLoader worker process, so it may return any callable — a
+nested closure included; only a directly passed `augment_fn=` callable must be picklable
+(module-level function, `functools.partial`, or class instance). `em_default` rotates by default,
 which requires isotropic resolutions and a cubic patch; set `rotate: false` in its kwargs for
 anisotropic data.
 
