@@ -230,14 +230,37 @@ def augment(sample):
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
+In YAML, a string names an importable `augment_fn(sample) -> sample` directly:
+
+```yaml
+augment_fn: myproject.augs.augment_sample
+```
+
+Use a factory mapping when configuration supplies its parameters; see
+[`examples/config_augment_fn.yaml`](examples/config_augment_fn.yaml):
+
+```yaml
+augment_fn:
+  factory: miao.augment_std.em_default
+  kwargs:
+    scale: [0.8, 1.2]
+```
+
+The factory's return value is pickled to DataLoader workers, so return a `functools.partial`
+over a module-level function or a class instance — not a nested closure, which fails at worker
+startup under the `spawn` start method (macOS/Windows default). `em_default` rotates by default,
+which requires isotropic resolutions and a cubic patch; set `rotate: false` in its kwargs for
+anisotropic data.
+
 See [`miao/augment.py`](src/miao/augment.py) for the available
 functions and their exact behavior.
 
 Using the `np.random` module keeps multi-worker randomness correct for free; a
 `np.random.default_rng()` Generator closed over from the parent process works too, but
 fork-inherited copies draw identical streams across workers unless you reseed it in a
-`worker_init_fn`. For volumes without labels, skip the empty label sentinel
-(`sample["label"].numel() == 0`) instead of rotating it.
+`worker_init_fn`. For spawned workers, pass a module-level function, `functools.partial`, or a
+class instance rather than a lambda or nested closure. For volumes without labels, skip the empty
+label sentinel (`sample["label"].numel() == 0`) instead of rotating it.
 
 ### `rot90isocube`
 

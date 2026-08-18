@@ -1,0 +1,20 @@
+# `factory` receives `kwargs` once at VolumeDataset construction and returns
+# augment_fn(sample) -> sample. (A bare string instead of this mapping names a ready
+# augment_fn directly — factories always need the mapping form.)
+# em_default rotates by default, which requires isotropic resolutions and a cubic
+# patch_size; for anisotropic data add `rotate: false` to kwargs.
+augment_fn:
+  factory: miao.augment_std.em_default
+  kwargs:
+    scale: [0.8, 1.2]
+    shift: [-0.1, 0.1]
+
+volumes:
+  - name: raw
+    path: /data/sample.zarr
+    image_key: raw
+
+resolutions: [[8, 8, 8]]
+output_axes: lzyx
+patch_size: [64, 64, 64]
+samples_per_epoch: 1000

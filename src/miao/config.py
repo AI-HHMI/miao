@@ -7,7 +7,7 @@ from typing import Literal, Optional, Union
 
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Mapping from config string to torch dtype for image tensors.
 IMAGE_DTYPE_MAP: dict[str, torch.dtype] = {
@@ -145,6 +145,26 @@ class VolumeConfig(BaseModel):
         return self
 
 
+class AugmentFnConfig(BaseModel):
+    """A dotted-path factory plus kwargs, resolved to an augment_fn at dataset construction.
+
+    ``factory`` names a callable (e.g. ``myproject.augs.make_em_default``) that is imported and
+    called once with ``kwargs``; it must return a callable ``augment_fn(sample) -> sample``.
+    Composition stays in code (the factory body); the parameters worth sweeping between
+    experiments live here, diffable across configs.
+
+    The returned callable is pickled to DataLoader workers, so the factory must return a
+    ``functools.partial`` over a module-level function or a class instance — a nested closure
+    fails at worker startup under the spawn start method (macOS/Windows default).
+    """
+
+    # Reject unknown keys so typos fail loudly.
+    model_config = ConfigDict(extra="forbid")
+
+    factory: str
+    kwargs: dict = Field(default_factory=dict)
+
+
 class MiaoConfig(BaseModel):
     """Top-level configuration for miaio dataset."""
 
@@ -152,6 +172,11 @@ class MiaoConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     volumes: list[VolumeConfig]
+    # A dotted string names an augment_fn(sample) -> sample directly. A {factory, kwargs}
+    # mapping is called at dataset construction and must return that callable. Mutually exclusive
+    # with passing augment_fn= to VolumeDataset directly.
+    augment_fn: Optional[Union[str, AugmentFnConfig]] = None
+
     # Desired output resolutions, one per scale. Each inner list is the output voxel size per
     # spatial axis (physical units, same unit as the zarr's OME coordinateTransformations scale),
     # in output_axes spatial order — like patch_size. Used as the default for every volume; a
