@@ -1,4 +1,5 @@
 # miao
+
 [![PyPI version](https://badge.fury.io/py/miao-io.svg)](https://pypi.org/project/miao-io/)
 
 Scalable PyTorch data loaders for OME-NGFF zarr datasets, powered by TensorStore.
@@ -11,46 +12,34 @@ pip install miao-io
 
 ## Quick start
 
-**1. Write a config**
-
 ```yaml
 # config.yaml
 volumes:
-  - name: "raw"
-    path: "/data/sample_A.zarr"
-    image_key: "raw"
-    zarr_version: "zarr2"      # or "zarr3" (default: "zarr2")
-    label_key: "labels/seg"    # optional
+  - name: sample_a
+    path: /data/sample_A.zarr
+    image_key: raw
+    label_key: labels/seg      # optional
+    zarr_version: zarr2        # or zarr3
     weight: 0.5                # optional
 
-  - name: "membrane"
-    path: "/data/sample_B.zarr"
-    image_key: "predictions"
-    zarr_version: "zarr3"
-    weight: 0.2
+  - name: sample_b
+    path: /data/sample_B.zarr
+    image_key: predictions
+    zarr_version: zarr3
+    weight: 0.5
 
-  - name: "expanded"
-    path: "/data/expanded.zarr"
-    image_key: "raw"
-    exp_factor: 4.0            # optional, default: 1.0 — see Effective voxel sizes
-    weight: 0.3
-
-resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]  # effective output voxel size per scale
-output_axes: "lcxyz"            # layer, channels, X, Y, Z. Shuffle as you please!!!
+resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]   # output voxel size per scale
+output_axes: lcxyz
 patch_size: [64, 64, 64]
 samples_per_epoch: 1000
-cache_bytes: 1073741824         # 1 GB tensorstore cache
 ```
-
-**2. Build a dataset**
 
 ```python
 from torch.utils.data import DataLoader
 from miao import VolumeDataset, load_config
 
 dataset = VolumeDataset(load_config("config.yaml"))
-loader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=8,
-                    pin_memory=True, persistent_workers=True)
+loader = DataLoader(dataset, batch_size=4, shuffle=True)
 
 for batch in loader:
     img, label = batch["img"], batch["label"]
@@ -60,41 +49,25 @@ Runnable notebooks live in [`examples/`](examples/).
 
 ## Batch format
 
+Tensors follow `output_axes` with the batch dim prepended, so `output_axes: "lczyx"` yields `img`
+as `(B, L, C, Z, Y, X)`. `L` is the number of scales, `Nd` the number of spatial axes.
+
 | Key | Shape | Description |
 |---|---|---|
-| `img` | `(B, L, X, Y, Z)`, or `(B, L, C, X, Y, Z)` with a channel axis | Image patch per scale level |
-| `label` | `(B, L, X, Y, Z)`, empty without a `label_key` | Label patch per scale level |
-| `bbox` | `(B, L, 2, Nd_spatial)` | Patch extent per level, world or crop-relative (see `bbox_mode`) |
-| `pixel_size` | `(B, L, Nd_spatial)` | Effective physical output voxel size per level |
-| `meta` | dict | `name`, `coordinate`, `resolutions` (mirroring `pixel_size`), source pyramid levels, plus `grid_index` in sequential mode |
+| `img` | `output_axes` order | Image patch per scale |
+| `label` | `output_axes` minus `c` | Label patch per scale; empty tensor without a `label_key` |
+| `bbox` | `(B, L, 2, Nd)` | Patch extent in physical units, world or center-relative (see `bbox_mode`) |
+| `pixel_size` | `(B, L, Nd)` | Effective output voxel size, as actually used for that sample |
+| `meta` | dict | `volume`, `coordinate`, `resolutions`, `source_levels`, plus `grid_index` in sequential mode |
 
-Spatial axes follow `output_axes` throughout. `pixel_size` sits at the top level rather than inside `meta` so default collate stacks it cleanly,
-ready to feed a scale-conditioned model. It reports the resolutions *actually used* for that
-sample, which under random resolution sampling differ from sample to sample.
+Spatial entries of `bbox`, `pixel_size` and every `meta` field are in `output_axes` spatial
+order.
 
-## How scales work
+## Resolutions
 
 Scales are addressed by **desired output resolution** — physical voxel size per axis, in the zarr's
-OME `coordinateTransformations` unit (e.g. nanometers) — never by pyramid level index. One
-`resolutions` list therefore serves volumes with wildly different pyramid layouts, and any volume
-can override it with its own.
-
-### Effective voxel sizes
-
-**Every voxel size and resolution in this README is an *effective* voxel size: the size of one
-voxel in the specimen, not in the microscope.** For a volume with `exp_factor: F`, the effective
-voxel size is the stored `coordinateTransformations` scale divided by `F` — a 4× expanded sample
-imaged at 200 nm holds 50 nm of biology per voxel. `exp_factor` defaults to `1.0`, so for
-unexpanded data the stored and effective sizes are identical.
-
-If the zarr's OME metadata already carries the correction as a multiscale-level (outer)
-`coordinateTransformations` scale, it is applied automatically — set `exp_factor` only for
-stores that lack that metadata, or the correction would be applied twice.
-
-Level selection, read extents, `pixel_size`, and `meta["resolutions"]` are all in effective units,
-which is what lets one `resolutions` list mix expanded and unexpanded volumes correctly.
-`bounding_box` and `meta["coordinate"]` are level-0 voxel *indices*, not physical sizes, so
-`exp_factor` does not affect them.
+OME `coordinateTransformations` unit (e.g. nanometers). One `resolutions` list therefore serves
+volumes with wildly different pyramid layouts, and any volume can override it with its own.
 
 Per sample, miao:
 
@@ -106,8 +79,21 @@ Per sample, miao:
 3. reads `ceil(patch_size × target_resolution / effective_level_voxel_size)` voxels centered on
    that coordinate and resamples them to `patch_size` — trilinear for images, nearest for labels.
 
-Every crop thus holds the same voxel count while covering a wider physical extent at coarser
-scales.
+Every crop thus holds the same voxel count while covering a wider physical extent at coarser scales.
+
+### Effective voxel sizes
+
+Every resolution here is an **effective** voxel size: the size of one voxel in the specimen, not in
+the microscope. With `exp_factor: F` it is the stored `coordinateTransformations` scale divided by
+`F` — a 4× expanded sample imaged at 200 nm holds 50 nm of biology per voxel. `exp_factor` defaults
+to `1.0`, so stored and effective sizes are identical for unexpanded data.
+
+Set `exp_factor` only for stores whose OME metadata lacks the correction. A multiscale-level (outer)
+`coordinateTransformations` scale is applied automatically, and would otherwise count twice.
+
+Level selection, read extents, `pixel_size` and `meta["resolutions"]` are all in effective units,
+which is what lets one `resolutions` list mix expanded and unexpanded volumes. `bounding_box` and
+`meta["coordinate"]` are level-0 voxel *indices*, so `exp_factor` does not affect them.
 
 ### Random resolution sampling
 
@@ -129,91 +115,81 @@ The shape of each bound decides isotropy:
 - `[[a, b, c], [d, e, f]]` draws **each axis independently**, so `[[[1, 1, 1], [4, 4, 4]]]` may
   yield `[1.8, 3.2, 2.5]` — not the same distribution as `[[[1], [4]]]`.
 
-Ranges stack: `[[[1], [2]], [[4], [8]]]` with `n_scales: [1, 1]` gives two scales, the `l`
-dimension being the sum across ranges. Draws are log-uniform and redrawn every `__getitem__`.
+Ranges stack: `[[[1], [2]], [[4], [8]]]` with `n_scales: [1, 1]` gives two scales, `L` being the sum
+across ranges. Draws are log-uniform and redrawn every `__getitem__`.
 
-Exactly one of `resolutions` / `resolution_sampling` may be set. `resolution_sampling` rules out
-`sampling: "sequential"`, and `sample_windows` demands isotropic ranges.
+Constraints: exactly one of `resolutions` / `resolution_sampling` per config and per volume
+override; `resolution_sampling` rules out `sampling: sequential`; `sample_windows` demands isotropic
+ranges.
 
 ## Sampling
 
-Random sampling — the default, and the mode described above — draws `samples_per_epoch` patches per
-epoch. Two settings change *where* patches land:
+### Random (default)
+
+Draws `samples_per_epoch` patches per epoch. Each sample picks a volume first — uniformly by
+default, so a 512³ ground-truth crop is chosen as often as a whole brain, biasing training toward
+small volumes. `size_weighting_exponent` tempers the draw by how much data each volume holds:
+
+```yaml
+size_weighting_exponent: 0.3   # p ∝ weight * size ** size_weighting_exponent
+```
+
+| Value | Effect |
+|---|---|
+| `0.0` (default) | size ignored; probabilities come from `weight` alone |
+| `0.3` – `0.5` | tempered; the usual choice for a corpus spanning orders of magnitude |
+| `1.0` | exactly proportional to reachable content; the largest volumes dominate |
+
+`size` is the number of distinct stored voxels the sampler can reach, measured on the finest pyramid
+level any configured scale reads. It is not the raw array size: it accounts for the patch window,
+`bounding_box`, and the level actually used, so a crop admitting only one patch center scores one
+patch window. It is reported per volume in the dataset summary alongside the resulting probability.
+`weight` multiplies the size term, so per-volume overrides keep working.
 
 ### Sequential (inference / evaluation)
 
-Walk the whole volume on a deterministic grid instead.
+Walks the whole volume on a deterministic grid instead.
 
 ```yaml
-sampling: "sequential"
+sampling: sequential
 overlap: 16              # or per-axis list, e.g. [16, 16, 8]
 ```
 
 ```python
 dataset = VolumeDataset(config)                            # len() = grid positions, all volumes
-loader = DataLoader(dataset, batch_size=4, shuffle=False)   # shuffle=False required
+loader = DataLoader(dataset, batch_size=4, shuffle=False)   # walk the grid in order
 
 for batch in loader:
-    # e.g. (2, 0, 3) — grid position per axis; use it to stitch predictions into a full volume
+    # Use the grid position to stitch predictions into a full volume. Default collate gives one
+    # (B,) tensor per spatial axis, in output_axes order; un-batched, dataset[i] gives a plain
+    # tuple like (2, 0, 3).
     grid_index = batch["meta"]["grid_index"]
 ```
 
 The grid tiles the volume at the **first scale's** target resolution, striding one output patch
 minus `overlap` worth of physical extent. Coverage is gap-free even on anisotropic source data.
 `samples_per_epoch`, `weight` and `size_weighting_exponent` are ignored here, and volumes are
-exhausted in order. The grid already visits each volume in proportion to its sampleable extent.
+exhausted in order — the grid already visits each in proportion to its sampleable extent.
 
-### Size-weighted volume sampling
-
-In `random` mode each sample picks a volume first. By default that draw is uniform, so a 512³
-ground-truth crop is chosen as often as a whole brain, which biases training toward small
-volumes. `size_weighting_exponent` tempers the draw by how much data each volume actually holds:
-
-```yaml
-size_weighting_exponent: 0.3   # p ∝ weight * size ** size_weighting_exponent
-```
-
-`size` is the number of distinct stored voxels the sampler can reach, measured on the finest
-pyramid level any configured scale reads. It is not the raw array size: it accounts for the patch
-window, `bounding_box`, and the pyramid level actually used, so a crop that admits only one patch
-center scores one patch window rather than its whole array. It is reported per volume in the
-dataset summary, alongside the resulting probability.
-
-| `size_weighting_exponent` | effect |
-| --- | --- |
-| `0.0` (default) | size ignored; probabilities come from `weight` alone |
-| `0.3` – `0.5` | tempered; the usual choice for a corpus spanning orders of magnitude |
-| `1.0` | exactly proportional to reachable content; the largest volumes dominate |
-
-`weight` still applies and multiplies the size term, so per-volume overrides keep working. At the
-default the probabilities are bit-identical to weight-only sampling.
-
-### Multi-scale windows (`sample_windows`)
+### Multi-scale windows
 
 By default all scales share one center, nesting finer patches inside coarser ones. With
 `sample_windows: true` each coarser level instead drops its patch origin uniformly at random among
-the positions that still cover the previous level's patch.
+the positions that still cover the previous level's patch, staying strictly inside any
+`bounding_box`. `resolutions` must then run fine to coarse (non-decreasing voxel size per axis,
+e.g. `[[8,8,8], [16,16,16]]`); a coarser resolution first raises.
 
-```yaml
-sample_windows: true
-```
+## Augmentation
 
-Those sampled origins stay strictly inside any per-volume `bounding_box`. `resolutions` must run
-finest to coarsest (non-decreasing voxel size per axis, e.g. `[[8,8,8], [16,16,16]]`); putting a
-coarser resolution first raises.
+Two composable modules, both used from one `augment_fn`:
 
-## Augmentations
+- [`miao.augment`](src/miao/augment.py) — stochastic augmentations. Pure functions: deterministic
+  given `rng`, tensors in, tensors out, inputs never mutated.
+- [`miao.labels`](src/miao/labels.py) — deterministic label-target transforms.
 
-Two composable ways to augment a sample:
+### Setup
 
-- **[`miao/augment.py`](src/miao/augment.py)** — image augmentations, composed in a
-  callable you pass to `VolumeDataset`.
-- **[`miao/labels.py`](src/miao/labels.py)** — label-target
-  transforms, composed in the same `augment_fn`.
-
-### Custom augmentations (`augment_fn`)
-
-Pass a callable to the dataset, called once per sample as `augment_fn(sample) -> sample`:
+`augment_fn(sample) -> sample` is called once per sample. Pass it to the dataset:
 
 ```python
 import numpy as np
@@ -221,33 +197,117 @@ from miao import VolumeDataset, load_config
 from miao.augment import intensity_jitter, rot90isocube
 
 def augment(sample):
-    rng = np.random  # the global numpy RNG; PyTorch reseeds it per DataLoader worker
-    img, lab = sample["img"], sample["label"]
-    img, lab = rot90isocube(rng, img, lab, pixel_size=sample["pixel_size"])
-    img = intensity_jitter(rng, img)
-    return {**sample, "img": img, "label": lab}
+    rng = np.random # PyTorch reseeds this per DataLoader worker
+    img, lab = rot90isocube(rng, sample["img"], sample["label"], pixel_size=sample["pixel_size"])
+    return {**sample, "img": intensity_jitter(rng, img), "label": lab}
 
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
-Using the `np.random` module keeps multi-worker randomness correct for free; a
-`np.random.default_rng()` Generator closed over from the parent process works too, but
-fork-inherited copies draw identical streams across workers unless you reseed it in a
-`worker_init_fn`. For volumes without labels, skip the empty label sentinel
-(`sample["label"].numel() == 0`) instead of rotating it.
+Or configure it. A bare string names a ready `augment_fn`; a `{factory, kwargs}` mapping names a
+callable that *returns* one, keeping composition in code and the swept parameters diffable across
+configs — see [`examples/config_augment_fn.yaml`](examples/config_augment_fn.yaml):
 
-Available functions (see [`miao/augment.py`](src/miao/augment.py) docstrings for exact behavior):
+```yaml
+augment_fn: myproject.augs.augment_sample     # a ready callable
+```
 
-| Function | Description |
-|---|---|
-| `rot90isocube` | Draws one of the 48 cube symmetries and rotates/flips every tensor passed together, at every scale. Requires a cubic patch and isotropic output resolution. `bbox` and `meta["coordinate"]` are not rotated — they still describe the original read location. |
-| `draw_rot90` / `apply_rot90` | Split draw and apply, for tensors that can't share one `rot90isocube` call — per-level tensors not yet stacked, or spatial dims at different positions. |
-| `intensity_jitter` | Random affine rescale/shift of intensities: `img * U(scale) + U(shift)`. |
-| `percentile_normalize` | Percentile-based rescaling of intensities to [0, 1]. |
+```yaml
+augment_fn:                                   # or a factory plus its parameters
+  factory: miao.augment_std.em_default
+  kwargs:
+    scale: [0.8, 1.2]
+```
 
-`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
-tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
-once and apply the same transform per tensor:
+The config field and the constructor argument are mutually exclusive. A directly passed callable is
+pickled to workers, so it must be a module-level function, `functools.partial`, or class instance;
+a factory instead runs once *inside* each worker and may return anything, closures included.
+`miao.augment_std.em_default` (cube rotation plus intensity jitter) rotates by default — set
+`rotate: false` for anisotropic data. For volumes without labels, skip the empty label sentinel
+(`sample["label"].numel() == 0`) instead of transforming it.
+
+### Functions
+
+Geometric ops take `*tensors` and apply one draw to all of them, so images and labels stay aligned.
+Photometric ops take the image alone. None is gated internally — apply your own probability in the
+closure.
+
+| Function | Applies to | Effect |
+|---|---|---|
+| `rot90isocube(rng, *tensors, spatial_dims, pixel_size)` | image + labels | One of the 48 cube symmetries. Requires a cubic patch and isotropic voxels |
+| `rot90inplane(rng, *tensors, spatial_dims, fixed_axis, pixel_size)` | image + labels | The 16 symmetries that never exchange `fixed_axis`, for anisotropic voxels. Also requires a cubic patch |
+| `shift_sections(rng, *tensors, prob=0.05, magnitude=10)` | image + labels | Offsets whole sections within their own plane, modeling imperfect section alignment |
+| `drop_sections(rng, img, prob=0.05)` | image **only** | Blanks whole sections, modeling lost or unusable ones |
+| `intensity_jitter(rng, img, scale=(0.9, 1.1), shift=(-0.1, 0.1))` | image only | `img * U(*scale) + U(*shift)` |
+| `additive_noise(rng, img, scale=0.1)` | image only | Gaussian noise whose std is drawn per sample from `[0, scale]` |
+| `percentile_normalize(img, lower=1.0, upper=99.0, clamp=True)` | image only | Rescales intensities to `[0, 1]` by the given percentiles. Deterministic, hence no `rng` |
+| `draw_rot90(rng)` / `apply_rot90(t, perm, flips, spatial_dims)` | — | Split the draw from the application, to replay one transform across tensors |
+| `spatial_dims_for(axes)` | — | Derive `spatial_dims` from a layout string |
+
+Both rotations permute spatial axes, so both require a **cubic patch** — a z-thin patch like
+`[8, 32, 32]` raises regardless of which one you use. They differ only in the voxel-size condition:
+`rot90isocube` mixes all three axes and so needs isotropic voxels, while `rot90inplane` needs only
+the two *free* axes to share one, which is what makes it the option for anisotropic data. Forward
+`sample["pixel_size"]` to have the relevant condition asserted per sample, which matters under
+`resolution_sampling`.
+`drop_sections` is deliberately image-only: an object still passes through a lost section, so
+blanking its label would teach the model that a gap is a boundary. Photometric defaults assume
+normalized input (~[0, 1]).
+
+Order geometric first, given both tensors, and photometric last, given only the image:
+
+```python
+img, lab = rot90inplane(rng, img, lab, fixed_axis=0, pixel_size=sample["pixel_size"])
+img, lab = shift_sections(rng, img, lab, prob=0.05, magnitude=10)
+img = drop_sections(rng, img, prob=0.05)
+img = additive_noise(rng, intensity_jitter(rng, img), scale=0.1)
+```
+
+Rotation reorients `img` and `label` only: `bbox` and `meta["coordinate"]` still describe the
+original read location. `pixel_size` stays valid either way, since both ops only exchange axes that
+share a voxel size.
+
+### Axis layouts (`spatial_dims`)
+
+Every geometric op takes `spatial_dims`: the positions of the spatial axes counted from the end,
+listed **in the order they appear in the layout** — `"lcxyz"` gives x, y, z and `"lczyx"` gives
+z, y, x, both `(-3, -2, -1)`. The order matters because everything indexes these slots
+positionally: `apply_rot90` permutes them, `fixed_axis` names one, and `pixel_size` follows the
+same order.
+
+The default `(-3, -2, -1)` is right when `output_axes` puts the spatial axes last (`"lczyx"`,
+`"lcxyz"`) and wrong otherwise: `"lzyxc"` pushes the image's to `(-4, -3, -2)`, while the label,
+carrying no channel axis, keeps `(-3, -2, -1)`. Pass one tuple per tensor when they differ; a
+single tuple still means "the same axes in every tensor". Derive them with `spatial_dims_for`
+rather than hard-coding:
+
+```python
+from miao.augment import rot90inplane, rot90isocube, spatial_dims_for
+
+img, lab = rot90isocube(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for("lzyxc"), spatial_dims_for("lzyx")],   # image, label
+)
+```
+
+`fixed_axis` indexes the same slot ordering, so it too depends on the layout — 0 for `"lczyx"`,
+2 for `"lcxyz"`:
+
+```python
+# Serial-section EM: z is coarser, so it must not be permuted into y or x.
+axes = "lczyx"                                   # the dataset's output_axes
+spatial = [a for a in axes if a in "zyx"]        # -> ['z', 'y', 'x']
+img, lab = rot90inplane(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for(axes), spatial_dims_for(axes.replace("c", ""))],
+    fixed_axis=spatial.index("z"),               # 0 here, 2 for "lcxyz"
+    pixel_size=sample["pixel_size"],
+)
+```
+
+When one call cannot cover everything — per-level tensors that are not stacked yet, say — draw once
+and apply the same transform per tensor. `apply_rot90` is deterministic given `(perm, flips)`, so a
+recorded draw can be replayed later:
 
 ```python
 from miao.augment import apply_rot90, draw_rot90
@@ -257,14 +317,31 @@ levels = [apply_rot90(lvl, perm, flips) for lvl in per_level_tensors]  # same ro
 img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X C layout
 ```
 
-### Label targets (`miao/labels.py`)
+### Randomness
 
-Available functions (see [`miao/labels.py`](src/miao/labels.py) docstrings for exact behavior):
+Draw from the `np.random` module and pass it as `rng`. This is correct with no further work:
+PyTorch reseeds numpy's global RNG in every DataLoader worker (from the loader's base seed and the
+worker id), so streams decorrelate across workers and epochs, and the whole pipeline stays
+reproducible by seeding the loader —
+`DataLoader(..., generator=torch.Generator().manual_seed(0))`.
 
-| Function | Description |
+For a private `np.random.Generator`, where you create it decides whether workers decorrelate:
+
+| Where it is created | Result |
 |---|---|
-| `erode_labels` | Replaces instance borders with background — a `steps`-voxel gap on each side of a touch. |
-| `affinities` | One foreground affinity map per neighbor offset (default nearest-neighbor), stacked as `C Z Y X`. |
+| In a configured factory, seeded from the global: `default_rng(np.random.randint(2**31))` | Independent per worker, reproducible via the loader seed. The factory runs after the per-worker reseeding |
+| In a factory with a fixed seed: `default_rng(0)` | Every worker recreates the same stream — correlated augmentations |
+| Captured in a directly passed callable | The Generator's *state* is cloned to every worker — correlated, and only fixable with a `worker_init_fn` |
+
+### Label targets
+
+| Function | Effect |
+|---|---|
+| `erode_labels(labels, steps=1, only_xy=False)` | Replaces instance borders with background: a `steps`-voxel gap on each side of a touch. `only_xy` compares in-plane neighbors only, for anisotropic data |
+| `affinities(labels, neighborhood=NEAREST_NEIGHBORHOOD)` | One foreground affinity map per neighbor offset, stacked `C Z Y X`; 1.0 where a voxel and its offset neighbor share a non-zero label |
+
+Both take a single `Z Y X` volume, so loop over the scale dim. Compose them after the stochastic
+augmentations — affinity channels are direction-dependent — with `erode_labels` before `affinities`.
 
 ```python
 import torch
@@ -272,54 +349,61 @@ from miao.labels import affinities, erode_labels
 
 def augment(sample):
     # ... geometric / intensity augmentations first ...
-    lab = torch.stack([erode_labels(l) for l in sample["label"]])  # per level; output_axes lzyx
-    aff = torch.stack([affinities(l) for l in lab])                 # L C Z Y X
-    return {**sample, "label": lab, "affinities": aff}
+    lab = torch.stack([erode_labels(l) for l in sample["label"]])   # per scale; output_axes lzyx
+    return {**sample, "label": lab,
+            "affinities": torch.stack([affinities(l) for l in lab])}
 ```
-
-Compose after the stochastic augmentations, since affinity channels are direction-dependent.
 
 ## Configuration reference
 
-### Per-volume fields
-
-| Field | Description |
-|---|---|
-| `name` | Unique name for the volume |
-| `path` | Path to the OME-NGFF zarr container |
-| `image_key` | Group key within the zarr for image data |
-| `zarr_version` | `"zarr2"` or `"zarr3"` (default: `"zarr2"`) |
-| `exp_factor` | Divides the zarr's metadata voxel size to give the effective (pre-expansion) voxel size (default: `1.0`). For expansion microscopy the stored value is the microscope's; `stored / exp_factor` is the specimen's. Applies to image and labels, before level selection. Not needed when the OME metadata already carries a multiscale-level `coordinateTransformations` scale — that is applied automatically — see [Effective voxel sizes](#effective-voxel-sizes) |
-| `label_key` | Optional group key for labels in the same zarr |
-| `weight` | Sampling probability weight (default: equal across volumes). Multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` — see [Size-weighted volume sampling](#size-weighted-volume-sampling) |
-| `resolutions` | Optional per-volume override of the global `resolutions` (same format) |
-| `normalize` | Scale images to [0, 1] by dtype max (default: `true`); `normalize_min` / `normalize_max` set the bounds explicitly |
-| `patch_normalize` | Standardize each sample to zero mean / unit variance after `normalize` (default: `false`). Multi-scale: statistics come from the coarsest crop and apply to all scales |
-| `bounding_box` | Optional `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window, or construction raises |
+Input axes come from OME-NGFF metadata (`multiscales.axes`) and never need specifying; channel
+dimensions are picked up automatically when present. Unknown keys are rejected, so typos fail loudly.
 
 ### Dataset fields
 
-| Field | Description |
-|---|---|
-| `resolutions` | One output resolution tuple per scale; `len()` is the `l` dimension. Mutually exclusive with `resolution_sampling` |
-| `resolution_sampling` | Draw resolutions per sample instead: `{strategy, ranges, n_scales, sort}` — see [above](#random-resolution-sampling). Mutually exclusive with `resolutions` |
-| `output_axes` | Tensor dim order: `l` (levels), optional `c` (channel), spatial dims (e.g. `"lcxyz"`, `"lxyz"`) |
-| `patch_size` | Voxel count per crop, in `output_axes` spatial order |
-| `samples_per_epoch` | Number of samples per epoch |
-| `cache_bytes` | TensorStore cache size in bytes (default: 1 GB) |
-| `bbox_mode` | `"absolute"` world coords (default) or `"relative"` to the finest-level crop origin |
-| `sampling` | `"random"` (default) or `"sequential"` — see [Sampling](#sampling) |
-| `size_weighting_exponent` | Weight volumes by how much data they hold (default: `0.0`, off) — see [Size-weighted volume sampling](#size-weighted-volume-sampling) |
-| `overlap` | Patch overlap in voxels, sequential mode only (default: `0`). Integer or per-axis list |
-| `sample_windows` | Randomize each coarser scale's patch origin (default: `false`) — see [above](#multi-scale-windows-sample_windows) |
+| Field | Default | Description |
+|---|---|---|
+| `volumes` | — | List of volumes; see [below](#per-volume-fields) |
+| `resolutions` | — | Output voxel size per scale, in `output_axes` spatial order; `len()` is `L`. Mutually exclusive with `resolution_sampling` |
+| `resolution_sampling` | — | Draw resolutions per sample instead: `{strategy, ranges, n_scales, sort}` — see [Random resolution sampling](#random-resolution-sampling) |
+| `output_axes` | — | Tensor dim order: `l` (scales, required), optional `c` (channel), spatial `x`/`y`/`z`/`t` — e.g. `"lcxyz"` |
+| `patch_size` | — | Voxel count per crop, in `output_axes` spatial order |
+| `samples_per_epoch` | `1000` | Samples per epoch; ignored in sequential mode |
+| `sampling` | `"random"` | `"random"` or `"sequential"` — see [Sampling](#sampling) |
+| `size_weighting_exponent` | `0.0` | Weight volumes by how much data they hold — see [Random](#random-default) |
+| `overlap` | `0` | Patch overlap in voxels, sequential mode only. Integer or per-axis list; each entry must be `< patch_size` |
+| `sample_windows` | `false` | Randomize each coarser scale's patch origin — see [Multi-scale windows](#multi-scale-windows) |
+| `chunk_aligned` | `false` | Keep random patches inside a single stored chunk, per axis where the chunk is at least patch-sized |
+| `bbox_mode` | `"absolute"` | `bbox` in world coords, or `"relative"` to the finest-level crop center |
+| `image_dtype` | `"float32"` | Output image dtype: `"float32"`, `"bfloat16"` or `"float16"` |
+| `cache_bytes` | `1 << 30` | TensorStore cache size in bytes (1 GB) |
+| `file_io_concurrency` | `64` | Concurrent TensorStore file reads |
+| `augment_fn` | — | Dotted path to an `augment_fn`, or `{factory, kwargs}` — see [Wiring](#wiring) |
 
-Input axes come from OME-NGFF metadata (`multiscales.axes`) and never need specifying; channel
-dimensions are picked up automatically when present.
+### Per-volume fields
 
-## Recipe: 2D image datasets
+| Field | Default | Description |
+|---|---|---|
+| `name` | — | Unique name for the volume |
+| `path` | — | Path to the OME-NGFF zarr container |
+| `image_key` | — | Group key within the zarr for image data |
+| `label_key` | `None` | Optional group key for labels in the same zarr |
+| `zarr_version` | `"zarr2"` | `"zarr2"` or `"zarr3"` |
+| `weight` | `1.0` | Sampling weight; multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` |
+| `exp_factor` | `1.0` | Divides the zarr's metadata voxel size to give the effective one, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
+| `resolutions` / `resolution_sampling` | — | Per-volume override of the global setting; set at most one |
+| `normalize` | `true` | Scale images to [0, 1]: integer dtypes by their max, float dtypes left unchanged |
+| `normalize_min` / `normalize_max` | `None` | Set both to clip to that range and map it linearly to [0, 1] |
+| `patch_normalize` | `false` | Standardize each sample to zero mean / unit variance after `normalize`. Multi-scale: statistics come from the coarsest crop and apply to all scales |
+| `bounding_box` | `None` | `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window |
+
+## Recipe: 2D datasets
 
 2D models are often strong baselines in 3D domains. Build one from three degenerate
-`VolumeDataset`s — `patch_size` `(1,P,P)`, `(P,1,P)`, `(P,P,1)` — glued with `ConcatDataset`.
+`VolumeDataset`s — `patch_size` `(1,P,P)`, `(P,1,P)`, `(P,P,1)` — glued with `ConcatDataset`. Each
+puts its singleton on a different axis, so a shuffled batch mixes shapes and default collate chokes;
+squeeze the thin axis away instead. Runnable:
+[`examples/example_2d.ipynb`](examples/example_2d.ipynb).
 
 <details>
 <summary><b>Show the recipe</b></summary>
@@ -339,15 +423,8 @@ def plane_config(cfg: MiaoConfig, thin_axis: str, size: int) -> MiaoConfig:
     data["samples_per_epoch"] = cfg.samples_per_epoch // len(spatial_order)
     return MiaoConfig(**data)
 
-dataset = ConcatDataset(
-    [VolumeDataset(plane_config(base, ax, P)) for ax in spatial_order]
-)
-```
+dataset = ConcatDataset([VolumeDataset(plane_config(base, ax, P)) for ax in spatial_order])
 
-Each sub-dataset puts its singleton on a different axis, so a shuffled batch mixes shapes and
-default collate chokes. Squeeze the thin axis away instead:
-
-```python
 def make_plane_collate(output_axes: str):
     """Collate 1-voxel-thick samples by squeezing away the singleton spatial axis."""
     img_dim = {c: i for i, c in enumerate(output_axes) if c in "xyzt"}
@@ -379,41 +456,34 @@ loader = DataLoader(dataset, batch_size=8, shuffle=True,
 for batch in loader:
     img = batch["img"]                # (B, L, C, P, P)
     label = batch["label"]            # (B, L, P, P)
-    bbox = batch["bbox"]              # (B, L, 2, Nd_spatial) — still 3D
+    bbox = batch["bbox"]              # (B, L, 2, Nd) — still 3D
     plane = batch["plane"]            # "yz" / "xz" / "xy", one per sample
 ```
 
 `bbox` and `pixel_size` keep their full spatial rank, so a plane's position, orientation and
 physical thickness all survive collation. Index a single scale out with `batch["img"][:, 0]` for a
-`(B, C, H, W)` tensor. Runnable: [`examples/example_2d.ipynb`](examples/example_2d.ipynb).
+`(B, C, H, W)` tensor.
 
-### Caveats
+**Caveats**
 
-- `samples_per_epoch` counts per sub-dataset, so `len(ConcatDataset)` is the sum of three. Set
-  them unequally to bias the orientation mix.
-- Each `VolumeDataset` opens its own TensorStore cache per worker — divide `cache_bytes` by three
-  to hold the footprint constant.
-- `rot90isocube` is out, since it wants a cubic `patch_size`. Flip and transpose the collated
-  planes yourself.
-- Mixing labelled and unlabelled volumes breaks collation: an empty `label` tensor will not stack
-  against a real one.
-- Under `sampling: "sequential"`, a non-zero scalar `overlap` fails validation — it must be
-  smaller than *every* `patch_size` entry, so pass a per-axis list with `0` on the thin axis (the
-  default `overlap: 0` is fine as a scalar). The grid strides one output plane's extent along the
-  normal, which equals one stored plane only when the read count is 1; otherwise planes overlap.
-- The three orientations are not equivalent on anisotropic data: at 4×4×33 nm, an `xy` plane is a
-  stored section while `xz` and `yz` are mostly interpolation along `z`.
-- Nearest-neighbor label resampling takes the *first* plane of a slab, not the middle one. So on a
-  resampled thin axis the label plane comes from a different depth than the image plane, off by up
-  to half a thickness. Read counts resolve from the *label* pyramid independently, so forcing the
-  image count to 1 is not enough — check both. If the two pyramids differ enough, the label plane
-  can fall outside the image slab entirely.
+- `samples_per_epoch` counts per sub-dataset, so `len(ConcatDataset)` is the sum of three. Set them
+  unequally to bias the orientation mix.
+- Each `VolumeDataset` opens its own TensorStore cache per worker — divide `cache_bytes` by three.
+- Both rotations are out, since they want a cubic `patch_size`. Flip and transpose the planes
+  yourself.
+- Mixing labelled and unlabelled volumes breaks collation: an empty `label` will not stack against a
+  real one.
+- Under `sampling: sequential`, `overlap` must be smaller than *every* `patch_size` entry, so pass a
+  per-axis list with `0` on the thin axis.
+- The three orientations are not equivalent on anisotropic data: at 4×4×33 nm an `xy` plane is a
+  stored section, while `xz` and `yz` are mostly interpolation along `z`.
+- Nearest-neighbor label resampling takes the *first* plane of a slab, so on a resampled thin axis
+  the label plane can come from a different depth than the image plane, off by up to half a
+  thickness. Read counts resolve from the *label* pyramid independently, so check both.
 
 </details>
 
 ## Requirements
 
-- Python >= 3.10
-- PyTorch >= 2.0
-- TensorStore >= 0.1.60
+- Python ≥ 3.10, PyTorch ≥ 2.0, TensorStore ≥ 0.1.60
 - Zarr datasets following the [OME-NGFF](https://ngff.openmicroscopy.org/latest/) spec (v2 or v3)
