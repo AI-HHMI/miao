@@ -1,19 +1,19 @@
 volumes:
   - name: "Jiefu Cerebellum FIB-SEM"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/jiefu-cerebellum-fibsem_crop.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-mouse-Jiefu-cerebellum/crop-001.zarr"
     image_key: "raw"
     zarr_version: "zarr3"
-    label_key: "labels/agglom_seg"
+    label_key: "labels/proofread-cell-agglom"
     bounding_box: [[1132, 12109], [1457, 4773], [1197, 5561]]  # [x_min, x_max], [y_min, y_max], [z_min, z_max] (finest-level voxels, output_axes spatial order — like patch_size). Every window's read extent stays strictly inside this box.
     weight: 0.5
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
 
   - name: "H01 Human Cortex"
-    path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
+    path: "/groups/miaai/miaai/lmd-v0.0.1/data/em-human-H01-cortex/crop-001.zarr"
     image_key: "raw"
     zarr_version: "zarr3"
     weight: 0.5
-    label_key: "labels/c3_seg"
+    label_key: "labels/auto_pred-cells-c3_seg"
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
     # Optionally override the global resolutions for a single volume:
     # resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
