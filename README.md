@@ -187,7 +187,7 @@ Two composable modules, both used from one `augment_fn`:
   given `rng`, tensors in, tensors out, inputs never mutated.
 - [`miao.labels`](src/miao/labels.py) — deterministic label-target transforms.
 
-### Wiring
+### Setup
 
 `augment_fn(sample) -> sample` is called once per sample. Pass it to the dataset:
 
@@ -197,9 +197,8 @@ from miao import VolumeDataset, load_config
 from miao.augment import intensity_jitter, rot90isocube
 
 def augment(sample):
-    rng = np.random                        # PyTorch reseeds this per DataLoader worker
-    img, lab = rot90isocube(rng, sample["img"], sample["label"],
-                            pixel_size=sample["pixel_size"])
+    rng = np.random # PyTorch reseeds this per DataLoader worker
+    img, lab = rot90isocube(rng, sample["img"], sample["label"], pixel_size=sample["pixel_size"])
     return {**sample, "img": intensity_jitter(rng, img), "label": lab}
 
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
