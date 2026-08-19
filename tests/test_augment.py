@@ -7,16 +7,18 @@ import pytest
 import torch
 
 from miao.augment import (
-    spatial_dims_for,
+    _QUANTILE_MAX_ELEMENTS,
     _SPATIAL_PERMS,
     additive_noise,
     apply_rot90,
     draw_rot90,
     drop_sections,
     intensity_jitter,
+    percentile_normalize,
     rot90inplane,
     rot90isocube,
     shift_sections,
+    spatial_dims_for,
 )
 from miao.augment_std import em_default
 from miao.config import MiaoConfig, load_config
@@ -210,6 +212,99 @@ class TestIntensityJitter:
         img = torch.ones(4, 4, 4)
         intensity_jitter(np.random.default_rng(0), img)
         assert torch.equal(img, torch.ones(4, 4, 4))
+
+
+class TestPercentileNormalize:
+    """Deterministic percentile scaling to ~[0, 1] (no RNG)."""
+
+    def test_full_range_maps_to_unit_interval(self):
+        img = torch.linspace(-5.0, 37.0, 4 * 4 * 4).reshape(4, 4, 4)
+        out = percentile_normalize(img, lower=0.0, upper=100.0)
+        assert torch.allclose(out.min(), torch.tensor(0.0), atol=1e-6)
+        assert torch.allclose(out.max(), torch.tensor(1.0), atol=1e-6)
+
+    def test_matches_numpy_percentile_oracle(self):
+        # torch.quantile's default linear interpolation matches np.percentile's.
+        img = torch.from_numpy(np.random.default_rng(0).normal(100.0, 20.0, (6, 6, 6))).float()
+        x = img.numpy()
+        lo, hi = np.percentile(x, 1.0), np.percentile(x, 99.0)
+        expected = (x - lo) / (hi - lo)
+        out = percentile_normalize(img)
+        assert np.allclose(out.numpy(), np.clip(expected, 0.0, 1.0), atol=1e-5)
+        out_unclamped = percentile_normalize(img, clamp=False)
+        assert np.allclose(out_unclamped.numpy(), expected, atol=1e-5)
+
+    def test_clamp_default_bounds_output(self):
+        # With 1/99 percentiles the tails fall outside the range and get clipped by default.
+        img = torch.from_numpy(np.random.default_rng(1).normal(0.0, 1.0, (8, 8, 8))).float()
+        out = percentile_normalize(img)
+        assert out.min() == 0.0
+        assert out.max() == 1.0
+
+    def test_clamp_false_leaves_tails_outside_unit_interval(self):
+        img = torch.from_numpy(np.random.default_rng(1).normal(0.0, 1.0, (8, 8, 8))).float()
+        out = percentile_normalize(img, clamp=False)
+        assert out.min() < 0.0
+        assert out.max() > 1.0
+
+    def test_integer_input_promoted_to_float32(self):
+        img = torch.arange(4 * 4 * 4, dtype=torch.uint8).reshape(4, 4, 4)
+        out = percentile_normalize(img)
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+
+    def test_float64_input_demoted_to_float32(self):
+        # A [0, 1] result has no use for the extra range, so float64 does not round-trip back.
+        img = torch.linspace(0.0, 9.0, 4 * 4 * 4, dtype=torch.float64).reshape(4, 4, 4)
+        out = percentile_normalize(img)
+        assert out.dtype == torch.float32
+
+    def test_constant_image_is_finite(self):
+        out = percentile_normalize(torch.full((4, 4, 4), 7.0))
+        assert torch.equal(out, torch.zeros(4, 4, 4))
+
+    def test_input_not_mutated(self):
+        img = torch.linspace(0.0, 9.0, 4 * 4 * 4).reshape(4, 4, 4)
+        original = img.clone()
+        percentile_normalize(img)
+        assert torch.equal(img, original)
+
+    def test_bad_percentile_order_asserts(self):
+        img = torch.ones(4, 4, 4)
+        for lower, upper in ((99.0, 1.0), (50.0, 50.0), (-1.0, 99.0), (1.0, 101.0)):
+            with pytest.raises(AssertionError, match="lower < upper"):
+                percentile_normalize(img, lower=lower, upper=upper)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_half_dtype_input_round_trips_back_to_its_own_dtype(self, dtype):
+        # torch.quantile rejects half dtypes even though img.is_floating_point() is True for them,
+        # so they are cast up for it -- but a reduced-precision pipeline gets its dtype back.
+        img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4).to(dtype)
+        out = percentile_normalize(img)
+        assert out.dtype == dtype
+        assert torch.isfinite(out).all()
+        assert torch.allclose(
+            out.float(), percentile_normalize(img.float()), atol=1e-2
+        )
+
+    def test_oversized_tensor_falls_back_to_subsample(self):
+        # torch.quantile refuses inputs above _QUANTILE_MAX_ELEMENTS; a stacked multi-scale
+        # sample can easily exceed it even though a single level fits.
+        img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)
+        out = percentile_normalize(img)
+        assert torch.isfinite(out).all()
+
+    def test_nonpositive_sample_size_asserts(self):
+        # An empty subsample would reach torch.quantile and raise a bare RuntimeError instead.
+        for sample_size in (0, -1):
+            with pytest.raises(AssertionError, match="sample_size"):
+                percentile_normalize(torch.ones(4, 4, 4), sample_size=sample_size)
+
+    def test_oversized_tensor_subsample_estimate_is_deterministic(self):
+        img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)
+        first = percentile_normalize(img)
+        second = percentile_normalize(img)
+        assert torch.equal(first, second)
 
 
 def _sequential_cfg(zarr2_volume, resolutions=None, augment_fn=None):

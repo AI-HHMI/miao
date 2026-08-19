@@ -332,3 +332,56 @@ def additive_noise(
         img.shape, generator=generator, dtype=img.dtype, device=img.device
     )
     return img + noise * (rng.random() * scale)
+
+
+# torch.quantile refuses inputs with more elements than this (a single 256**3 multi-scale level
+# already hits it exactly), so larger tensors estimate percentiles from a subsample instead.
+_QUANTILE_MAX_ELEMENTS = 2**24
+
+# Floating-point dtypes torch.quantile does not accept, so they round-trip through float32.
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def percentile_normalize(
+    img: torch.Tensor,
+    lower: float = 1.0,
+    upper: float = 99.0,
+    clamp: bool = True,
+    sample_size: int = 10_000,
+) -> torch.Tensor:
+    """Normalize intensities to [0, 1] via percentiles: ``(img - p_lower) / (p_upper - p_lower)``.
+
+    Percentiles are computed over the whole tensor (a multi-scale ``L Z Y X`` sample pools all
+    levels, keeping them on a common intensity scale) — except above ``torch.quantile``'s
+    2**24-element limit, where ``p_lower``/``p_upper`` are instead estimated from ``sample_size``
+    values drawn uniformly at random. With ``clamp`` (the default) values outside the percentile range are
+    clipped to [0, 1]; ``clamp=False`` leaves them outside. Deterministic, hence no ``rng``.
+
+    The arithmetic runs in float32 whatever comes in. float16/bfloat16 — which ``torch.quantile``
+    rejects despite their being floating-point — are cast up for it and back down on return, so a
+    reduced-precision pipeline keeps the dtype it handed in. The two dtypes with nowhere sensible
+    to return to keep float32: integer input is promoted to it, and float64 demoted, a [0, 1]
+    result having no use for the extra range or precision. A constant image maps to all zeros.
+    """
+    assert 0.0 <= lower < upper <= 100.0, (
+        f"percentiles must satisfy 0 <= lower < upper <= 100, got lower={lower}, upper={upper}."
+    )
+    assert sample_size > 0, (
+        f"sample_size is the number of values drawn to estimate the percentiles of an oversized "
+        f"tensor, so it must be >= 1, got {sample_size}; 0 would hand torch.quantile an empty "
+        f"tensor, which raises a bare RuntimeError."
+    )
+    x = img.float()
+    flat = x.reshape(-1)
+    if flat.numel() > _QUANTILE_MAX_ELEMENTS:
+        idx = torch.randint(
+            flat.numel(), (sample_size,), generator=torch.Generator().manual_seed(0)
+        )
+        flat = flat[idx.to(flat.device)]
+    lo = torch.quantile(flat, lower / 100.0)
+    hi = torch.quantile(flat, upper / 100.0)
+    # clamp_min guards the constant-image case (hi == lo) without mutating anything shared.
+    out = (x - lo) / (hi - lo).clamp_min(1e-8)
+    # clamp_ mutates only the fresh quotient above, so the input stays unmutated.
+    out = out.clamp_(0.0, 1.0) if clamp else out
+    return out.to(img.dtype) if img.dtype in _HALF_DTYPES else out
