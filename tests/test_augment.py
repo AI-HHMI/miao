@@ -247,11 +247,17 @@ class TestPercentileNormalize:
         assert out.min() < 0.0
         assert out.max() > 1.0
 
-    def test_integer_input_promoted_to_float(self):
+    def test_integer_input_promoted_to_float32(self):
         img = torch.arange(4 * 4 * 4, dtype=torch.uint8).reshape(4, 4, 4)
         out = percentile_normalize(img)
-        assert out.is_floating_point()
+        assert out.dtype == torch.float32
         assert torch.isfinite(out).all()
+
+    def test_float64_input_demoted_to_float32(self):
+        # A [0, 1] result has no use for the extra range, so float64 does not round-trip back.
+        img = torch.linspace(0.0, 9.0, 4 * 4 * 4, dtype=torch.float64).reshape(4, 4, 4)
+        out = percentile_normalize(img)
+        assert out.dtype == torch.float32
 
     def test_constant_image_is_finite(self):
         out = percentile_normalize(torch.full((4, 4, 4), 7.0))
@@ -270,12 +276,16 @@ class TestPercentileNormalize:
                 percentile_normalize(img, lower=lower, upper=upper)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_half_dtype_input_does_not_crash(self, dtype):
-        # torch.quantile rejects half dtypes even though img.is_floating_point() is True for them.
+    def test_half_dtype_input_round_trips_back_to_its_own_dtype(self, dtype):
+        # torch.quantile rejects half dtypes even though img.is_floating_point() is True for them,
+        # so they are cast up for it -- but a reduced-precision pipeline gets its dtype back.
         img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4).to(dtype)
         out = percentile_normalize(img)
-        assert out.dtype == torch.float32
+        assert out.dtype == dtype
         assert torch.isfinite(out).all()
+        assert torch.allclose(
+            out.float(), percentile_normalize(img.float()), atol=1e-2
+        )
 
     def test_oversized_tensor_falls_back_to_subsample(self):
         # torch.quantile refuses inputs above _QUANTILE_MAX_ELEMENTS; a stacked multi-scale
@@ -283,6 +293,12 @@ class TestPercentileNormalize:
         img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)
         out = percentile_normalize(img)
         assert torch.isfinite(out).all()
+
+    def test_nonpositive_sample_size_asserts(self):
+        # An empty subsample would reach torch.quantile and raise a bare RuntimeError instead.
+        for sample_size in (0, -1):
+            with pytest.raises(AssertionError, match="sample_size"):
+                percentile_normalize(torch.ones(4, 4, 4), sample_size=sample_size)
 
     def test_oversized_tensor_subsample_estimate_is_deterministic(self):
         img = torch.rand(_QUANTILE_MAX_ELEMENTS + 1)

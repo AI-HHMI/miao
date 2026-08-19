@@ -338,6 +338,9 @@ def additive_noise(
 # already hits it exactly), so larger tensors estimate percentiles from a subsample instead.
 _QUANTILE_MAX_ELEMENTS = 2**24
 
+# Floating-point dtypes torch.quantile does not accept, so they round-trip through float32.
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+
 
 def percentile_normalize(
     img: torch.Tensor,
@@ -355,12 +358,20 @@ def percentile_normalize(
     given ``img``; a strided subsample was considered but risks aliasing against periodic
     structure in the data). With ``clamp`` (the default) values outside the percentile range are
     clipped to [0, 1]; ``clamp=False`` leaves them outside. Deterministic, hence no ``rng``.
-    Non-float32 inputs — integer, float64, and float16/bfloat16 (unsupported by
-    ``torch.quantile`` despite being floating-point) — are promoted to float32. A constant image
-    maps to all zeros.
+
+    The arithmetic runs in float32 whatever comes in. float16/bfloat16 — which ``torch.quantile``
+    rejects despite their being floating-point — are cast up for it and back down on return, so a
+    reduced-precision pipeline keeps the dtype it handed in. The two dtypes with nowhere sensible
+    to return to keep float32: integer input is promoted to it, and float64 demoted, a [0, 1]
+    result having no use for the extra range or precision. A constant image maps to all zeros.
     """
     assert 0.0 <= lower < upper <= 100.0, (
         f"percentiles must satisfy 0 <= lower < upper <= 100, got lower={lower}, upper={upper}."
+    )
+    assert sample_size > 0, (
+        f"sample_size is the number of values drawn to estimate the percentiles of an oversized "
+        f"tensor, so it must be >= 1, got {sample_size}; 0 would hand torch.quantile an empty "
+        f"tensor, which raises a bare RuntimeError."
     )
     x = img.float()
     flat = x.reshape(-1)
@@ -374,4 +385,5 @@ def percentile_normalize(
     # clamp_min guards the constant-image case (hi == lo) without mutating anything shared.
     out = (x - lo) / (hi - lo).clamp_min(1e-8)
     # clamp_ mutates only the fresh quotient above, so the input stays unmutated.
-    return out.clamp_(0.0, 1.0) if clamp else out
+    out = out.clamp_(0.0, 1.0) if clamp else out
+    return out.to(img.dtype) if img.dtype in _HALF_DTYPES else out
