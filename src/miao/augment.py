@@ -354,9 +354,7 @@ def percentile_normalize(
     Percentiles are computed over the whole tensor (a multi-scale ``L Z Y X`` sample pools all
     levels, keeping them on a common intensity scale) — except above ``torch.quantile``'s
     2**24-element limit, where ``p_lower``/``p_upper`` are instead estimated from ``sample_size``
-    values drawn uniformly at random (a fixed-seed generator, so the estimate stays deterministic
-    given ``img``; a strided subsample was considered but risks aliasing against periodic
-    structure in the data). With ``clamp`` (the default) values outside the percentile range are
+    values drawn uniformly at random. With ``clamp`` (the default) values outside the percentile range are
     clipped to [0, 1]; ``clamp=False`` leaves them outside. Deterministic, hence no ``rng``.
 
     The arithmetic runs in float32 whatever comes in. float16/bfloat16 — which ``torch.quantile``

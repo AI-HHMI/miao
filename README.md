@@ -240,7 +240,7 @@ closure.
 | `drop_sections(rng, img, prob=0.05)` | image **only** | Blanks whole sections, modeling lost or unusable ones |
 | `intensity_jitter(rng, img, scale=(0.9, 1.1), shift=(-0.1, 0.1))` | image only | `img * U(*scale) + U(*shift)` |
 | `additive_noise(rng, img, scale=0.1)` | image only | Gaussian noise whose std is drawn per sample from `[0, scale]` |
-| `percentile_normalize(img, lower=1.0, upper=99.0, clamp=True)` | image only | Rescales intensities to `[0, 1]` by the given percentiles. Deterministic, hence no `rng` |
+| `percentile_normalize(img, lower=1.0, upper=99.0, clamp=True)` | image only | Rescales intensities to `[0, 1]` by the given percentiles. |
 | `draw_rot90(rng)` / `apply_rot90(t, perm, flips, spatial_dims)` | — | Split the draw from the application, to replay one transform across tensors |
 | `spatial_dims_for(axes)` | — | Derive `spatial_dims` from a layout string |
 
