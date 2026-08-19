@@ -298,11 +298,63 @@ resolution each call; use isotropic single-value bounds).
 > **Note:** rotation reorients `img` and `label` only. `bbox` and `meta["coordinate"]` still
 > describe the original read location; `pixel_size` is isotropic by construction, so unaffected.
 
+### `rot90inplane`
+
+The subgroup for **anisotropic** data, where `rot90isocube` cannot apply. `fixed_axis` names the
+slot in `spatial_dims` that is never exchanged (typically the sectioning axis), leaving the 8
+rotations times the one swap of the two free axes, so 16 of the 48 symmetries. Only the two free
+axes need a shared voxel size, which is what `pixel_size` asserts.
+
+`fixed_axis` is a slot index, so it depends on where z sits in the spatial layout: *e.g.* 0 for `"lczyx"`, 2
+for `"lcxyz"`. Derive it rather than hard-code it:
+
+```python
+from miao.augment import rot90inplane, spatial_dims_for
+
+# Serial-section EM: z is coarser, so it must not be permuted into y or x.
+axes = "lczyx"                                   # the dataset's output_axes
+spatial = [a for a in axes if a in "zyx"]        # -> ['z', 'y', 'x']
+img, lab = rot90inplane(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for(axes), spatial_dims_for(axes.replace("c", ""))],
+    fixed_axis=spatial.index("z"),               # 0 here, 2 for "lcxyz"
+    pixel_size=sample["pixel_size"],
+)
+```
+
+Exchanging axes of unequal voxel size would relabel a 5-unit neighbour relationship as a 1-unit
+one, producing object shapes that do not occur in the data. Passing isotropic data is fine and
+simply yields a subgroup of the full 48.
+
+### Mixed axis layouts (`spatial_dims`)
+
+Every geometric augmentation takes `spatial_dims`, the positions of the spatial axes counted from
+the end, listed in the order they appear in the layout, *e.g.* `"lcxyz"` gives x, y, z and `"lczyx"`
+gives z, y, x, both `(-3, -2, -1)`. The order matters because everything indexes these slots
+positionally: `apply_rot90` permutes slots, `rot90inplane`'s `fixed_axis` names one, and
+`pixel_size` follows the same `output_axes` order.
+
+The default `(-3, -2, -1)` is right when `output_axes` puts the spatial axes last (`"lczyx"`,
+`"lcxyz"`), but wrong otherwise: *e.g.* `"lzyxc"` pushes the image's to `(-4, -3, -2)`, while the
+label, carrying no channel axis, keeps `(-3, -2, -1)`.
+
+Pass one tuple per tensor when they differ; a single tuple still means "the same axes in every
+tensor". `spatial_dims_for` derives it from a layout string:
+
+```python
+from miao.augment import rot90isocube, spatial_dims_for
+
+img, lab = rot90isocube(
+    rng, img, lab,
+    spatial_dims=[spatial_dims_for("lzyxc"), spatial_dims_for("lzyx")],   # image, label
+)
+```
+
 ### `draw_rot90` + `apply_rot90`
 
-`rot90isocube` draws and applies in one call. When one call can't cover everything — per-level
-tensors that aren't stacked yet, or tensors whose spatial dims sit at different positions — draw
-once and apply the same transform per tensor:
+`rot90isocube` draws and applies in one call, including for tensors whose spatial dims sit at
+different positions (see above). When one call still can't cover everything, *e.g.* per-level 
+tensors that aren't stacked yet, draw once and apply the same transform per tensor:
 
 ```python
 from miao.augment import apply_rot90, draw_rot90
@@ -312,8 +364,35 @@ levels = [apply_rot90(lvl, perm, flips) for lvl in per_level_tensors]  # same ro
 img = apply_rot90(img, perm, flips, spatial_dims=(-4, -3, -2))         # L Z Y X C layout
 ```
 
-`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later —
-e.g. to apply the identical rotation to tensors produced further down the pipeline.
+`apply_rot90` is deterministic given `(perm, flips)`, so a recorded draw can be replayed later,
+*e.g.* to apply the identical rotation to tensors produced further down the pipeline.
+
+### Section augmentations + generic photometric augmentations
+
+Four data augmentations modeling serial-section EM and generic photometric variation are available. None is gated
+internally (apply your own probability in the closure).
+
+| Function | Applies to | Effect |
+|---|---|---|
+| `shift_sections(rng, *tensors, prob, magnitude)` | image **and** labels | Offsets whole sections within their own plane, modeling imperfect alignment between separately imaged sections. |
+| `drop_sections(rng, img, prob)` | image **only** | Blanks whole sections with given probability, modeling lost or unusable sections. |
+| `intensity_jitter(rng, img, scale, shift)` | image **only** | Per-sample intensity jitter: `img * U(*scale) + U(*shift)`. |
+| `additive_noise(rng, img, scale)` | image **only** | Per-voxel additive Gaussian noise with std drawn uniformly from `[0, scale]` for each sample. |
+
+Each augmentation draws one axis (or one transform) per call and applies it to every tensor passed, so
+`shift_sections` keeps image and labels registered. `drop_sections` is deliberately image-only:
+an object still passes through a lost section, so blanking its label would mistakenly teach the model that a
+gap is a boundary.
+
+```python
+img, lab = rot90inplane(rng, img, lab, fixed_axis=0, pixel_size=sample["pixel_size"])
+img, lab = shift_sections(rng, img, lab, prob=0.05, magnitude=10)
+img = drop_sections(rng, img, prob=0.05)
+img = additive_noise(rng, intensity_jitter(rng, img), scale=0.1)
+```
+
+Geometric operations first and given both tensors; photometric ones last and given only the
+image. `scale`/`shift`/`magnitude` defaults assume normalized input (~[0, 1]).
 
 ### Label targets (`miao/labels.py`)
 

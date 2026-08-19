@@ -6,7 +6,18 @@ import numpy as np
 import pytest
 import torch
 
-from miao.augment import _SPATIAL_PERMS, apply_rot90, draw_rot90, intensity_jitter, rot90isocube
+from miao.augment import (
+    spatial_dims_for,
+    _SPATIAL_PERMS,
+    additive_noise,
+    apply_rot90,
+    draw_rot90,
+    drop_sections,
+    intensity_jitter,
+    rot90inplane,
+    rot90isocube,
+    shift_sections,
+)
 from miao.augment_std import em_default
 from miao.config import MiaoConfig, load_config
 from miao.dataset import VolumeDataset
@@ -467,3 +478,436 @@ sampling: sequential
 
         with pytest.raises((AttributeError, pickle.PicklingError)):
             pickle.dumps(_closure_factory())
+
+
+class TestRot90InPlane:
+    """The 16-transform subgroup that never exchanges the anisotropic axis."""
+
+    def test_fixed_axis_is_never_exchanged(self):
+        """The property the whole function exists for.
+
+        The volume varies along the fixed axis alone, so if that axis were ever permuted into a
+        free slot the variation would move with it. A flip along it is allowed and leaves the
+        variation where it is.
+        """
+        img = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1).expand(6, 6, 6).contiguous()
+        rng = np.random.default_rng(0)
+        for _ in range(64):
+            (out,) = rot90inplane(rng, img, fixed_axis=0)
+            varies_within_section = out.reshape(6, -1).std(dim=1)
+            assert torch.allclose(varies_within_section, torch.zeros(6), atol=1e-6), (
+                "values varied inside a section, so the fixed axis was permuted away"
+            )
+
+    def test_offers_exactly_sixteen_transforms(self):
+        """8 per-axis flips times the single swap of the two free axes."""
+        img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4)
+        rng = np.random.default_rng(0)
+        seen = {rot90inplane(rng, img, fixed_axis=0)[0].numpy().tobytes() for _ in range(2000)}
+        assert len(seen) == 16
+
+    def test_is_a_subgroup_of_the_full_forty_eight(self):
+        img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4)
+        rng = np.random.default_rng(1)
+        inplane = {rot90inplane(rng, img, fixed_axis=0)[0].numpy().tobytes() for _ in range(2000)}
+        every = {
+            apply_rot90(img, perm, flips).numpy().tobytes()
+            for perm in _SPATIAL_PERMS
+            for flips in [(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+        }
+        assert inplane <= every
+
+    @pytest.mark.parametrize("fixed_axis", [0, 1, 2])
+    def test_any_slot_can_be_the_fixed_one(self, fixed_axis):
+        shape = [1, 1, 1]
+        shape[fixed_axis] = 6
+        img = torch.arange(6, dtype=torch.float32).reshape(shape).expand(6, 6, 6).contiguous()
+        rng = np.random.default_rng(0)
+        for _ in range(32):
+            (out,) = rot90inplane(rng, img, fixed_axis=fixed_axis)
+            spread = out.movedim(fixed_axis, 0).reshape(6, -1).std(dim=1)
+            assert torch.allclose(spread, torch.zeros(6), atol=1e-6)
+
+    def test_anisotropy_on_the_fixed_axis_is_allowed(self):
+        """The weaker condition this subgroup needs, and the reason it exists."""
+        img = torch.zeros(4, 4, 4)
+        rot90inplane(np.random.default_rng(0), img, fixed_axis=2, pixel_size=[9.0, 9.0, 20.0])
+
+    def test_anisotropy_between_the_free_axes_is_rejected(self):
+        img = torch.zeros(4, 4, 4)
+        with pytest.raises(AssertionError, match="share a voxel size"):
+            rot90inplane(np.random.default_rng(0), img, fixed_axis=2, pixel_size=[9.0, 11.0, 20.0])
+
+    def test_image_and_label_share_the_transform(self):
+        data = torch.arange(4 * 4 * 4).reshape(4, 4, 4)
+        for i in range(10):
+            img, lbl = rot90inplane(np.random.default_rng(i), data.float(), data.clone())
+            assert torch.equal(img, lbl.float())
+
+    def test_deterministic_given_rng(self):
+        img = torch.arange(4 * 4 * 4, dtype=torch.float32).reshape(4, 4, 4)
+        (a,) = rot90inplane(np.random.default_rng(3), img)
+        (b,) = rot90inplane(np.random.default_rng(3), img)
+        assert torch.equal(a, b)
+
+
+class TestDropSections:
+    """Whole blanked sections, image only."""
+
+    def test_dropped_sections_are_entirely_blank(self):
+        img = torch.ones(8, 8, 8)
+        out = drop_sections(np.random.default_rng(0), img, prob=0.5)
+        per_section = [out.movedim(d, 0).reshape(8, -1) for d in range(3)]
+        assert any(
+            all(float(s[i].max()) in (0.0, 1.0) and float(s[i].min()) == float(s[i].max())
+                for i in range(8))
+            for s in per_section
+        ), "a drop must blank a whole section, not part of one"
+
+    def test_certain_probability_blanks_everything(self):
+        out = drop_sections(np.random.default_rng(0), torch.ones(4, 4, 4), prob=1.0)
+        assert torch.equal(out, torch.zeros(4, 4, 4))
+
+    def test_zero_probability_is_the_identity(self):
+        img = torch.rand(4, 4, 4)
+        assert torch.equal(drop_sections(np.random.default_rng(0), img, prob=0.0), img)
+
+    def test_does_not_mutate_its_input(self):
+        img = torch.ones(8, 8, 8)
+        before = img.clone()
+        drop_sections(np.random.default_rng(0), img, prob=0.9)
+        assert torch.equal(img, before)
+
+    def test_deterministic_given_rng(self):
+        img = torch.rand(6, 6, 6)
+        a = drop_sections(np.random.default_rng(5), img, prob=0.4)
+        b = drop_sections(np.random.default_rng(5), img, prob=0.4)
+        assert torch.equal(a, b)
+
+
+class TestShiftSections:
+    """Misaligned sections, image and labels together."""
+
+    def test_image_and_label_receive_the_same_shift(self):
+        """The divergence from the reference recipes: alignment is preserved, not broken."""
+        data = torch.arange(8 * 8 * 8).reshape(8, 8, 8)
+        img, lbl = shift_sections(
+            np.random.default_rng(0), data.float(), data.clone(), prob=1.0, magnitude=3
+        )
+        assert torch.equal(img, lbl.float())
+
+    def test_shape_and_values_are_preserved(self):
+        """A roll is a bijection, so no voxel is created or destroyed."""
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(8, 8, 8)
+        (out,) = shift_sections(np.random.default_rng(0), img, prob=1.0, magnitude=3)
+        assert out.shape == img.shape
+        assert torch.equal(torch.sort(out.flatten()).values, torch.sort(img.flatten()).values)
+
+    def test_zero_magnitude_is_the_identity(self):
+        img = torch.rand(4, 4, 4)
+        (out,) = shift_sections(np.random.default_rng(0), img, prob=1.0, magnitude=0)
+        assert torch.equal(out, img)
+
+    def test_does_not_mutate_its_input(self):
+        img = torch.arange(8 * 8 * 8, dtype=torch.float32).reshape(8, 8, 8)
+        before = img.clone()
+        shift_sections(np.random.default_rng(0), img, prob=1.0, magnitude=3)
+        assert torch.equal(img, before)
+
+    def test_deterministic_given_rng(self):
+        img = torch.rand(6, 6, 6)
+        (a,) = shift_sections(np.random.default_rng(2), img, prob=0.5, magnitude=2)
+        (b,) = shift_sections(np.random.default_rng(2), img, prob=0.5, magnitude=2)
+        assert torch.equal(a, b)
+
+
+class TestAdditiveNoise:
+    """Zero-mean Gaussian noise at a randomly drawn deviation."""
+
+    def test_shape_and_dtype_survive(self):
+        img = torch.rand(4, 4, 4)
+        out = additive_noise(np.random.default_rng(0), img, scale=0.5)
+        assert out.shape == img.shape and out.dtype == img.dtype
+
+    def test_zero_scale_is_the_identity(self):
+        img = torch.rand(4, 4, 4)
+        assert torch.equal(additive_noise(np.random.default_rng(0), img, scale=0.0), img)
+
+    def test_noise_is_zero_mean_and_bounded_by_the_scale(self):
+        img = torch.zeros(64, 64, 64)
+        out = additive_noise(np.random.default_rng(0), img, scale=0.5)
+        assert abs(float(out.mean())) < 0.01
+        assert float(out.std()) <= 0.5 + 1e-3, "the drawn deviation must not exceed `scale`"
+
+    def test_does_not_mutate_its_input(self):
+        img = torch.rand(8, 8, 8)
+        before = img.clone()
+        additive_noise(np.random.default_rng(0), img, scale=0.5)
+        assert torch.equal(img, before)
+
+    def test_deterministic_given_rng(self):
+        img = torch.rand(6, 6, 6)
+        a = additive_noise(np.random.default_rng(4), img, scale=0.3)
+        b = additive_noise(np.random.default_rng(4), img, scale=0.3)
+        assert torch.equal(a, b)
+
+
+class TestSerialSectionRecipeIntegration:
+    """The serial-section EM recipe, composed through the dataset the way a trainer would."""
+
+    def _aniso_cfg(self, path):
+        return MiaoConfig(
+            volumes=[{"name": "v", "path": str(path), "image_key": "raw"}],
+            resolutions=[[5, 1, 1]],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+
+    def _iso_cfg(self, path):
+        return MiaoConfig(
+            volumes=[{
+                "name": "v", "path": str(path),
+                "image_key": "raw", "label_key": "labels/seg",
+            }],
+            resolutions=[[1, 1, 1]],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+        )
+
+    def test_inplane_serves_the_data_isocube_refuses(self, zarr2_volume_anisotropic: Path):
+        """Why this subgroup exists, stated as a contrast on one volume.
+
+        At [5, 1, 1] the sectioning axis is 5x coarser than the in-plane ones. Exchanging it with
+        y or x would relabel a 5-unit neighbour relationship as a 1-unit one, so `rot90isocube`
+        refuses; `rot90inplane` keeps the 16 transforms that never touch it and proceeds.
+        """
+        def with_isocube(sample):
+            (img,) = rot90isocube(
+                np.random.default_rng(0), sample["img"], pixel_size=sample["pixel_size"]
+            )
+            return {**sample, "img": img}
+
+        def with_inplane(sample):
+            (img,) = rot90inplane(
+                np.random.default_rng(0), sample["img"],
+                fixed_axis=0, pixel_size=sample["pixel_size"],
+            )
+            return {**sample, "img": img}
+
+        cfg = self._aniso_cfg(zarr2_volume_anisotropic)
+        with pytest.raises(AssertionError, match="isotropic output resolution"):
+            VolumeDataset(cfg, augment_fn=with_isocube)[0]
+
+        out = VolumeDataset(cfg, augment_fn=with_inplane)[0]
+        assert out["img"].shape == VolumeDataset(cfg)[0]["img"].shape
+
+    def test_the_whole_recipe_composes_and_keeps_labels_aligned(self, zarr2_volume: Path):
+        """All five operations in one closure, which is how a trainer would use them.
+
+        Ordering is the part worth pinning: the geometric operations come first and receive both
+        tensors, and the photometric ones come last and receive only the image. `drop_sections`
+        sits with the photometric group on purpose -- an object still passes through a lost
+        section, so its label must survive the blanking.
+        """
+        rng = np.random.default_rng(0)
+
+        def augment(sample):
+            img, label = rot90inplane(
+                rng, sample["img"], sample["label"],
+                fixed_axis=0, pixel_size=sample["pixel_size"],
+            )
+            img, label = shift_sections(rng, img, label, prob=0.3, magnitude=2)
+            img = drop_sections(rng, img, prob=0.2)
+            img = intensity_jitter(rng, img)
+            img = additive_noise(rng, img, scale=0.1)
+            return {**sample, "img": img, "label": label}
+
+        cfg = self._iso_cfg(zarr2_volume)
+        plain, aug = VolumeDataset(cfg)[0], VolumeDataset(cfg, augment_fn=augment)[0]
+
+        assert aug["img"].shape == plain["img"].shape
+        assert aug["label"].shape == plain["label"].shape
+        # The label went through the geometric operations only, so it is a rearrangement of the
+        # original: same voxel multiset. The image is not, having been jittered and noised.
+        assert torch.equal(
+            torch.sort(aug["label"].flatten()).values,
+            torch.sort(plain["label"].flatten()).values,
+        )
+        assert not torch.allclose(
+            torch.sort(aug["img"].flatten()).values,
+            torch.sort(plain["img"].flatten()).values,
+        )
+
+
+class TestMixedLayouts:
+    """Tensors handed to one call need not share an axis layout.
+
+    `output_axes` is a config field, and only some of its values put the spatial axes last. A
+    label carries no channel axis, so under `"lzyxc"` the image's z/y/x sit at (-4, -3, -2) while
+    the label's sit at (-3, -2, -1). Every geometric augmentation therefore has to be told each
+    tensor's axes separately; assuming one layout for both moved them apart silently, which is the
+    worst available failure -- no exception, just targets that no longer describe the image.
+    """
+
+    @staticmethod
+    def _pair(axes):
+        """(img, label) for `axes`, each holding a single marker at the same voxel."""
+        label_axes = axes.replace("c", "")
+        sizes = {"l": 1, "c": 1}
+        img = torch.zeros(tuple(sizes.get(a, 6) for a in axes))
+        label = torch.zeros(tuple(sizes.get(a, 6) for a in label_axes))
+        img[tuple(0 if a in "lc" else 2 for a in axes)] = 1.0
+        label[tuple(0 if a in "l" else 2 for a in label_axes)] = 1.0
+        return img, label, spatial_dims_for(axes), spatial_dims_for(label_axes)
+
+    @staticmethod
+    def _marker(tensor, axes):
+        """Where the marker sits, in z/y/x only, so tensors of different rank compare."""
+        index = (tensor == 1.0).nonzero()[0].tolist()
+        return [index[axes.index(a)] for a in "zyx"]
+
+    @pytest.mark.parametrize(
+        # Both orderings of the spatial axes. Every layout here was once z-before-y-before-x,
+        # which hid an ordering bug in `spatial_dims_for`: the x-first ones are the coverage.
+        "axes", ["lczyx", "lcxyz", "lzyxc", "lxyzc", "zyxl", "czyxl", "zyxlc"]
+    )
+    @pytest.mark.parametrize("op", ["rot90isocube", "rot90inplane", "shift_sections"])
+    def test_image_and_label_stay_aligned_under_any_layout(self, axes, op):
+        img, label, img_dims, label_dims = self._pair(axes)
+        call = {
+            "rot90isocube": lambda: rot90isocube(
+                np.random.default_rng(0), img, label, spatial_dims=[img_dims, label_dims]),
+            "rot90inplane": lambda: rot90inplane(
+                np.random.default_rng(0), img, label, spatial_dims=[img_dims, label_dims]),
+            "shift_sections": lambda: shift_sections(
+                np.random.default_rng(0), img, label, prob=1.0, magnitude=2,
+                spatial_dims=[img_dims, label_dims]),
+        }[op]
+        out_img, out_label = call()
+
+        assert out_img.shape == img.shape and out_label.shape == label.shape
+        assert self._marker(out_img, axes) == self._marker(out_label, axes.replace("c", "")), (
+            "the marker moved to different voxels in image and label, so the targets no longer "
+            "describe the image"
+        )
+
+    def test_a_shared_tuple_still_means_the_same_axes_for_every_tensor(self):
+        """The old signature stays valid: one tuple broadcasts, which is what trailing layouts want."""
+        img, label = torch.rand(1, 6, 6, 6), torch.rand(1, 6, 6, 6)
+        shared = rot90isocube(np.random.default_rng(0), img, label, spatial_dims=(-3, -2, -1))
+        per_tensor = rot90isocube(
+            np.random.default_rng(0), img, label, spatial_dims=[(-3, -2, -1), (-3, -2, -1)]
+        )
+        assert all(torch.equal(a, b) for a, b in zip(shared, per_tensor))
+
+    def test_a_wrong_number_of_layouts_is_refused(self):
+        with pytest.raises(AssertionError, match="one tuple per tensor"):
+            rot90isocube(
+                np.random.default_rng(0), torch.rand(6, 6, 6), torch.rand(6, 6, 6),
+                spatial_dims=[(-3, -2, -1)],
+            )
+
+    def test_shift_rolls_the_two_free_spatial_axes_not_the_trailing_two(self):
+        """The specific bug: with a trailing channel, `dims=(-2,-1)` meant (x, channel).
+
+        A size-1 channel makes that roll a no-op, so the image moved along one axis while the
+        label moved along two -- no error, just a displacement between them.
+        """
+        img, label, img_dims, label_dims = self._pair("lzyxc")
+        out_img, out_label = shift_sections(
+            np.random.default_rng(0), img, label, prob=1.0, magnitude=2,
+            spatial_dims=[img_dims, label_dims],
+        )
+        moved_img = self._marker(out_img, "lzyxc")
+        assert moved_img != [2, 2, 2], "nothing moved, so the test proves nothing"
+        assert moved_img == self._marker(out_label, "lzyx")
+
+
+class TestSlotOrdering:
+    """`spatial_dims` slots are indexed positionally against the tensor's own spatial order.
+
+    Three things agree on that ordering and would disagree with a fixed z/y/x one: `apply_rot90`
+    permutes slots, `rot90inplane` reads `pixel_size[:, slot]`, and `pixel_size` follows the
+    dataset's `output_axes`. Listing the offsets in any other order compares the wrong pair of
+    voxel sizes -- for `"lcxyz"`, y against z rather than x against y.
+    """
+
+    @pytest.mark.parametrize(
+        ("axes", "expected"),
+        [("lcxyz", (-3, -2, -1)), ("lczyx", (-3, -2, -1)), ("lzyx", (-3, -2, -1)),
+         ("lzyxc", (-4, -3, -2)), ("lxyzc", (-4, -3, -2)), ("zyxl", (-4, -3, -2)),
+         ("zyxlc", (-5, -4, -3))],
+    )
+    def test_offsets_follow_the_layout(self, axes, expected):
+        assert spatial_dims_for(axes) == expected
+
+    @pytest.mark.parametrize("axes", ["lcxyz", "lczyx", "lzyx", "lzyxc", "lxyzc", "zyxl"])
+    def test_slot_i_is_the_i_th_spatial_axis(self, axes):
+        """The invariant everything else relies on."""
+        dims = spatial_dims_for(axes)
+        resolved = "".join(axes[offset % len(axes)] for offset in dims)
+        assert resolved == "".join(a for a in axes if a in "zyx")
+
+    @pytest.mark.parametrize(
+        ("axes", "pixel_size"),
+        # pixel_size follows output_axes spatial order, so z's entry moves with the layout.
+        [("lcxyz", [[9.0, 9.0, 20.0]]),      # x, y, z -- z coarse, and last
+         ("lczyx", [[20.0, 9.0, 9.0]])],     # z, y, x -- z coarse, and first
+    )
+    def test_inplane_accepts_anisotropy_on_the_axis_it_holds_fixed(self, axes, pixel_size):
+        """The case the ordering bug broke: `"lcxyz"` compared y against z instead of x against y.
+
+        Serial-section EM at 9x9x20 nm is exactly this shape, so it failed for the layout every
+        real config uses while passing for the one the tests happened to cover.
+        """
+        spatial = [a for a in axes if a in "zyx"]
+        img = torch.zeros(tuple({"l": 1, "c": 1}.get(a, 6) for a in axes))
+        rot90inplane(
+            np.random.default_rng(0), img,
+            spatial_dims=spatial_dims_for(axes),
+            fixed_axis=spatial.index("z"),
+            pixel_size=pixel_size,
+        )
+
+    def test_inplane_still_rejects_anisotropy_between_the_axes_it_exchanges(self):
+        """The check must stay live: only the fixed axis may differ."""
+        spatial = [a for a in "lcxyz" if a in "zyx"]
+        with pytest.raises(AssertionError, match="share a voxel size"):
+            rot90inplane(
+                np.random.default_rng(0), torch.zeros(1, 1, 6, 6, 6),
+                spatial_dims=spatial_dims_for("lcxyz"),
+                fixed_axis=spatial.index("z"),
+                pixel_size=[[9.0, 11.0, 20.0]],       # x != y, which it exchanges
+            )
+
+    @pytest.mark.parametrize("axes", ["lcxyz", "lczyx", "lzyxc"])
+    def test_inplane_holds_the_named_axis_fixed_whatever_the_layout(self, axes):
+        """Not just that the voxel-size check passes -- that the right axis is actually held.
+
+        A slot ordering that disagrees with the layout still satisfies the `pixel_size` assertion
+        when the two exchanged axes happen to match; what it gets wrong is *which* axis is fixed.
+        Here the volume varies along z alone, so if z were permuted into a free slot the variation
+        would move with it.
+        """
+        spatial = [a for a in axes if a in "zyx"]
+        z_at = axes.index("z")
+        shape = tuple({"l": 1, "c": 1}.get(a, 6) for a in axes)
+        ramp = torch.arange(6, dtype=torch.float32)
+        img = ramp.reshape([6 if i == z_at else 1 for i in range(len(axes))]).expand(shape)
+
+        # Swept, not drawn once: the in-plane swap fires on only half the draws, so a single
+        # seed can leave z where it started even when the slot ordering is wrong.
+        for seed in range(20):
+            (out,) = rot90inplane(
+                np.random.default_rng(seed), img.contiguous(),
+                spatial_dims=spatial_dims_for(axes),
+                fixed_axis=spatial.index("z"),
+                pixel_size=[[20.0 if a == "z" else 9.0 for a in spatial]],
+            )
+            # Each z-slice must still be constant across the two in-plane axes.
+            per_slice = out.movedim(z_at, 0).reshape(6, -1)
+            assert torch.allclose(per_slice.std(dim=1), torch.zeros(6), atol=1e-6), (
+                f"z was permuted away under {axes!r} at seed {seed}"
+            )
