@@ -230,14 +230,63 @@ def augment(sample):
 dataset = VolumeDataset(load_config("config.yaml"), augment_fn=augment)
 ```
 
+In YAML, a string names an importable `augment_fn(sample) -> sample` directly:
+
+```yaml
+augment_fn: myproject.augs.augment_sample
+```
+
+Use a factory mapping when configuration supplies its parameters; see
+[`examples/config_augment_fn.yaml`](examples/config_augment_fn.yaml):
+
+```yaml
+augment_fn:
+  factory: miao.augment_std.em_default
+  kwargs:
+    scale: [0.8, 1.2]
+```
+
+The factory is called once per DataLoader worker process, so it may return any callable — a
+nested closure included; only a directly passed `augment_fn=` callable must be picklable
+(module-level function, `functools.partial`, or class instance). `em_default` rotates by default,
+which requires isotropic resolutions and a cubic patch; set `rotate: false` in its kwargs for
+anisotropic data.
+
 See [`miao/augment.py`](src/miao/augment.py) for the available
 functions and their exact behavior.
 
-Using the `np.random` module keeps multi-worker randomness correct for free; a
-`np.random.default_rng()` Generator closed over from the parent process works too, but
-fork-inherited copies draw identical streams across workers unless you reseed it in a
-`worker_init_fn`. For volumes without labels, skip the empty label sentinel
-(`sample["label"].numel() == 0`) instead of rotating it.
+For volumes without labels, skip the empty label sentinel (`sample["label"].numel() == 0`)
+instead of rotating it.
+
+### Randomness
+
+Draw augmentation randomness from the `np.random` module, passed as the `rng` argument of the
+`miao.augment` functions:
+
+```python
+def augment(sample):
+    img, lab = rot90isocube(np.random, sample["img"], sample["label"],
+                            pixel_size=sample["pixel_size"])
+    return {**sample, "img": intensity_jitter(np.random, img), "label": lab}
+```
+
+This is correct with no further work: PyTorch reseeds numpy's global RNG in every DataLoader
+worker (from the loader's base seed and the worker id), so streams are decorrelated across
+workers and epochs — and the whole pipeline is reproducible end to end by seeding the loader,
+`DataLoader(..., generator=torch.Generator().manual_seed(0))`.
+
+If you want a private `np.random.Generator` instead, where you create it determines whether
+workers decorrelate:
+
+- **Inside a configured factory** — fine. The factory runs in each worker *after* the per-worker
+  reseeding, so derive its seed from the global:
+  `rng = np.random.default_rng(np.random.randint(2**31))`. Independent per worker, reproducible
+  via the loader seed.
+- **A fixed seed inside a factory** (`default_rng(0)`) — every worker recreates the same stream:
+  correlated augmentations across workers.
+- **Captured in a directly passed callable** — the Generator's *state* is cloned to every worker
+  (fork memory copies and pickled state alike): correlated again, and only fixable externally
+  with a `worker_init_fn`.
 
 ### `rot90isocube`
 

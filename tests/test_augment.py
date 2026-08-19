@@ -7,8 +7,13 @@ import pytest
 import torch
 
 from miao.augment import _SPATIAL_PERMS, apply_rot90, draw_rot90, intensity_jitter, rot90isocube
-from miao.config import MiaoConfig
+from miao.augment_std import em_default
+from miao.config import MiaoConfig, load_config
 from miao.dataset import VolumeDataset
+
+
+def identity(sample):
+    return sample
 
 
 class TestApplyRot90:
@@ -196,32 +201,42 @@ class TestIntensityJitter:
         assert torch.equal(img, torch.ones(4, 4, 4))
 
 
+def _sequential_cfg(zarr2_volume, resolutions=None, augment_fn=None):
+    return MiaoConfig(
+        volumes=[{
+            "name": "v",
+            "path": str(zarr2_volume),
+            "image_key": "raw",
+            "label_key": "labels/seg",
+        }],
+        resolutions=resolutions or [[1, 1, 1]],
+        output_axes="lzyx",
+        patch_size=[8, 8, 8],
+        sampling="sequential",  # sample 0 is deterministic
+        augment_fn=augment_fn,
+    )
+
+
 class TestVolumeDatasetAugmentFn:
     """The augment_fn arg: called per sample as augment_fn(sample) -> sample; rng closed over."""
 
-    def _cfg(self, zarr2_volume, resolutions=[[1, 1, 1]]):
-        return MiaoConfig(
-            volumes=[{
-                "name": "v",
-                "path": str(zarr2_volume),
-                "image_key": "raw",
-                "label_key": "labels/seg",
-            }],
-            resolutions=resolutions,
-            output_axes="lzyx",
-            patch_size=[8, 8, 8],
-            sampling="sequential",  # sample 0 is deterministic
-        )
-
     def test_identity_fn_passthrough(self, zarr2_volume: Path):
-        plain = VolumeDataset(self._cfg(zarr2_volume))[0]
-        ident = VolumeDataset(self._cfg(zarr2_volume), augment_fn=lambda s: s)[0]
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        ident = VolumeDataset(_sequential_cfg(zarr2_volume), augment_fn=identity)[0]
         assert torch.equal(plain["img"], ident["img"])
         assert torch.equal(plain["label"], ident["label"])
 
+    def test_direct_augment_fn_runs_in_spawned_dataloader(self, zarr2_volume: Path):
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume), augment_fn=HalveFactory((0.5, 0.5)))
+        batch = next(iter(torch.utils.data.DataLoader(
+            ds, batch_size=1, num_workers=1, multiprocessing_context="spawn"
+        )))
+        assert torch.allclose(batch["img"][0], 0.5 * plain["img"])
+
     def test_non_callable_asserts_at_construction(self, zarr2_volume: Path):
         with pytest.raises(AssertionError, match="callable"):
-            VolumeDataset(self._cfg(zarr2_volume), augment_fn=True)
+            VolumeDataset(_sequential_cfg(zarr2_volume), augment_fn=True)
 
     def test_rot90_and_jitter_closure(self, zarr2_volume: Path):
         """The intended usage: compose the pure fns in a closure with an rng closed over."""
@@ -233,8 +248,8 @@ class TestVolumeDatasetAugmentFn:
             )
             return {**sample, "img": intensity_jitter(rng, img), "label": label}
 
-        plain = VolumeDataset(self._cfg(zarr2_volume))[0]
-        aug = VolumeDataset(self._cfg(zarr2_volume), augment_fn=augment)[0]
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        aug = VolumeDataset(_sequential_cfg(zarr2_volume), augment_fn=augment)[0]
 
         assert aug["img"].shape == plain["img"].shape
         assert aug["label"].shape == plain["label"].shape
@@ -259,6 +274,196 @@ class TestVolumeDatasetAugmentFn:
             )
             return {**sample, "img": img, "label": label}
 
-        ds = VolumeDataset(self._cfg(zarr2_volume, resolutions=[[1, 1, 2]]), augment_fn=augment)
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, resolutions=[[1, 1, 2]]), augment_fn=augment)
         with pytest.raises(AssertionError, match="isotropic output resolution"):
             ds[0]
+
+
+class HalveFactory:
+    """Class-as-factory: the class itself is the factory, instances are picklable augment_fns."""
+
+    def __init__(self, scale=(1.0, 1.0)):
+        self.scale = scale
+
+    def __call__(self, sample):
+        img = intensity_jitter(np.random, sample["img"], scale=self.scale, shift=(0.0, 0.0))
+        return {**sample, "img": img}
+
+
+def _closure_factory():
+    """A factory returning a nested closure — the documented anti-pattern."""
+
+    def augment(sample):
+        return sample
+
+    return augment
+
+
+class TestConfigAugmentFn:
+    """config.augment_fn: {factory, kwargs} resolved at dataset construction (v1: class factory)."""
+
+
+    def test_factory_resolved_and_kwargs_applied(self, zarr2_volume: Path):
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        spec = {"factory": "test_augment.HalveFactory", "kwargs": {"scale": [0.5, 0.5]}}
+        aug = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))[0]
+        assert torch.allclose(aug["img"], 0.5 * plain["img"])
+
+    def test_load_yaml_factory_and_kwargs(self, tmp_path: Path, zarr2_volume: Path):
+        example_path = Path(__file__).parents[1] / "examples" / "config_augment_fn.yaml"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            example_path.read_text()
+            .replace("/data/sample.zarr", str(zarr2_volume))
+            .replace("patch_size: [64, 64, 64]", "patch_size: [8, 8, 8]")
+        )
+        cfg = load_config(config_path)
+        assert cfg.augment_fn.factory == "miao.augment_std.em_default"
+        assert cfg.augment_fn.kwargs == {"scale": [0.8, 1.2], "shift": [-0.1, 0.1]}
+        assert VolumeDataset(cfg)[0]["img"].shape == (1, 8, 8, 8)
+
+    def test_em_default_factory_and_kwargs(self, zarr2_volume: Path):
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        spec = {
+            "factory": "miao.augment_std.em_default",
+            "kwargs": {"scale": [0.5, 0.5], "shift": [0.0, 0.0], "rotate": False},
+        }
+        aug = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))[0]
+        assert torch.allclose(aug["img"], 0.5 * plain["img"])
+        assert torch.equal(aug["label"], plain["label"])
+
+    def test_direct_callable_path(self, zarr2_volume: Path):
+        cfg = _sequential_cfg(zarr2_volume, augment_fn="test_augment.identity")
+        assert cfg.augment_fn == "test_augment.identity"
+        plain = VolumeDataset(_sequential_cfg(zarr2_volume))[0]
+        aug = VolumeDataset(cfg)[0]
+        assert torch.equal(aug["img"], plain["img"])
+
+    def test_load_yaml_direct_callable_path(self, tmp_path: Path, zarr2_volume: Path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"""
+augment_fn: test_augment.identity
+volumes:
+  - name: v
+    path: {zarr2_volume}
+    image_key: raw
+resolutions: [[1, 1, 1]]
+output_axes: lzyx
+patch_size: [8, 8, 8]
+sampling: sequential
+"""
+        )
+        cfg = load_config(config_path)
+        assert cfg.augment_fn == "test_augment.identity"
+        assert VolumeDataset(cfg)[0]["img"].shape == (1, 8, 8, 8)
+
+    def test_dataset_pickles_and_still_augments(self, zarr2_volume: Path):
+        import pickle
+
+        spec = {"factory": "test_augment.HalveFactory", "kwargs": {"scale": [0.5, 0.5]}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        clone = pickle.loads(pickle.dumps(ds))  # what a spawned worker receives
+        assert torch.allclose(clone[0]["img"], ds[0]["img"])
+
+    def test_both_sources_assert(self, zarr2_volume: Path):
+        cfg = _sequential_cfg(zarr2_volume, augment_fn="test_augment.identity")
+        with pytest.raises(AssertionError, match="not both"):
+            VolumeDataset(cfg, augment_fn=identity)
+
+    def test_bad_kwarg_fails_at_first_sample(self, zarr2_volume: Path):
+        # The factory call is deferred per worker, so kwarg errors surface at the first sample.
+        spec = {"factory": "test_augment.HalveFactory", "kwargs": {"scal": [0.5, 0.5]}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        with pytest.raises(TypeError):
+            ds[0]
+
+    def test_bad_factory_path_in_mapping_fails_at_construction(self, zarr2_volume: Path):
+        spec = {"factory": "test_augment.NoSuchFactory", "kwargs": {}}
+        with pytest.raises(AssertionError, match="augment_fn"):
+            VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+
+    def test_closure_factory_works_through_pickle(self, zarr2_volume: Path):
+        # The v3 selling point: factories may return closures because only the recipe pickles.
+        spec = {"factory": "test_augment._closure_factory", "kwargs": {}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        ds[0]  # resolve in the parent, populating the per-worker cache with a closure
+        import pickle
+
+        clone = pickle.loads(pickle.dumps(ds))  # __getstate__ drops the cached closure
+        assert torch.equal(clone[0]["img"], ds[0]["img"])
+
+    def test_closure_factory_runs_in_spawned_dataloader(self, zarr2_volume: Path):
+        spec = {"factory": "test_augment._closure_factory", "kwargs": {}}
+        ds = VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=spec))
+        batch = next(iter(torch.utils.data.DataLoader(
+            ds, batch_size=1, num_workers=1, multiprocessing_context="spawn"
+        )))
+        assert batch["img"].shape == (1, 1, 8, 8, 8)
+
+    def test_bad_path_fails_at_construction(self, zarr2_volume: Path):
+        for bad in ("test_augment.NoSuchFactory", "test_augment.", ".rel.path", "nodots"):
+            with pytest.raises(AssertionError, match="augment_fn"):
+                VolumeDataset(_sequential_cfg(zarr2_volume, augment_fn=bad))
+
+    def test_bare_string_naming_a_factory_asserts_at_first_sample(self, zarr2_volume: Path):
+        # em_default is a factory; as a bare string it resolves as the augment_fn itself and
+        # returns a partial instead of a sample — the __getitem__ guard catches it.
+        ds = VolumeDataset(
+            _sequential_cfg(zarr2_volume, augment_fn="miao.augment_std.em_default")
+        )
+        with pytest.raises(AssertionError, match="factories need"):
+            ds[0]
+
+    def test_em_default_rotates_labels_with_image(self, tmp_path: Path):
+        """Distinct value at every voxel so any misalignment between img and label is visible."""
+        import json
+
+        import zarr
+        from zarr.storage import LocalStore
+
+        zpath = tmp_path / "grad.zarr"
+        root = zarr.open_group(LocalStore(str(zpath)), mode="a", zarr_format=2)
+        axes = [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"]
+        data = np.arange(8 * 8 * 8, dtype=np.float32).reshape(8, 8, 8)
+        for key, dtype, arr in [("raw", "float32", data), ("seg", "uint32", data.astype("uint32"))]:
+            grp = root.create_group(key)
+            a = grp.create_array("0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=dtype, overwrite=True)
+            a[:] = arr
+            (zpath / key / ".zattrs").write_text(json.dumps({"multiscales": [{
+                "version": "0.4", "axes": axes,
+                "datasets": [{"path": "0", "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, 1.0, 1.0]}]}],
+            }]}))
+
+        cfg = MiaoConfig(
+            volumes=[{"name": "v", "path": str(zpath), "image_key": "raw", "label_key": "seg",
+                      "normalize": False}],
+            resolutions=[[1, 1, 1]],
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+            sampling="sequential",
+            augment_fn={"factory": "miao.augment_std.em_default",
+                        "kwargs": {"scale": [1.0, 1.0], "shift": [0.0, 0.0]}},
+        )
+        ds = VolumeDataset(cfg)
+        plain_label = torch.from_numpy(data.astype("int64")).reshape(1, 8, 8, 8)
+        rotated_any = False
+        for seed in range(5):
+            np.random.seed(seed)
+            s = ds[0]
+            # scale 1 / shift 0 makes jitter a no-op, so img must equal the rotated label exactly
+            assert torch.equal(s["img"][0], s["label"][0].float()), f"misaligned at seed {seed}"
+            rotated_any = rotated_any or not torch.equal(s["label"], plain_label)
+        assert rotated_any, "no seed produced a non-identity rotation"
+
+    def test_em_default_partial_pickles(self):
+        import pickle
+
+        pickle.loads(pickle.dumps(em_default(scale=(0.8, 1.2))))
+
+    def test_closure_factory_return_does_not_pickle(self):
+        import pickle
+
+        with pytest.raises((AttributeError, pickle.PicklingError)):
+            pickle.dumps(_closure_factory())
