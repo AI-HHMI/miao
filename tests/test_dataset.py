@@ -1483,3 +1483,41 @@ class TestLabelTranslation:
             lbl = sample["label"][0]
             offset = (lbl.double() - img.double()).unique()
             assert offset.numel() == 1 and offset.item() == pytest.approx(1000.0)
+
+    def test_a_fractional_offset_picks_the_nearest_label_voxel(self, tmp_path: Path):
+        """With a part-voxel offset, the label index is fractional and must round, not floor.
+
+        The offset here is 0.25 of a voxel, so the exact label index for image voxel z is
+        z - 20.25. The nearest label voxel is z - 20, at distance 0.25; flooring gives z - 21, at
+        distance 0.75. This asserts the nearer one, which is a property of nearest-neighbour
+        lookup rather than a claim about what OME-NGFF's `translation` denotes.
+
+        Measured on real CellMap crops, whose offsets are 0.75 of a raw voxel: across four volumes
+        the best-fitting whole-voxel shift was always the one rounding gives, and on the one volume
+        whose offset was integral (where rounding and flooring agree) it was zero.
+        """
+        root = self._build(tmp_path, [20.25, 0.0, 0.0])
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "fractional",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                "bounding_box": [[0, 16], [0, 16], [21, 36]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]
+            lbl = sample["label"][0]
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1, f"sample {i}: label and image disagree, got {offset}"
+            assert offset.item() == pytest.approx(1000.0 - 20.0), (
+                f"sample {i}: got {offset.item():.0f}; 979 means the index was floored "
+                "(0.75 voxels away) instead of rounded (0.25 away)"
+            )

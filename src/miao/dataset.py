@@ -1252,16 +1252,23 @@ class VolumeDataset(torch.utils.data.Dataset):
                         if scales.label_center_offsets is not None
                         else 0.0
                     )
+                    # Nearest, not floor. The label index is generally fractional -- whenever the
+                    # image and label voxel sizes do not divide evenly, or their origins differ by
+                    # part of a voxel -- and flooring always moves it toward the origin, which is a
+                    # systematic bias of up to a whole voxel. Rounding leaves at most half.
+                    #
+                    # floor(x + 0.5) rather than np.round, because np.round breaks ties to even and
+                    # that would make the exact-half case depend on the parity of the index.
                     if self.config.sample_windows and s > 0:
                         center_fine = (
                             origin.astype(np.float64) + eff_half.astype(np.float64)
                         ) * rel_factors
                         lbl_center = np.floor(
-                            (center_fine + lbl_offset) / lbl_rel_factors
+                            (center_fine + lbl_offset) / lbl_rel_factors + 0.5
                         ).astype(np.int64)
                     else:
                         lbl_center = np.floor(
-                            (center + lbl_offset) / lbl_rel_factors
+                            (center + lbl_offset) / lbl_rel_factors + 0.5
                         ).astype(np.int64)
                     lbl_origin = lbl_center - lbl_eff_half
                     # Clamp into the label volume (same per-level rounding concern as the image).
