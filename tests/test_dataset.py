@@ -1388,3 +1388,98 @@ class TestLabelAxisOrderValidation:
             )
             with pytest.raises(ValueError, match="do not match image spatial axes"):
                 VolumeDataset(cfg)
+
+
+class TestLabelTranslation:
+    """A label written as a crop of a larger image must be read where it actually sits.
+
+    Converting an image position into a label position needs a scale factor (the voxels differ in
+    size) and an origin offset (the arrays may start at different physical points). Only the scale
+    used to be applied, so a label crop was read as though it began at the image's origin.
+
+    The failure was silent rather than loud: the resulting index is clamped into the label array, so
+    a read landing outside it returned a plausible patch from the wrong place instead of raising.
+    These tests therefore check *content*, not shapes -- a shape assertion passes either way.
+    """
+
+    @staticmethod
+    def _ramp(shape, level):
+        """Contents that say where they came from: value == index along the first axis."""
+        import numpy as np
+
+        out = np.zeros(shape, dtype=np.float64)
+        idx = np.arange(shape[0]).reshape(-1, *([1] * (len(shape) - 1)))
+        return out + idx
+
+    def _build(self, tmp_path: Path, label_translation):
+        from conftest import _create_ome_ngff_zarr2
+
+        # Image spans 64 voxels at 1.0 units; the label covers only [20, 36) of it.
+        _create_ome_ngff_zarr2(
+            tmp_path, "raw", (64, 16, 16), num_scales=1,
+            base_scale_factors=[1.0, 1.0, 1.0], data_fn=self._ramp,
+        )
+        _create_ome_ngff_zarr2(
+            tmp_path, "labels/seg", (16, 16, 16), num_scales=1, dtype="uint16",
+            base_scale_factors=[1.0, 1.0, 1.0],
+            base_translation=label_translation,
+            data_fn=lambda shape, level: self._ramp(shape, level) + 1000,
+        )
+        return tmp_path
+
+    def test_label_crop_is_read_at_its_translation(self, tmp_path: Path):
+        """The label sits at image voxel 20, so its first row must pair with image value 20."""
+        root = self._build(tmp_path, [20.0, 0.0, 0.0])
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "offset",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                # Keep every sampled patch inside the labelled region, [20, 36) along z. The
+                # bounding_box is in output_axes spatial order (xyz here), while the arrays are
+                # written zyx, so the offset axis is last.
+                "bounding_box": [[0, 16], [0, 16], [20, 36]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]                    # (l, c, z, y, x) -> spatial
+            lbl = sample["label"][0]                     # (l, z, y, x) -> spatial
+            # The ramp encodes position, so image value and label value must describe the same
+            # place: label = image + 1000 - 20 exactly when the offset is applied.
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1, f"sample {i}: label and image disagree, got {offset}"
+            assert offset.item() == pytest.approx(1000.0 - 20.0), (
+                f"sample {i}: label read {offset.item() - 1000.0:+.0f} voxels from where the "
+                "image says it should be"
+            )
+
+    def test_no_translation_reads_as_before(self, tmp_path: Path):
+        """The inert case: with no translation the label is read exactly as it always was."""
+        root = self._build(tmp_path, None)
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "aligned",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                "bounding_box": [[0, 16], [0, 16], [0, 16]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]
+            lbl = sample["label"][0]
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1 and offset.item() == pytest.approx(1000.0)

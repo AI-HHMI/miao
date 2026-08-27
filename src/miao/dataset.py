@@ -208,6 +208,10 @@ class ScaleResolution:
     label_relative_scale_factors: list[np.ndarray] | None
     # Per-scale label storage read shape (label spatial axis order)
     label_read_shapes: list[np.ndarray] | None
+    # Per-scale offset to add to a centre before converting it into label voxels, expressed in the
+    # same finest-image-voxel units as `center`. Zero unless the image and label declare different
+    # physical origins. See VolumeInfo.img_translation.
+    label_center_offsets: list[np.ndarray] | None = None
 
 
 @dataclass
@@ -238,6 +242,12 @@ class VolumeInfo:
     # Per-level absolute spatial voxel sizes (for on-the-fly level selection)
     img_level_voxels: dict[int, np.ndarray]
     lbl_level_voxels: dict[int, np.ndarray] | None
+    # Physical origin of image level 0, and of each label level. Needed to convert an image
+    # position into a label position: the scale factors say how big the voxels are, these say where
+    # the arrays start. Zeros when the OME-NGFF metadata declares no translation, which leaves the
+    # conversion exactly as it was before translations were read at all.
+    img_translation: np.ndarray
+    lbl_level_translations: dict[int, np.ndarray] | None
     # Output patch size in image spatial axis order (interpolation target for every scale)
     read_shape: list[int]
     # Valid center coordinate range (spatial dims only, in image spatial axis order, level-0 frame)
@@ -573,6 +583,28 @@ class VolumeDataset(torch.utils.data.Dataset):
                 for lvl, m in label_meta.scales.items()
             }
 
+        # Physical origins, for turning an image position into a label position. Converting between
+        # the two arrays needs both a scale factor (the voxels differ in size) and an origin offset
+        # (the arrays may start at different physical points). Only the scale was applied before, so
+        # a label written as a crop of a larger image was read as though it began at the image's
+        # origin -- and because the resulting index is clamped into the label array, that returned a
+        # plausible patch from the wrong place rather than failing.
+        #
+        # Divided by `exp` for the same reason the voxel sizes are: an expansion factor rescales the
+        # physical coordinate system, origins included.
+        img_translation = (
+            np.array(image_meta.scales[0].translation_or_zeros(), dtype=np.float64)[img_sp_idx]
+            / exp
+        )
+        lbl_level_translations: dict[int, np.ndarray] | None = None
+        if label_meta is not None and lbl_sp_idx is not None:
+            # Per level, not once: a pyramid's levels do not share an origin. CellMap's hela-2
+            # writes s0 at 3132.21 nm and s1 at 3133.52 nm on the same axis.
+            lbl_level_translations = {
+                lvl: np.array(m.translation_or_zeros(), dtype=np.float64)[lbl_sp_idx] / exp
+                for lvl, m in label_meta.scales.items()
+            }
+
         # Derive smallest safe label dtypes from on-disk dtype
         if label_meta is not None:
             lbl_np_dt, lbl_torch_dt = _label_dtypes(
@@ -605,6 +637,8 @@ class VolumeDataset(torch.utils.data.Dataset):
             finest_voxel_size=finest_spatial_factors,
             img_level_voxels=img_level_voxels,
             lbl_level_voxels=lbl_level_voxels,
+            img_translation=img_translation,
+            lbl_level_translations=lbl_level_translations,
             read_shape=read_shape,
             min_center=np.zeros(len(img_sp_idx), dtype=np.int64),
             max_center=np.zeros(len(img_sp_idx), dtype=np.int64),
@@ -685,6 +719,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         label_chosen_levels: list[int] | None = [] if has_labels else None
         label_relative_scale_factors: list[np.ndarray] | None = [] if has_labels else None
         label_read_shapes: list[np.ndarray] | None = [] if has_labels else None
+        label_center_offsets: list[np.ndarray] | None = [] if has_labels else None
 
         for target_out in resolutions_output_order:
             img_target = np.array(
@@ -716,6 +751,18 @@ class VolumeDataset(torch.utils.data.Dataset):
                 label_read_shapes.append(
                     np.ceil(lbl_patch * lbl_target / lbl_voxel).astype(np.int64)
                 )
+                # A centre is measured in finest-image-voxel units, so express the origin
+                # difference in those units too and it can simply be added before the conversion:
+                #   label_index = (center + offset) / (label_voxel / finest)
+                # which expands to (center * finest + img_origin - label_origin) / label_voxel.
+                lbl_translation = (
+                    vol_info.lbl_level_translations[lbl_lvl]
+                    if vol_info.lbl_level_translations is not None
+                    else np.zeros_like(finest)
+                )
+                label_center_offsets.append(
+                    (vol_info.img_translation - lbl_translation) / finest
+                )
 
         return ScaleResolution(
             resolutions=resolutions,
@@ -725,6 +772,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             label_chosen_levels=label_chosen_levels,
             label_relative_scale_factors=label_relative_scale_factors,
             label_read_shapes=label_read_shapes,
+            label_center_offsets=label_center_offsets,
         )
 
     def _center_bounds(
@@ -745,12 +793,28 @@ class VolumeDataset(torch.utils.data.Dataset):
         # bounding_box (image storage spatial order, reference-frame [lo, hi)); None if unset.
         bb = vol_info.bounding_box
 
-        def _apply(rel: np.ndarray, eff: np.ndarray, sp_shape: np.ndarray) -> None:
+        def _apply(
+            rel: np.ndarray,
+            eff: np.ndarray,
+            sp_shape: np.ndarray,
+            start: float | np.ndarray = 0.0,
+        ) -> None:
+            """Constrain the centre range so this array's read fits inside it.
+
+            `start` is where the array begins in the reference frame, which is zero for the image
+            and non-zero for a label declaring a different origin: such a label occupies
+            [start, start + sp_shape * rel) rather than [0, sp_shape * rel). Without it the valid
+            centre range is computed as though a label crop sat at the image's origin, which
+            collapses to an empty range as soon as a bounding_box points at where the crop really is.
+
+            Only the volume fit shifts. The bounding_box clauses below are already expressed in the
+            image's coordinates, so they are independent of where the label array starts.
+            """
             nonlocal min_center, max_center
             eff_half = np.floor(eff / 2)
-            # Volume fit (centered patch within [0, sp_shape) at this level).
-            min_center = np.maximum(min_center, rel * eff_half)
-            max_center = np.minimum(max_center, rel * (sp_shape - eff + eff_half))
+            # Volume fit (centered patch within [start, start + sp_shape) at this level).
+            min_center = np.maximum(min_center, start + rel * eff_half)
+            max_center = np.minimum(max_center, start + rel * (sp_shape - eff + eff_half))
             if bb is not None:
                 # Strict bbox on the read extent. A centered patch spans (ref frame, worst-case
                 # over the floor()/eff//2 quantization) [center - (eff_half + 1)*rel,
@@ -780,10 +844,18 @@ class VolumeDataset(torch.utils.data.Dataset):
                     vol_info.label_meta.scales[scale_res.label_chosen_levels[s]].shape,
                     dtype=np.float64,
                 )[vol_info.lbl_spatial_idx]
+                # label_center_offsets is (image_origin - label_origin) in reference-frame units,
+                # so the label array begins at minus that.
+                lbl_start = (
+                    -scale_res.label_center_offsets[s]
+                    if scale_res.label_center_offsets is not None
+                    else 0.0
+                )
                 _apply(
                     scale_res.label_relative_scale_factors[s],
                     scale_res.label_read_shapes[s].astype(np.float64),
                     lbl_sp_shape,
+                    lbl_start,
                 )
 
         if bb is not None and np.any(np.ceil(min_center) > np.floor(max_center)):
@@ -1172,15 +1244,25 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl_rel_factors = scales.label_relative_scale_factors[s]
                     lbl_eff_shape = scales.label_read_shapes[s]
                     lbl_eff_half = lbl_eff_shape // 2
+                    # Origin difference between the image and this label level, in the same
+                    # finest-image-voxel units as the centre. Zero unless the two declare different
+                    # physical origins, so this leaves aligned volumes reading exactly as before.
+                    lbl_offset = (
+                        scales.label_center_offsets[s]
+                        if scales.label_center_offsets is not None
+                        else 0.0
+                    )
                     if self.config.sample_windows and s > 0:
                         center_fine = (
                             origin.astype(np.float64) + eff_half.astype(np.float64)
                         ) * rel_factors
-                        lbl_center = np.floor(center_fine / lbl_rel_factors).astype(
-                            np.int64
-                        )
+                        lbl_center = np.floor(
+                            (center_fine + lbl_offset) / lbl_rel_factors
+                        ).astype(np.int64)
                     else:
-                        lbl_center = np.floor(center / lbl_rel_factors).astype(np.int64)
+                        lbl_center = np.floor(
+                            (center + lbl_offset) / lbl_rel_factors
+                        ).astype(np.int64)
                     lbl_origin = lbl_center - lbl_eff_half
                     # Clamp into the label volume (same per-level rounding concern as the image).
                     lbl_sp_shape = np.array(

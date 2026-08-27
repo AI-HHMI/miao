@@ -76,3 +76,67 @@ class TestReadOmeMetadata:
         assert meta.scales[0].scale_factors == [2.0, 1.0, 1.0]
         assert meta.scales[1].scale_factors == [4.0, 2.0, 2.0]
         assert meta.scales[2].scale_factors == [8.0, 4.0, 4.0]
+
+
+# --- OME-NGFF `translation`: where a level's origin sits --------------------------------------
+#
+# Read because a label written as a crop of a larger image records its position this way, and
+# without it there is nothing to say where in the image the crop belongs.
+
+
+def test_translation_is_parsed_per_level(tmp_path):
+    from conftest import _create_ome_ngff_zarr2
+
+    _create_ome_ngff_zarr2(
+        tmp_path, "raw", (32, 32, 32), num_scales=2,
+        base_scale_factors=[2.0, 2.0, 2.0], base_translation=[100.0, 50.0, 25.0],
+    )
+    meta = read_ome_metadata(tmp_path, "raw", "zarr2")
+    for level in (0, 1):
+        assert meta.scales[level].translation == [100.0, 50.0, 25.0]
+
+
+def test_translation_absent_reads_as_zeros(tmp_path):
+    """The overwhelmingly common case, and the one that must not change behaviour."""
+    from conftest import _create_ome_ngff_zarr2
+
+    _create_ome_ngff_zarr2(
+        tmp_path, "raw", (32, 32, 32), num_scales=2, base_scale_factors=[2.0, 2.0, 2.0]
+    )
+    meta = read_ome_metadata(tmp_path, "raw", "zarr2")
+    assert meta.outer_translation == [0.0, 0.0, 0.0]
+    assert meta.scales[0].translation_or_zeros() == [0.0, 0.0, 0.0]
+
+
+def test_outer_translation_composes_with_the_per_level_one(tmp_path):
+    """OME-NGFF applies the dataset transform, then the multiscale-level one:
+
+        physical = outer_scale * (level_scale * index + level_translation) + outer_translation
+
+    so the effective translation is outer_scale * level_translation + outer_translation.
+    """
+    from conftest import _create_ome_ngff_zarr2
+
+    _create_ome_ngff_zarr2(
+        tmp_path, "raw", (32, 32, 32), num_scales=1,
+        base_scale_factors=[1.0, 1.0, 1.0],
+        base_translation=[10.0, 20.0, 30.0],
+        outer_scale=[2.0, 2.0, 2.0],
+        outer_translation=[1.0, 1.0, 1.0],
+    )
+    meta = read_ome_metadata(tmp_path, "raw", "zarr2")
+    assert meta.scales[0].translation == [21.0, 41.0, 61.0]
+    assert meta.scales[0].scale_factors == [2.0, 2.0, 2.0]
+
+
+def test_translation_survives_a_scale_only_outer_transform(tmp_path):
+    """A pre-existing config carrying only an outer scale must still report zero translation."""
+    from conftest import _create_ome_ngff_zarr2
+
+    _create_ome_ngff_zarr2(
+        tmp_path, "raw", (32, 32, 32), num_scales=1,
+        base_scale_factors=[1.0, 1.0, 1.0], outer_scale=[3.0, 3.0, 3.0],
+    )
+    meta = read_ome_metadata(tmp_path, "raw", "zarr2")
+    assert meta.scales[0].translation == [0.0, 0.0, 0.0]
+    assert meta.scales[0].scale_factors == [3.0, 3.0, 3.0]

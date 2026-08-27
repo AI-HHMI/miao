@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -22,6 +22,18 @@ class ScaleMetadata:
     shape: list[int]
     chunks: list[int]
     dtype: np.dtype
+    # Physical position of this level's origin, in the same units as scale_factors. Zeros when the
+    # level declares no translation, which is the common case: a volume whose arrays all start at
+    # the same point needs none. A label written as a crop of a larger image does, and without it
+    # there is nothing to say where in the image the crop belongs.
+    #
+    # Defaults to empty rather than zeros because the rank is not known here; `translation_or_zeros`
+    # is how readers should consume it.
+    translation: list[float] = field(default_factory=list)
+
+    def translation_or_zeros(self) -> list[float]:
+        """The translation, or zeros matching the array rank when none was declared."""
+        return self.translation if self.translation else [0.0] * len(self.shape)
 
 
 @dataclass
@@ -33,6 +45,8 @@ class OmeMetadata:
     scales: dict[int, ScaleMetadata]  # level index -> metadata
     zarr_version: ZarrVersion
     outer_scale: list[float]  # multiscale-level coordinateTransformations scale; identity if absent
+    # multiscale-level coordinateTransformations translation; zeros if absent
+    outer_translation: list[float] = field(default_factory=list)
 
 
 def detect_zarr_version(path: Path | str) -> ZarrVersion:
@@ -161,10 +175,15 @@ def read_ome_metadata(
 
     # Multiscale-level (outer) transform
     outer_scale = [1.0] * len(axis_names)
+    outer_translation = [0.0] * len(axis_names)
+    seen_scale = seen_translation = False
     for transform in multiscales.get("coordinateTransformations", []):
-        if transform["type"] == "scale":
+        if transform["type"] == "scale" and not seen_scale:
             outer_scale = transform["scale"]
-            break
+            seen_scale = True
+        elif transform["type"] == "translation" and not seen_translation:
+            outer_translation = transform["translation"]
+            seen_translation = True
 
     # Parse scale-level metadata
     if requested_scales is None:
@@ -181,13 +200,24 @@ def read_ome_metadata(
         ds_rel_path = ds["path"]
         array_path = group_path / ds_rel_path
 
-        # Get scale factors from coordinateTransformations
+        # Get scale and translation from coordinateTransformations
         scale_factors = [1.0] * len(axis_names)
+        translation = [0.0] * len(axis_names)
+        seen_scale = seen_translation = False
         for transform in ds.get("coordinateTransformations", []):
-            if transform["type"] == "scale":
+            if transform["type"] == "scale" and not seen_scale:
                 scale_factors = transform["scale"]
-                break
+                seen_scale = True
+            elif transform["type"] == "translation" and not seen_translation:
+                translation = transform["translation"]
+                seen_translation = True
+
+        # OME-NGFF applies the dataset transform first, then the multiscale-level one, so for an
+        # array index i the physical position is
+        #     outer_scale * (level_scale * i + level_translation) + outer_translation
+        # which composes to an effective scale and an effective translation.
         scale_factors = [s * o for s, o in zip(scale_factors, outer_scale)]
+        translation = [t * o + ot for t, o, ot in zip(translation, outer_scale, outer_translation)]
 
         shape, chunks, dtype = _read_array_metadata(array_path, zarr_version)
 
@@ -197,6 +227,7 @@ def read_ome_metadata(
             shape=shape,
             chunks=chunks,
             dtype=dtype,
+            translation=translation,
         )
 
     return OmeMetadata(
@@ -205,4 +236,5 @@ def read_ome_metadata(
         scales=scales,
         zarr_version=zarr_version,
         outer_scale=outer_scale,
+        outer_translation=outer_translation,
     )
