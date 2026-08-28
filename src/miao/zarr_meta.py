@@ -22,13 +22,7 @@ class ScaleMetadata:
     shape: list[int]
     chunks: list[int]
     dtype: np.dtype
-    # Physical position of this level's origin, in the same units as scale_factors. Zeros when the
-    # level declares no translation, which is the common case: a volume whose arrays all start at
-    # the same point needs none. A label written as a crop of a larger image does, and without it
-    # there is nothing to say where in the image the crop belongs.
-    #
-    # Defaults to empty rather than zeros because the rank is not known here; `translation_or_zeros`
-    # is how readers should consume it.
+    # Physical position of this level's origin, in the same units as scale_factors.
     translation: list[float] = field(default_factory=list)
 
     def translation_or_zeros(self) -> list[float]:

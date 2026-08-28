@@ -208,9 +208,7 @@ class ScaleResolution:
     label_relative_scale_factors: list[np.ndarray] | None
     # Per-scale label storage read shape (label spatial axis order)
     label_read_shapes: list[np.ndarray] | None
-    # Per-scale offset to add to a centre before converting it into label voxels, expressed in the
-    # same finest-image-voxel units as `center`. Zero unless the image and label declare different
-    # physical origins. See VolumeInfo.img_translation.
+    # Per-scale offset to add to a centre before converting it into label voxels
     label_center_offsets: list[np.ndarray] | None = None
 
 
@@ -242,10 +240,7 @@ class VolumeInfo:
     # Per-level absolute spatial voxel sizes (for on-the-fly level selection)
     img_level_voxels: dict[int, np.ndarray]
     lbl_level_voxels: dict[int, np.ndarray] | None
-    # Physical origin of image level 0, and of each label level. Needed to convert an image
-    # position into a label position: the scale factors say how big the voxels are, these say where
-    # the arrays start. Zeros when the OME-NGFF metadata declares no translation, which leaves the
-    # conversion exactly as it was before translations were read at all.
+    # Physical origin of level-0 image and of each label level.
     img_translation: np.ndarray
     lbl_level_translations: dict[int, np.ndarray] | None
     # Output patch size in image spatial axis order (interpolation target for every scale)
@@ -585,10 +580,7 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         # Physical origins, for turning an image position into a label position. Converting between
         # the two arrays needs both a scale factor (the voxels differ in size) and an origin offset
-        # (the arrays may start at different physical points). Only the scale was applied before, so
-        # a label written as a crop of a larger image was read as though it began at the image's
-        # origin -- and because the resulting index is clamped into the label array, that returned a
-        # plausible patch from the wrong place rather than failing.
+        # (the arrays may start at different physical points).
         #
         # Divided by `exp` for the same reason the voxel sizes are: an expansion factor rescales the
         # physical coordinate system, origins included.
@@ -598,8 +590,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         )
         lbl_level_translations: dict[int, np.ndarray] | None = None
         if label_meta is not None and lbl_sp_idx is not None:
-            # Per level, not once: a pyramid's levels do not share an origin. CellMap's hela-2
-            # writes s0 at 3132.21 nm and s1 at 3133.52 nm on the same axis.
+            # Per level, not once: a pyramid's levels do not share an origin.
             lbl_level_translations = {
                 lvl: np.array(m.translation_or_zeros(), dtype=np.float64)[lbl_sp_idx] / exp
                 for lvl, m in label_meta.scales.items()
@@ -751,10 +742,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 label_read_shapes.append(
                     np.ceil(lbl_patch * lbl_target / lbl_voxel).astype(np.int64)
                 )
-                # A centre is measured in finest-image-voxel units, so express the origin
-                # difference in those units too and it can simply be added before the conversion:
-                #   label_index = (center + offset) / (label_voxel / finest)
-                # which expands to (center * finest + img_origin - label_origin) / label_voxel.
+                # Express the origin difference in finest-image-voxel units
                 lbl_translation = (
                     vol_info.lbl_level_translations[lbl_lvl]
                     if vol_info.lbl_level_translations is not None
@@ -1245,20 +1233,17 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl_eff_shape = scales.label_read_shapes[s]
                     lbl_eff_half = lbl_eff_shape // 2
                     # Origin difference between the image and this label level, in the same
-                    # finest-image-voxel units as the centre. Zero unless the two declare different
-                    # physical origins, so this leaves aligned volumes reading exactly as before.
+                    # finest-image-voxel units as the center
                     lbl_offset = (
                         scales.label_center_offsets[s]
                         if scales.label_center_offsets is not None
                         else 0.0
                     )
-                    # Nearest, not floor. The label index is generally fractional -- whenever the
-                    # image and label voxel sizes do not divide evenly, or their origins differ by
-                    # part of a voxel -- and flooring always moves it toward the origin, which is a
-                    # systematic bias of up to a whole voxel. Rounding leaves at most half.
-                    #
-                    # floor(x + 0.5) rather than np.round, because np.round breaks ties to even and
-                    # that would make the exact-half case depend on the parity of the index.
+                    # Nearest, not floor. The label index is generally fractional and flooring always
+                    # moves it toward the origin, which is a systematic bias of up to a whole voxel. 
+                    # Rounding leaves at most half. Use floor(x + 0.5) rather than np.round, because 
+                    # np.round breaks ties to even and that would make the exact-half case depend on 
+                    # the parity of the index.
                     if self.config.sample_windows and s > 0:
                         center_fine = (
                             origin.astype(np.float64) + eff_half.astype(np.float64)
