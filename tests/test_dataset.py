@@ -1521,3 +1521,168 @@ class TestLabelTranslation:
                 f"sample {i}: got {offset.item():.0f}; 979 means the index was floored "
                 "(0.75 voxels away) instead of rounded (0.25 away)"
             )
+
+    # --- The label read must describe the same physical region as the image patch it is paired
+    # --- with, whatever levels the two pyramids resolve to.
+    #
+    # The content checks above only work where nothing is resampled. These instead compare the
+    # reads themselves: the loader pins the image window's anchor voxel (origin + eff // 2) and the
+    # label read's anchor to one physical point, so a gap there means the label was displaced --
+    # in practice clamped back into a label array the window had wandered off, which returns a
+    # plausible patch of the wrong place rather than raising.
+
+    @staticmethod
+    def _worst_anchor_gap(ds, n_samples: int) -> float:
+        """Largest image-vs-label anchor disagreement over n_samples, in label voxels."""
+
+        class _Rec:
+            """Records the slices issued against a tensorstore handle, then delegates."""
+
+            def __init__(self, real, log, tag):
+                self._real, self._log, self._tag = real, log, tag
+
+            def __getitem__(self, key):
+                self._log.append((self._tag, key))
+                return self._real[key]
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        log: list = []
+        for kinds in ds._get_stores().values():
+            for kind, levels in kinds.items():
+                for lvl, store in list(levels.items()):
+                    levels[lvl] = _Rec(store, log, (kind, lvl))
+
+        vol = ds._volumes[0]
+
+        def anchor(meta, level, spatial_idx, key):
+            scale = np.array(meta.scales[level].scale_factors, dtype=np.float64)[spatial_idx]
+            trans = np.array(meta.scales[level].translation_or_zeros(), dtype=np.float64)[
+                spatial_idx
+            ]
+            start = np.array(
+                [k.start for i, k in enumerate(key) if i in spatial_idx], dtype=np.float64
+            )
+            stop = np.array(
+                [k.stop for i, k in enumerate(key) if i in spatial_idx], dtype=np.float64
+            )
+            return trans + (start + (stop - start) // 2) * scale, scale
+
+        worst = 0.0
+        for i in range(n_samples):
+            log.clear()
+            ds[i]
+            imgs = [(t, k) for t, k in log if t[0] == "img"]
+            lbls = [(t, k) for t, k in log if t[0] == "label"]
+            assert imgs and len(imgs) == len(lbls), "expected one label read per image read"
+            for (it, ik), (lt, lk) in zip(imgs, lbls):
+                img_anchor, _ = anchor(vol.image_meta, it[1], vol.img_spatial_idx, ik)
+                lbl_anchor, lbl_voxel = anchor(vol.label_meta, lt[1], vol.lbl_spatial_idx, lk)
+                worst = max(worst, float(np.max(np.abs(img_anchor - lbl_anchor) / lbl_voxel)))
+        return worst
+
+    @staticmethod
+    def _volumes(root: Path, *, img=(96, 96, 96), lbl=(96, 96, 96), lbl_tr=None, img_tr=None,
+                 img_scales=3, lbl_scales=3, img_axes=None, voxel=None, lbl_voxel=None) -> None:
+        from conftest import _create_ome_ngff_zarr2
+
+        _create_ome_ngff_zarr2(
+            root, "raw", img, num_scales=img_scales, axes=img_axes,
+            base_scale_factors=list(voxel) if voxel else [1.0] * len(img),
+            base_translation=list(img_tr) if img_tr else None,
+        )
+        _create_ome_ngff_zarr2(
+            root, "labels/seg", lbl, num_scales=lbl_scales, dtype="uint16",
+            base_scale_factors=list(lbl_voxel) if lbl_voxel else [1.0] * len(lbl),
+            base_translation=list(lbl_tr) if lbl_tr else None,
+        )
+
+    @staticmethod
+    def _dataset(root: Path, resolutions, **kwargs) -> VolumeDataset:
+        vol = {"name": "v", "path": str(root), "image_key": "raw", "label_key": "labels/seg"}
+        vol.update(kwargs.pop("volume", {}))
+        return VolumeDataset(MiaoConfig(
+            volumes=[vol], resolutions=resolutions, output_axes="lcxyz",
+            patch_size=[8, 8, 8], samples_per_epoch=kwargs.pop("samples", 24), **kwargs,
+        ))
+
+    def test_label_tracks_the_image_window_at_coarse_levels(self, tmp_path: Path):
+        """No translation anywhere -- purely that the label follows the window that was read.
+
+        `origin` is a whole number of voxels at the level being read, so on a coarser level the
+        window sits up to one level-voxel off the requested centre. Anchoring the label on the
+        centre rather than on the window leaves it a voxel out whenever the centre does not land
+        on the coarse grid, which is half the centres at level 1.
+        """
+        self._volumes(tmp_path)
+        ds = self._dataset(tmp_path, [[2.0, 2.0, 2.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_label_tracks_the_image_window_at_the_coarsest_level(self, tmp_path: Path):
+        """Same, three levels down, where the quantization is four reference voxels wide."""
+        self._volumes(tmp_path)
+        ds = self._dataset(tmp_path, [[4.0, 4.0, 4.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_sample_windows_keeps_a_coarse_window_over_an_offset_label(self, tmp_path: Path):
+        """sample_windows places coarser windows off-centre, and the label read follows them.
+
+        A label spanning the whole image stays covered whatever the window does; a label *crop*
+        does not, so the window has to be held over the labelled region as well.
+
+        Along z the crop is exactly as wide as the coarse window (16 reference voxels), which
+        leaves the window one placement that keeps its label read on the crop and several that do
+        not -- so this does not depend on happening to draw a centre near an edge. y and x are
+        left roomy, to check the constraint only binds where the label actually runs out.
+        """
+        self._volumes(tmp_path, lbl=(16, 96, 96), lbl_tr=(20.0, 0.0, 0.0),
+                      img_scales=2, lbl_scales=2)
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+                           sample_windows=True, samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+    def test_offset_label_with_a_shallower_pyramid_than_the_image(self, tmp_path: Path):
+        """Labels stored at full resolution only, so the image reads a coarser level than the label.
+
+        The window centre is floored onto the image level's grid -- four reference voxels here --
+        and the label's own origin (23) does not sit on that grid, so at the crop's low edge the
+        label read underflows by up to three label voxels and is silently clamped.
+        """
+        self._volumes(tmp_path, lbl=(48, 48, 48), lbl_tr=(23.0, 23.0, 23.0), lbl_scales=1)
+        ds = self._dataset(tmp_path, [[4.0, 4.0, 4.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+    def test_offset_label_when_only_the_image_has_a_channel_axis(self, tmp_path: Path):
+        """Each translation is indexed with its own array's spatial indices.
+
+        The image is "czyx" and the label "zyx", so the same spatial axis sits at a different
+        position in the two translation lists; only the spatial order has to agree (it is
+        validated elsewhere). Both arrays are translated, and differently per axis, so mixing the
+        two indexings up would show as a misread.
+        """
+        czyx = [{"name": "c", "type": "channel"}] + [
+            {"name": a, "type": "space", "unit": "micrometer"} for a in "zyx"
+        ]
+        self._volumes(
+            tmp_path, img=(2, 96, 96, 96), img_axes=czyx, voxel=[1.0, 1.0, 1.0, 1.0],
+            img_tr=(0.0, 5.0, 3.0, 1.0), img_scales=1,
+            lbl=(48, 48, 48), lbl_tr=(20.0, 9.0, 7.0), lbl_scales=1,
+        )
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0]], samples=24)
+        assert self._worst_anchor_gap(ds, 24) <= 0.5
+
+    def test_chunk_aligned_sampling_keeps_an_offset_label(self, tmp_path: Path):
+        """chunk_aligned picks chunks of the *image*, but clamps to the volume's centre range,
+        which already accounts for where the label sits."""
+        self._volumes(tmp_path, lbl=(48, 96, 96), lbl_tr=(20.0, 0.0, 0.0))
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0]], chunk_aligned=True, samples=48)
+        assert self._worst_anchor_gap(ds, 48) <= 0.5
+
+    def test_error_names_the_label_when_the_label_is_what_does_not_fit(self, tmp_path: Path):
+        """A label crop far smaller than the patch window: the image is large enough, so the
+        message must not send the reader off to find a larger volume."""
+        self._volumes(tmp_path, img=(128, 128, 128), img_scales=1,
+                      lbl=(4, 4, 4), lbl_tr=(40.0, 40.0, 40.0), lbl_scales=1)
+        with pytest.raises(ValueError, match=r"it is the label \('labels/seg'\)"):
+            self._dataset(tmp_path, [[1.0, 1.0, 1.0]], samples=4)
