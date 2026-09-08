@@ -354,9 +354,26 @@ def augment(sample):
             "affinities": torch.stack([affinities(l) for l in lab])}
 ```
 
+## Moving all image processing to the GPU
+For workloads that are not compute-bound (_i.e._ small models, small inputs), performing image processing operations like resampling and normalization on the CPU (which is the default option) can be inefficient. 
+
+Setting `defer_image_ops: true` in the config defers all image processing pipeline to a specified "device". Crops are returned at their stored shape and dtype and handed over to the caller. `finish_images()` then performs the same resample, cast, normalization and patch normalization ops, in the same order, on this "device". The default collate can no longer be used with `defer_image_ops: true` because of the potential shape mismatch of the samples within a batch, so a new custom `collate_deferred()` function is used for batching the samples instead. 
+
+With `defer_image_ops: true`, a data loading pipeline would schematically look like this:
+```python
+from miao import VolumeDataset, collate_deferred, finish_images
+
+loader = DataLoader(VolumeDataset(cfg), batch_size=8, num_workers=8,
+                    collate_fn=collate_deferred, pin_memory=True)
+
+for batch in loader:
+    batch = finish_images(batch, device="cuda")       # transfer + finish in one
+    img, label = batch["img"], batch["label"].cuda()  # labels are not deferred
+```
+
 ## Configuration reference
 
-Input axes come from OME-NGFF metadata (`multiscales.axes`) and never need specifying; channel
+Input axes come from OME-NGFF metadata (`multiscales.axes`) and do not need to be specified. Channel
 dimensions are picked up automatically when present. Unknown keys are rejected, so typos fail loudly.
 
 ### Dataset fields
@@ -378,7 +395,8 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `image_dtype` | `"float32"` | Output image dtype: `"float32"`, `"bfloat16"` or `"float16"` |
 | `cache_bytes` | `1 << 30` | TensorStore cache size in bytes (1 GB) |
 | `file_io_concurrency` | `64` | Concurrent TensorStore file reads |
-| `augment_fn` | — | Dotted path to an `augment_fn`, or `{factory, kwargs}` — see [Wiring](#wiring) |
+| `augment_fn` | — | Dotted path to an `augment_fn`, or `{factory, kwargs}` — see [Augmentation](#augmentation) |
+| `defer_image_ops` | `false` | Defers image ops, like resampling and normalization, to the GPU — see [Moving all image processing to the GPU](#moving-all-image-processing-to-the-gpu) |
 
 ### Per-volume fields
 
