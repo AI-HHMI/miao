@@ -1584,18 +1584,21 @@ class TestLabelTranslation:
 
     @staticmethod
     def _volumes(root: Path, *, img=(96, 96, 96), lbl=(96, 96, 96), lbl_tr=None, img_tr=None,
-                 img_scales=3, lbl_scales=3, img_axes=None, voxel=None, lbl_voxel=None) -> None:
+                 img_scales=3, lbl_scales=3, img_axes=None, voxel=None, lbl_voxel=None,
+                 img_half_voxel=False, lbl_half_voxel=False) -> None:
         from conftest import _create_ome_ngff_zarr2
 
         _create_ome_ngff_zarr2(
             root, "raw", img, num_scales=img_scales, axes=img_axes,
             base_scale_factors=list(voxel) if voxel else [1.0] * len(img),
             base_translation=list(img_tr) if img_tr else None,
+            half_voxel_shift=img_half_voxel,
         )
         _create_ome_ngff_zarr2(
             root, "labels/seg", lbl, num_scales=lbl_scales, dtype="uint16",
             base_scale_factors=list(lbl_voxel) if lbl_voxel else [1.0] * len(lbl),
             base_translation=list(lbl_tr) if lbl_tr else None,
+            half_voxel_shift=lbl_half_voxel,
         )
 
     @staticmethod
@@ -1686,3 +1689,88 @@ class TestLabelTranslation:
                       lbl=(4, 4, 4), lbl_tr=(40.0, 40.0, 40.0), lbl_scales=1)
         with pytest.raises(ValueError, match=r"it is the label \('labels/seg'\)"):
             self._dataset(tmp_path, [[1.0, 1.0, 1.0]], samples=4)
+
+    # --- The levels of one pyramid need not share an origin. The prevailing OME-NGFF convention
+    # --- records translation_L = (scale_L - scale_0) / 2 on each level, level 0 declaring nothing
+    # --- -- 850 of the 993 multiscale groups in lmd-v0.0.1 are written that way. Reading a coarse
+    # --- image level as though it began where level 0 does puts the image patch
+    # --- (voxel_L - voxel_0) / 2 away from where it is reported to be, and since the label read is
+    # --- anchored on the image window, the label is dragged along with it.
+
+    @pytest.mark.parametrize("res,was", [(12.0, 0.5), (24.0, 1.5), (48.0, 3.5)])
+    def test_image_read_honours_its_own_level_translation(
+        self, tmp_path: Path, res: float, was: float
+    ):
+        """Labels at full resolution only, image read coarse: the case where nothing absorbs the
+        image's own per-level shift.
+
+        Where the label resolves to the same relative scale as the image the two shifts are equal
+        and cancel, and where it does not they do not. With labels at level 0 and the image at
+        level L the gap is (rel - 1) / 2 label voxels -- measured at 0.5 / 1.5 / 3.5 for
+        rel = 2 / 4 / 8 while the image translation was read from level 0 only.
+
+        Only rel = 4 and rel = 8 actually discriminate: at rel = 2 the gap is 0.5, which is also
+        what nearest-voxel rounding onto a coarser grid costs, so that case reads the same either
+        way. It is kept as the low end of the progression.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=1, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[res] * 3], samples=32)
+        gap = self._worst_anchor_gap(ds, 32)
+        assert gap <= 0.5, (
+            f"label displaced {gap} label voxels; {was} is what reading the image translation "
+            "from level 0 only gives at this resolution"
+        )
+
+    @pytest.mark.parametrize("res", [6.0, 12.0, 24.0, 48.0])
+    def test_matched_half_voxel_pyramids_stay_exactly_aligned(self, tmp_path: Path, res: float):
+        """Both pyramids in the same convention, read at the same relative scale: the shifts are
+        equal, so the reads coincide exactly rather than merely within rounding.
+
+        This case reads correctly either way -- the label's own per-level translation absorbs the
+        image's -- so it is here to catch an image-side correction applied twice or with the wrong
+        sign, which would break it.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=4,
+                      img_half_voxel=True, lbl_half_voxel=True)
+        ds = self._dataset(tmp_path, [[res] * 3], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_bbox_reports_the_extent_of_a_shifted_level(self, tmp_path: Path):
+        """The reported bbox is the physical extent of the voxels actually read, measured from the
+        image's level-0 origin, so on a shifted level it carries that level's own origin.
+
+        Level 2 here has voxel 24 and origin 9, so every read starts at 24k + 9. Ignoring the
+        level's origin puts the bbox at 24k -- naming a region 9 units from the data returned.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=1, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[24.0] * 3], samples=16)
+        voxel_l, origin_l = 24.0, 9.0
+        for i in range(16):
+            bbox = ds[i]["bbox"][0].numpy()
+            lo, hi = bbox[0], bbox[1]
+            off = (lo - origin_l) / voxel_l
+            assert np.allclose(off, np.round(off)), (
+                f"sample {i}: bbox lo={lo.tolist()} is not an whole number of level-2 voxels "
+                f"from that level's origin ({origin_l}); {(lo / voxel_l).tolist()} whole voxels "
+                "from 0 means the level's own origin was dropped"
+            )
+            assert np.allclose(hi - lo, voxel_l * 8), (
+                f"sample {i}: bbox spans {(hi - lo).tolist()}, expected {voxel_l * 8}"
+            )
+
+    def test_sample_windows_over_a_half_voxel_pyramid(self, tmp_path: Path):
+        """sample_windows converts one level's window extent into another level's index space, so
+        with per-level origins each conversion needs its own offset -- not a shared one.
+
+        The z crop is roomier than in the test above: there, the crop is exactly as wide as the
+        coarse window and admits a single placement, which a half-voxel shift of the image grid
+        removes outright. That knife edge is its own case; this one is about the conversions.
+        """
+        self._volumes(tmp_path, lbl=(24, 96, 96), lbl_tr=(20.0, 0.0, 0.0),
+                      img_scales=2, lbl_scales=2, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+                           sample_windows=True, samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5

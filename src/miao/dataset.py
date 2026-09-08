@@ -31,6 +31,7 @@ def _random_patch_origin_covering_fine_extent(
     eff_shape_curr: np.ndarray,
     max_origin: np.ndarray,
     *,
+    offset_curr: np.ndarray | None = None,
     fine_roi_lo: np.ndarray | None = None,
     fine_roi_hi_excl: np.ndarray | None = None,
 ) -> np.ndarray:
@@ -41,8 +42,13 @@ def _random_patch_origin_covering_fine_extent(
     ``rel_curr`` is ``relative_scale_factors`` at the current scale (voxel size ratio vs finest).
     ``max_origin`` is ``spatial_shape - eff_shape`` (largest valid origin per axis, inclusive).
 
+    ``offset_curr`` is the current level's origin offset in the reference frame (zero when the
+    level shares level 0's origin), so an index ``i`` at this level sits at reference coordinate
+    ``i * rel_curr - offset_curr``. Every bound below is stated on that extent.
+
     ``fine_roi_lo`` / ``fine_roi_hi_excl`` (if set) bound the patch's finest extent
-    ``[origin * rel_curr, (origin + eff_shape) * rel_curr)`` to ``[fine_roi_lo, fine_roi_hi_excl)``
+    ``[origin * rel_curr - offset_curr, (origin + eff_shape) * rel_curr - offset_curr)``
+    to ``[fine_roi_lo, fine_roi_hi_excl)``
     — used to keep the patch strictly inside a ``bounding_box`` and over the region a label array
     covers (the intersection of the two). It is a hard constraint; the caller (via
     ``_center_bounds``) guarantees a feasible origin exists, so this does not fail in valid configs.
@@ -51,16 +57,21 @@ def _random_patch_origin_covering_fine_extent(
     fine_lo = fine_lo.astype(np.float64)
     fine_hi = fine_hi.astype(np.float64)
     eff_f = eff_shape_curr.astype(np.float64)
+    # Reference coordinate r sits at index (r + offset_curr) / rel_curr on this level.
+    off = np.zeros_like(rel_curr) if offset_curr is None else offset_curr.astype(np.float64)
 
     # Cover the finer extent AND fit the volume.
-    lo = np.maximum(np.ceil(fine_hi / rel_curr - eff_f - 1e-9), 0.0)
-    hi = np.minimum(np.floor(fine_lo / rel_curr + 1e-9), max_origin.astype(np.float64))
+    lo = np.maximum(np.ceil((fine_hi + off) / rel_curr - eff_f - 1e-9), 0.0)
+    hi = np.minimum(
+        np.floor((fine_lo + off) / rel_curr + 1e-9), max_origin.astype(np.float64)
+    )
     # Stay inside the region of interest (reference frame), if given.
     if fine_roi_lo is not None:
-        lo = np.maximum(lo, np.ceil(fine_roi_lo.astype(np.float64) / rel_curr - 1e-9))
+        lo = np.maximum(lo, np.ceil((fine_roi_lo.astype(np.float64) + off) / rel_curr - 1e-9))
     if fine_roi_hi_excl is not None:
         hi = np.minimum(
-            hi, np.floor(fine_roi_hi_excl.astype(np.float64) / rel_curr - eff_f + 1e-9)
+            hi,
+            np.floor((fine_roi_hi_excl.astype(np.float64) + off) / rel_curr - eff_f + 1e-9),
         )
     if np.any(lo > hi):
         raise ValueError(
@@ -242,6 +253,10 @@ class ScaleResolution:
     label_read_shapes: list[np.ndarray] | None
     # Per-scale offset to add to a centre before converting it into label voxels
     label_center_offsets: list[np.ndarray] | None = None
+    # Per-scale offset to add to a centre before converting it into image voxels at the chosen
+    # level. Zero for a level that shares level 0's origin, which is every level of a pyramid
+    # written corner-aligned and level 0 of any pyramid.
+    image_center_offsets: list[np.ndarray] | None = None
 
 
 @dataclass
@@ -272,8 +287,10 @@ class VolumeInfo:
     # Per-level absolute spatial voxel sizes (for on-the-fly level selection)
     img_level_voxels: dict[int, np.ndarray]
     lbl_level_voxels: dict[int, np.ndarray] | None
-    # Physical origin of level-0 image and of each label level.
+    # Physical origin of level-0 image (the reference frame's anchor), of every image level, and
+    # of every label level.
     img_translation: np.ndarray
+    img_level_translations: dict[int, np.ndarray]
     lbl_level_translations: dict[int, np.ndarray] | None
     # Output patch size in image spatial axis order (interpolation target for every scale)
     read_shape: list[int]
@@ -620,6 +637,13 @@ class VolumeDataset(torch.utils.data.Dataset):
             np.array(image_meta.scales[0].translation_or_zeros(), dtype=np.float64)[img_sp_idx]
             / exp
         )
+        # Per level, for the same reason the labels are: the levels of one pyramid do not share an 
+        # origin. Reading a coarse level as though it started where level 0 does displaces the image 
+        # patch by (voxel_L - voxel_0) / 2, and drags the label read along with it.
+        img_level_translations: dict[int, np.ndarray] = {
+            lvl: np.array(m.translation_or_zeros(), dtype=np.float64)[img_sp_idx] / exp
+            for lvl, m in image_meta.scales.items()
+        }
         lbl_level_translations: dict[int, np.ndarray] | None = None
         if label_meta is not None and lbl_sp_idx is not None:
             # Per level, not once: a pyramid's levels do not share an origin.
@@ -661,6 +685,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             img_level_voxels=img_level_voxels,
             lbl_level_voxels=lbl_level_voxels,
             img_translation=img_translation,
+            img_level_translations=img_level_translations,
             lbl_level_translations=lbl_level_translations,
             read_shape=read_shape,
             min_center=np.zeros(len(img_sp_idx), dtype=np.int64),
@@ -751,6 +776,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         chosen_levels: list[int] = []
         relative_scale_factors: list[np.ndarray] = []
         read_shapes: list[np.ndarray] = []
+        image_center_offsets: list[np.ndarray] = []
         label_chosen_levels: list[int] | None = [] if has_labels else None
         label_relative_scale_factors: list[np.ndarray] | None = [] if has_labels else None
         label_read_shapes: list[np.ndarray] | None = [] if has_labels else None
@@ -766,6 +792,12 @@ class VolumeDataset(torch.utils.data.Dataset):
             img_voxel = vol_info.img_level_voxels[img_lvl]
             chosen_levels.append(img_lvl)
             relative_scale_factors.append(img_voxel / finest)
+            # Same quantity as label_center_offsets, for the image's own level: the origin
+            # difference against the reference frame, in reference-frame units. Identically zero
+            # at level 0, so a single-level read is unaffected.
+            image_center_offsets.append(
+                (vol_info.img_translation - vol_info.img_level_translations[img_lvl]) / finest
+            )
             # Storage voxels to read so that, after resampling to read_shape, the output patch
             # has voxel size `target`: read = patch * target / level_voxel.
             read_shapes.append(np.ceil(read_shape_arr * img_target / img_voxel).astype(np.int64))
@@ -801,6 +833,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             chosen_levels=chosen_levels,
             relative_scale_factors=relative_scale_factors,
             read_shapes=read_shapes,
+            image_center_offsets=image_center_offsets,
             label_chosen_levels=label_chosen_levels,
             label_relative_scale_factors=label_relative_scale_factors,
             label_read_shapes=label_read_shapes,
@@ -831,6 +864,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             sp_shape: np.ndarray,
             start: float | np.ndarray = 0.0,
             quantize: np.ndarray | None = None,
+            quantize_offset: float | np.ndarray = 0.0,
         ) -> None:
             """Constrain the centre range so this array's read fits inside it.
 
@@ -839,6 +873,10 @@ class VolumeDataset(torch.utils.data.Dataset):
             [start, start + sp_shape * rel) rather than [0, sp_shape * rel). Without it the valid
             centre range is computed as though a label crop sat at the image's origin, which
             collapses to an empty range as soon as a bounding_box points at where the crop really is.
+
+            `quantize_offset` goes with `quantize`: the image centre grid is
+            {k * quantize - quantize_offset}, not {k * quantize}, once the image level declares an
+            origin of its own.
 
             `quantize` (label calls only) is the *image* scale's relative factor. A label read is
             anchored on the centre of the image window, and that centre is floored onto the image
@@ -856,7 +894,10 @@ class VolumeDataset(torch.utils.data.Dataset):
             # Volume fit (centered patch within [start, start + sp_shape) at this level).
             lo_fit = start + rel * eff_half
             if quantize is not None:
-                lo_fit = np.ceil(lo_fit / quantize - 1e-9) * quantize
+                lo_fit = (
+                    np.ceil((lo_fit + quantize_offset) / quantize - 1e-9) * quantize
+                    - quantize_offset
+                )
             min_center = np.maximum(min_center, lo_fit)
             max_center = np.minimum(max_center, start + rel * (sp_shape - eff + eff_half))
             if bb is not None:
@@ -871,10 +912,17 @@ class VolumeDataset(torch.utils.data.Dataset):
             img_sp_shape = np.array(
                 vol_info.image_meta.scales[scale_res.chosen_levels[s]].shape, dtype=np.float64
             )[img_sp_idx]
+            # The image array begins at minus its own level's offset, exactly as the label does.
+            img_start = (
+                -scale_res.image_center_offsets[s]
+                if scale_res.image_center_offsets is not None
+                else 0.0
+            )
             _apply(
                 scale_res.relative_scale_factors[s],
                 scale_res.read_shapes[s].astype(np.float64),
                 img_sp_shape,
+                img_start,
             )
 
             if (
@@ -901,6 +949,11 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl_sp_shape,
                     lbl_start,
                     quantize=scale_res.relative_scale_factors[s],
+                    quantize_offset=(
+                        scale_res.image_center_offsets[s]
+                        if scale_res.image_center_offsets is not None
+                        else 0.0
+                    ),
                 )
 
         if bb is not None and np.any(np.ceil(min_center) > np.floor(max_center)):
@@ -1231,6 +1284,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         prev_origin: np.ndarray | None = None
         prev_eff_shape: np.ndarray | None = None
         prev_rel: np.ndarray | None = None
+        prev_offset: np.ndarray | None = None
 
         with ts.Batch() as batch:
             for s in range(n_scales):
@@ -1238,9 +1292,23 @@ class VolumeDataset(torch.utils.data.Dataset):
                 rel_factors = scales.relative_scale_factors[s]
                 eff_shape = scales.read_shapes[s]
                 eff_half = eff_shape // 2
+                # Origin difference between this image level and the reference frame, in
+                # reference-frame units: reference coordinate r is index (r + img_offset) /
+                # rel_factors here, and index i is reference coordinate i * rel_factors -
+                # img_offset. Zero unless the pyramid gives its levels separate origins.
+                img_offset = (
+                    scales.image_center_offsets[s]
+                    if scales.image_center_offsets is not None
+                    else np.zeros_like(rel_factors)
+                )
 
                 if self.config.sample_windows and s > 0:
-                    assert prev_origin is not None and prev_eff_shape is not None and prev_rel is not None
+                    assert (
+                        prev_origin is not None
+                        and prev_eff_shape is not None
+                        and prev_rel is not None
+                        and prev_offset is not None
+                    )
                     if not np.all(rel_factors + 1e-9 >= prev_rel):
                         raise AssertionError(
                             "sample_windows requires `resolutions` ordered from higher resolution "
@@ -1248,8 +1316,10 @@ class VolumeDataset(torch.utils.data.Dataset):
                             f"At scale index {s - 1} -> {s}, prev_rel={prev_rel.tolist()} but "
                             f"current rel={rel_factors.tolist()}."
                         )
-                    fine_lo = prev_origin.astype(np.float64) * prev_rel
-                    fine_hi = (prev_origin + prev_eff_shape).astype(np.float64) * prev_rel
+                    fine_lo = prev_origin.astype(np.float64) * prev_rel - prev_offset
+                    fine_hi = (
+                        prev_origin + prev_eff_shape
+                    ).astype(np.float64) * prev_rel - prev_offset
                     img_sp_shape = np.array(
                         vol_info.image_meta.scales[level].shape, dtype=np.int64
                     )[vol_info.img_spatial_idx]
@@ -1283,11 +1353,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                         rel_factors,
                         eff_shape,
                         max_origin,
+                        offset_curr=img_offset,
                         fine_roi_lo=roi_lo,
                         fine_roi_hi_excl=roi_hi,
                     )
                 else:
-                    center_at_level = np.floor(center / rel_factors).astype(np.int64)
+                    center_at_level = np.floor(
+                        (center + img_offset) / rel_factors
+                    ).astype(np.int64)
                     origin = center_at_level - eff_half
                     # Clamp into the valid range: when resolutions are sampled, the chosen level
                     # (and its read shape) differ from the one used to derive min/max_center, so
@@ -1300,10 +1373,15 @@ class VolumeDataset(torch.utils.data.Dataset):
                 prev_origin = origin
                 prev_eff_shape = np.asarray(eff_shape, dtype=np.int64).copy()
                 prev_rel = rel_factors.astype(np.float64).copy()
+                prev_offset = np.asarray(img_offset, dtype=np.float64).copy()
 
                 voxel_size = vol_info.finest_voxel_size
-                phys_min = (origin * rel_factors * voxel_size).astype(np.float64)
-                phys_max = ((origin + eff_shape) * rel_factors * voxel_size).astype(np.float64)
+                phys_min = (
+                    (origin * rel_factors - img_offset) * voxel_size
+                ).astype(np.float64)
+                phys_max = (
+                    ((origin + eff_shape) * rel_factors - img_offset) * voxel_size
+                ).astype(np.float64)
                 bbox = np.stack(
                     [phys_min[list(spatial_perm)], phys_max[list(spatial_perm)]]
                 )
@@ -1331,7 +1409,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                     # describe a region the paired image patch does not show.
                     center_fine = (
                         origin.astype(np.float64) + eff_half.astype(np.float64)
-                    ) * rel_factors
+                    ) * rel_factors - img_offset
                     # Nearest, not floor. The label index is generally fractional and flooring always
                     # moves it toward the origin, which is a systematic bias of up to a whole voxel.
                     # Rounding leaves at most half. Use floor(x + 0.5) rather than np.round, because
