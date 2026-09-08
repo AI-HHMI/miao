@@ -353,6 +353,16 @@ class VolumeDataset(torch.utils.data.Dataset):
             f"augment_fn must be a callable augment_fn(sample) -> sample, "
             f"got {type(augment_fn).__name__}"
         )
+        # The same refusal `MiaoConfig` applies to `config.augment_fn`, on the route the config
+        # cannot see: this argument never reaches the validator, so without this the pair is
+        # accepted here and the augment_fn is handed a deferred sample. See
+        # `MiaoConfig.validate_defer_image_ops` for why that cannot be made to work.
+        assert not (config.defer_image_ops and augment_fn is not None), (
+            "defer_image_ops=True cannot be combined with an augment_fn: a deferred sample's "
+            "image is a list of crops at their stored resolutions, which an augment_fn cannot "
+            "transform, and its labels are already resampled so a geometric transform would "
+            "de-register the two. Apply augmentation after miao.finish_images instead."
+        )
         if config.augment_fn is not None:
             # Validate the dotted path now (typos fail at construction); the factory call itself
             # is deferred to _get_augment_fn, once per worker process, so its return value never

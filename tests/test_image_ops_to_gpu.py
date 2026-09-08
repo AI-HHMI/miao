@@ -183,6 +183,32 @@ def test_defer_and_augment_fn_are_refused_together(sample_config: dict):
         MiaoConfig(**config)
 
 
+def test_defer_and_the_augment_fn_argument_are_refused_together(sample_config: dict):
+    """The constructor argument is refused too, because the config validator cannot see it.
+
+    `augment_fn` reaches `VolumeDataset` two ways, and only `config.augment_fn` passes through
+    `MiaoConfig`. Without a check here the argument route accepted the pair and ran the callable
+    on a deferred sample -- verified before the fix: the augment_fn was handed `sample["img"]` as
+    a `list`, silently, which is the failure the config validator exists to prevent.
+    """
+    config = MiaoConfig(**{**sample_config, "defer_image_ops": True})
+    with pytest.raises(AssertionError, match="defer_image_ops"):
+        VolumeDataset(config, augment_fn=lambda sample: sample)
+
+
+def test_the_augment_fn_argument_is_still_accepted_without_deferring(sample_config: dict):
+    """The guard must not cost the ordinary case its augmentation."""
+    config = MiaoConfig(**{**sample_config, "defer_image_ops": False})
+    calls: list[str] = []
+
+    def augment(sample):
+        calls.append(type(sample["img"]).__name__)
+        return sample
+
+    VolumeDataset(config, augment_fn=augment)[0]
+    assert calls == ["Tensor"]
+
+
 def _axes_volume(root: Path, img_axes: str, n: int = 16) -> Path:
     """A container that declares `img_axes` for its image and the matching spatial order for its
     labels. Mirrors `test_dataset._build_axes_volume`; kept local so this file stays readable."""
