@@ -19,10 +19,19 @@ import torch
 
 from miao import collate_deferred, finish_images
 from miao.config import MiaoConfig
-from miao.dataset import VolumeDataset
+from miao.dataset import VolumeDataset, _coarsest_scale_index
 
 RES_1 = [[1, 1, 1]]
 RES_2 = [[1, 1, 1], [2, 2, 2]]
+
+# `finish_images` defaults to device="cpu", so a suite that never passes anything else leaves the
+# accelerator path -- the entire point of the flag -- untested. That is how a CPU-only index
+# tensor inside `_patch_normalize_image_tensor` survived: correct on CPU, a hard failure on CUDA.
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="no CUDA device")),
+]
 
 
 def _draw(dataset: VolumeDataset, index: int, seed: int) -> dict:
@@ -41,8 +50,9 @@ def _pair(config: dict) -> tuple[VolumeDataset, VolumeDataset]:
 # ------------------------------------------------------------------ equivalence
 
 
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["one_scale", "two_scales"])
-def test_deferred_finish_reproduces_the_worker_path(sample_config: dict, resolutions):
+def test_deferred_finish_reproduces_the_worker_path(sample_config: dict, resolutions, device):
     """The whole contract, at one and at several scales.
 
     Several scales matter on their own: until something resamples them the levels have different
@@ -55,7 +65,7 @@ def test_deferred_finish_reproduces_the_worker_path(sample_config: dict, resolut
     for index in range(4):
         expected = _draw(plain, index, seed=1000 + index)["img"]
         raw = _draw(deferred, index, seed=1000 + index)
-        got = finish_images(collate_deferred([raw]))["img"][0]
+        got = finish_images(collate_deferred([raw]), device=device)["img"][0].cpu()
 
         assert got.shape == expected.shape, f"{got.shape} != {expected.shape}"
         assert got.dtype == expected.dtype
@@ -266,3 +276,35 @@ def test_deferred_handles_a_squeezed_channel_axis(tmp_path: Path, img_axes, reso
 
     assert got.shape == expected.shape
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["one_scale", "two_scales"])
+def test_patch_normalize_survives_the_device_it_is_finished_on(
+    sample_config: dict, resolutions, device
+):
+    """`patch_normalize` on the accelerator, which nothing else here covers.
+
+    It takes its statistics from one scale level, and reaching for that level is the only place
+    `finish_images` needs an index rather than arithmetic -- so it was the one operation that
+    could be correct on the CPU and raise on CUDA. Parametrized over resolutions because the
+    reference level is only a real choice when there is more than one.
+    """
+    config = {**sample_config, "resolutions": resolutions}
+    config["volumes"] = [{**v, "patch_normalize": True} for v in config["volumes"]]
+    plain, deferred = _pair(config)
+
+    expected = _draw(plain, 0, seed=23)["img"]
+    got = finish_images(collate_deferred([_draw(deferred, 0, seed=23)]), device=device)
+    got = got["img"][0].cpu()
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+    # Pinned so a silently skipped normalization cannot pass by matching an equally unnormalized
+    # reference. Checked on the reference level rather than the whole sample: the statistics come
+    # from one level and are applied to all of them, so with several scales only that level is
+    # centered -- which is the property `ref_level` exists to provide.
+    ref = got.float().index_select(
+        int(sample_config["output_axes"].index("l")),
+        torch.tensor([_coarsest_scale_index([np.asarray(r) for r in resolutions])]),
+    )
+    assert abs(float(ref.mean())) < 1e-4, "patch_normalize did not center the reference level"

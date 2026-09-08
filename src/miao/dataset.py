@@ -180,7 +180,11 @@ def _patch_normalize_image_tensor(
     Statistics come from a single scale level and are applied to every level, so the scales of a
     multi-scale sample stay on a common intensity scale.
     """
-    ref = img_tensor.index_select(l_dim, torch.tensor([ref_level])).float()
+    # `narrow` rather than `index_select`: it needs no index tensor, so there is none to build on
+    # the wrong device. The `index_select` this replaces allocated its index on the CPU, which was
+    # invisible while this only ever ran in a worker and became a hard failure once `finish_images`
+    # began calling it with the image already on an accelerator.
+    ref = img_tensor.narrow(l_dim, ref_level, 1).float()
     std = ref.std().clamp_min(1e-8)
     out = (img_tensor.float() - ref.mean()) / std
     return out.to(img_tensor.dtype)
