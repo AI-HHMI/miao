@@ -21,12 +21,24 @@ def _create_ome_ngff_zarr2(
     fill_value: float | None = None,
     base_scale_factors: list[float] | None = None,
     outer_scale: list[float] | None = None,
+    base_translation: list[float] | None = None,
+    outer_translation: list[float] | None = None,
+    half_voxel_shift: bool = False,
+    data_fn=None,
 ) -> None:
     """Create an OME-NGFF compliant zarr2 multiscale group.
 
     Each scale level is downsampled by 2x in all dimensions.
     base_scale_factors sets the voxel size at level 0 (e.g., [5, 1, 1] for anisotropic).
     outer_scale writes a multiscale-level coordinateTransformations scale entry.
+    base_translation writes a per-level translation, i.e. the physical position of the level's
+    origin; level L is offset by the same physical amount, as a real pyramid is.
+    half_voxel_shift instead gives every level its *own* origin, base_translation +
+    (scale_L - scale_0) / 2 -- the convention 850 of the 993 stores in lmd-v0.0.1 are written in,
+    where downsampling's half-voxel shift is recorded per level and level 0 declares nothing.
+    outer_translation writes a multiscale-level translation entry.
+    data_fn(level_shape, level) returns the array contents, for tests that need to know what is
+    where rather than random noise.
     """
     if axes is None:
         ndim = len(base_shape)
@@ -42,6 +54,10 @@ def _create_ome_ngff_zarr2(
     for part in parts:
         grp = grp.create_group(part, overwrite=False) if part not in grp else grp[part]
 
+    level0_scale_factors = (
+        list(base_scale_factors) if base_scale_factors is not None else [1.0] * len(base_shape)
+    )
+
     datasets = []
     for level in range(num_scales):
         scale_factor = 2**level
@@ -53,7 +69,9 @@ def _create_ome_ngff_zarr2(
 
         # Create array with deterministic data
         rng = np.random.RandomState(42 + level)
-        if fill_value is not None:
+        if data_fn is not None:
+            data = np.asarray(data_fn(level_shape, level)).astype(dtype)
+        elif fill_value is not None:
             data = np.full(level_shape, fill_value, dtype=dtype)
         else:
             data = rng.rand(*level_shape).astype(dtype)
@@ -67,14 +85,26 @@ def _create_ome_ngff_zarr2(
         )
         arr[:] = data
 
-        datasets.append(
-            {
-                "path": str(level),
-                "coordinateTransformations": [
-                    {"type": "scale", "scale": scale_factors}
-                ],
-            }
-        )
+        transforms: list[dict] = [{"type": "scale", "scale": scale_factors}]
+        if half_voxel_shift:
+            # Each level carries the half-voxel shift its own downsampling introduced, so the
+            # levels do not share an origin. Level 0's shift is zero, and -- as in the real
+            # stores -- a zero shift with no base_translation writes no translation entry at all.
+            origin = base_translation if base_translation is not None else [0.0] * len(base_shape)
+            level_translation = [
+                o + (s - s0) / 2.0
+                for o, s, s0 in zip(origin, scale_factors, level0_scale_factors)
+            ]
+            if base_translation is not None or any(t != 0.0 for t in level_translation):
+                transforms.append(
+                    {"type": "translation", "translation": level_translation}
+                )
+        elif base_translation is not None:
+            # The origin is a physical position, so it is the same at every level.
+            transforms.append(
+                {"type": "translation", "translation": list(base_translation)}
+            )
+        datasets.append({"path": str(level), "coordinateTransformations": transforms})
 
     # Write OME-NGFF .zattrs manually (zarr 3.x attrs API may not write to .zattrs correctly for v2)
     zattrs_path = root_path / group_key / ".zattrs"
@@ -84,10 +114,13 @@ def _create_ome_ngff_zarr2(
         "axes": axes,
         "datasets": datasets,
     }
+    outer: list[dict] = []
     if outer_scale is not None:
-        multiscales["coordinateTransformations"] = [
-            {"type": "scale", "scale": outer_scale}
-        ]
+        outer.append({"type": "scale", "scale": outer_scale})
+    if outer_translation is not None:
+        outer.append({"type": "translation", "translation": list(outer_translation)})
+    if outer:
+        multiscales["coordinateTransformations"] = outer
     existing["multiscales"] = [multiscales]
     zattrs_path.write_text(json.dumps(existing))
 

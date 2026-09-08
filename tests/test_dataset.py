@@ -1388,3 +1388,389 @@ class TestLabelAxisOrderValidation:
             )
             with pytest.raises(ValueError, match="do not match image spatial axes"):
                 VolumeDataset(cfg)
+
+
+class TestLabelTranslation:
+    """A label written as a crop of a larger image must be read where it actually sits.
+
+    Converting an image position into a label position needs a scale factor (the voxels differ in
+    size) and an origin offset (the arrays may start at different physical points). Only the scale
+    used to be applied, so a label crop was read as though it began at the image's origin.
+
+    The failure was silent rather than loud: the resulting index is clamped into the label array, so
+    a read landing outside it returned a plausible patch from the wrong place instead of raising.
+    These tests therefore check *content*, not shapes -- a shape assertion passes either way.
+    """
+
+    @staticmethod
+    def _ramp(shape, level):
+        """Contents that say where they came from: value == index along the first axis."""
+        import numpy as np
+
+        out = np.zeros(shape, dtype=np.float64)
+        idx = np.arange(shape[0]).reshape(-1, *([1] * (len(shape) - 1)))
+        return out + idx
+
+    def _build(self, tmp_path: Path, label_translation):
+        from conftest import _create_ome_ngff_zarr2
+
+        # Image spans 64 voxels at 1.0 units; the label covers only [20, 36) of it.
+        _create_ome_ngff_zarr2(
+            tmp_path, "raw", (64, 16, 16), num_scales=1,
+            base_scale_factors=[1.0, 1.0, 1.0], data_fn=self._ramp,
+        )
+        _create_ome_ngff_zarr2(
+            tmp_path, "labels/seg", (16, 16, 16), num_scales=1, dtype="uint16",
+            base_scale_factors=[1.0, 1.0, 1.0],
+            base_translation=label_translation,
+            data_fn=lambda shape, level: self._ramp(shape, level) + 1000,
+        )
+        return tmp_path
+
+    def test_label_crop_is_read_at_its_translation(self, tmp_path: Path):
+        """The label sits at image voxel 20, so its first row must pair with image value 20."""
+        root = self._build(tmp_path, [20.0, 0.0, 0.0])
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "offset",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                # Keep every sampled patch inside the labelled region, [20, 36) along z. The
+                # bounding_box is in output_axes spatial order (xyz here), while the arrays are
+                # written zyx, so the offset axis is last.
+                "bounding_box": [[0, 16], [0, 16], [20, 36]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]                    # (l, c, z, y, x) -> spatial
+            lbl = sample["label"][0]                     # (l, z, y, x) -> spatial
+            # The ramp encodes position, so image value and label value must describe the same
+            # place: label = image + 1000 - 20 exactly when the offset is applied.
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1, f"sample {i}: label and image disagree, got {offset}"
+            assert offset.item() == pytest.approx(1000.0 - 20.0), (
+                f"sample {i}: label read {offset.item() - 1000.0:+.0f} voxels from where the "
+                "image says it should be"
+            )
+
+    def test_no_translation_reads_as_before(self, tmp_path: Path):
+        """The inert case: with no translation the label is read exactly as it always was."""
+        root = self._build(tmp_path, None)
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "aligned",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                "bounding_box": [[0, 16], [0, 16], [0, 16]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]
+            lbl = sample["label"][0]
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1 and offset.item() == pytest.approx(1000.0)
+
+    def test_a_fractional_offset_picks_the_nearest_label_voxel(self, tmp_path: Path):
+        """With a part-voxel offset, the label index is fractional and must round, not floor.
+
+        The offset here is 0.25 of a voxel, so the exact label index for image voxel z is
+        z - 20.25. The nearest label voxel is z - 20, at distance 0.25; flooring gives z - 21, at
+        distance 0.75. This asserts the nearer one, which is a property of nearest-neighbour
+        lookup rather than a claim about what OME-NGFF's `translation` denotes.
+
+        Measured on real CellMap crops, whose offsets are 0.75 of a raw voxel: across four volumes
+        the best-fitting whole-voxel shift was always the one rounding gives, and on the one volume
+        whose offset was integral (where rounding and flooring agree) it was zero.
+        """
+        root = self._build(tmp_path, [20.25, 0.0, 0.0])
+        cfg = MiaoConfig(
+            volumes=[{
+                "name": "fractional",
+                "path": str(root),
+                "image_key": "raw",
+                "label_key": "labels/seg",
+                "bounding_box": [[0, 16], [0, 16], [21, 36]],
+            }],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=8,
+        )
+        ds = VolumeDataset(cfg)
+        for i in range(8):
+            sample = ds[i]
+            img = sample["img"][0, 0]
+            lbl = sample["label"][0]
+            offset = (lbl.double() - img.double()).unique()
+            assert offset.numel() == 1, f"sample {i}: label and image disagree, got {offset}"
+            assert offset.item() == pytest.approx(1000.0 - 20.0), (
+                f"sample {i}: got {offset.item():.0f}; 979 means the index was floored "
+                "(0.75 voxels away) instead of rounded (0.25 away)"
+            )
+
+    # --- The label read must describe the same physical region as the image patch it is paired
+    # --- with, whatever levels the two pyramids resolve to.
+    #
+    # The content checks above only work where nothing is resampled. These instead compare the
+    # reads themselves: the loader pins the image window's anchor voxel (origin + eff // 2) and the
+    # label read's anchor to one physical point, so a gap there means the label was displaced --
+    # in practice clamped back into a label array the window had wandered off, which returns a
+    # plausible patch of the wrong place rather than raising.
+
+    @staticmethod
+    def _worst_anchor_gap(ds, n_samples: int) -> float:
+        """Largest image-vs-label anchor disagreement over n_samples, in label voxels."""
+
+        class _Rec:
+            """Records the slices issued against a tensorstore handle, then delegates."""
+
+            def __init__(self, real, log, tag):
+                self._real, self._log, self._tag = real, log, tag
+
+            def __getitem__(self, key):
+                self._log.append((self._tag, key))
+                return self._real[key]
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        log: list = []
+        for kinds in ds._get_stores().values():
+            for kind, levels in kinds.items():
+                for lvl, store in list(levels.items()):
+                    levels[lvl] = _Rec(store, log, (kind, lvl))
+
+        vol = ds._volumes[0]
+
+        def anchor(meta, level, spatial_idx, key):
+            scale = np.array(meta.scales[level].scale_factors, dtype=np.float64)[spatial_idx]
+            trans = np.array(meta.scales[level].translation_or_zeros(), dtype=np.float64)[
+                spatial_idx
+            ]
+            start = np.array(
+                [k.start for i, k in enumerate(key) if i in spatial_idx], dtype=np.float64
+            )
+            stop = np.array(
+                [k.stop for i, k in enumerate(key) if i in spatial_idx], dtype=np.float64
+            )
+            return trans + (start + (stop - start) // 2) * scale, scale
+
+        worst = 0.0
+        for i in range(n_samples):
+            log.clear()
+            ds[i]
+            imgs = [(t, k) for t, k in log if t[0] == "img"]
+            lbls = [(t, k) for t, k in log if t[0] == "label"]
+            assert imgs and len(imgs) == len(lbls), "expected one label read per image read"
+            for (it, ik), (lt, lk) in zip(imgs, lbls):
+                img_anchor, _ = anchor(vol.image_meta, it[1], vol.img_spatial_idx, ik)
+                lbl_anchor, lbl_voxel = anchor(vol.label_meta, lt[1], vol.lbl_spatial_idx, lk)
+                worst = max(worst, float(np.max(np.abs(img_anchor - lbl_anchor) / lbl_voxel)))
+        return worst
+
+    @staticmethod
+    def _volumes(root: Path, *, img=(96, 96, 96), lbl=(96, 96, 96), lbl_tr=None, img_tr=None,
+                 img_scales=3, lbl_scales=3, img_axes=None, voxel=None, lbl_voxel=None,
+                 img_half_voxel=False, lbl_half_voxel=False) -> None:
+        from conftest import _create_ome_ngff_zarr2
+
+        _create_ome_ngff_zarr2(
+            root, "raw", img, num_scales=img_scales, axes=img_axes,
+            base_scale_factors=list(voxel) if voxel else [1.0] * len(img),
+            base_translation=list(img_tr) if img_tr else None,
+            half_voxel_shift=img_half_voxel,
+        )
+        _create_ome_ngff_zarr2(
+            root, "labels/seg", lbl, num_scales=lbl_scales, dtype="uint16",
+            base_scale_factors=list(lbl_voxel) if lbl_voxel else [1.0] * len(lbl),
+            base_translation=list(lbl_tr) if lbl_tr else None,
+            half_voxel_shift=lbl_half_voxel,
+        )
+
+    @staticmethod
+    def _dataset(root: Path, resolutions, **kwargs) -> VolumeDataset:
+        vol = {"name": "v", "path": str(root), "image_key": "raw", "label_key": "labels/seg"}
+        vol.update(kwargs.pop("volume", {}))
+        return VolumeDataset(MiaoConfig(
+            volumes=[vol], resolutions=resolutions, output_axes="lcxyz",
+            patch_size=[8, 8, 8], samples_per_epoch=kwargs.pop("samples", 24), **kwargs,
+        ))
+
+    def test_label_tracks_the_image_window_at_coarse_levels(self, tmp_path: Path):
+        """No translation anywhere -- purely that the label follows the window that was read.
+
+        `origin` is a whole number of voxels at the level being read, so on a coarser level the
+        window sits up to one level-voxel off the requested centre. Anchoring the label on the
+        centre rather than on the window leaves it a voxel out whenever the centre does not land
+        on the coarse grid, which is half the centres at level 1.
+        """
+        self._volumes(tmp_path)
+        ds = self._dataset(tmp_path, [[2.0, 2.0, 2.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_label_tracks_the_image_window_at_the_coarsest_level(self, tmp_path: Path):
+        """Same, three levels down, where the quantization is four reference voxels wide."""
+        self._volumes(tmp_path)
+        ds = self._dataset(tmp_path, [[4.0, 4.0, 4.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_sample_windows_keeps_a_coarse_window_over_an_offset_label(self, tmp_path: Path):
+        """sample_windows places coarser windows off-centre, and the label read follows them.
+
+        A label spanning the whole image stays covered whatever the window does; a label *crop*
+        does not, so the window has to be held over the labelled region as well.
+
+        Along z the crop is exactly as wide as the coarse window (16 reference voxels), which
+        leaves the window one placement that keeps its label read on the crop and several that do
+        not -- so this does not depend on happening to draw a centre near an edge. y and x are
+        left roomy, to check the constraint only binds where the label actually runs out.
+        """
+        self._volumes(tmp_path, lbl=(16, 96, 96), lbl_tr=(20.0, 0.0, 0.0),
+                      img_scales=2, lbl_scales=2)
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+                           sample_windows=True, samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+    def test_offset_label_with_a_shallower_pyramid_than_the_image(self, tmp_path: Path):
+        """Labels stored at full resolution only, so the image reads a coarser level than the label.
+
+        The window centre is floored onto the image level's grid -- four reference voxels here --
+        and the label's own origin (23) does not sit on that grid, so at the crop's low edge the
+        label read underflows by up to three label voxels and is silently clamped.
+        """
+        self._volumes(tmp_path, lbl=(48, 48, 48), lbl_tr=(23.0, 23.0, 23.0), lbl_scales=1)
+        ds = self._dataset(tmp_path, [[4.0, 4.0, 4.0]], samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+    def test_offset_label_when_only_the_image_has_a_channel_axis(self, tmp_path: Path):
+        """Each translation is indexed with its own array's spatial indices.
+
+        The image is "czyx" and the label "zyx", so the same spatial axis sits at a different
+        position in the two translation lists; only the spatial order has to agree (it is
+        validated elsewhere). Both arrays are translated, and differently per axis, so mixing the
+        two indexings up would show as a misread.
+        """
+        czyx = [{"name": "c", "type": "channel"}] + [
+            {"name": a, "type": "space", "unit": "micrometer"} for a in "zyx"
+        ]
+        self._volumes(
+            tmp_path, img=(2, 96, 96, 96), img_axes=czyx, voxel=[1.0, 1.0, 1.0, 1.0],
+            img_tr=(0.0, 5.0, 3.0, 1.0), img_scales=1,
+            lbl=(48, 48, 48), lbl_tr=(20.0, 9.0, 7.0), lbl_scales=1,
+        )
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0]], samples=24)
+        assert self._worst_anchor_gap(ds, 24) <= 0.5
+
+    def test_chunk_aligned_sampling_keeps_an_offset_label(self, tmp_path: Path):
+        """chunk_aligned picks chunks of the *image*, but clamps to the volume's centre range,
+        which already accounts for where the label sits."""
+        self._volumes(tmp_path, lbl=(48, 96, 96), lbl_tr=(20.0, 0.0, 0.0))
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0]], chunk_aligned=True, samples=48)
+        assert self._worst_anchor_gap(ds, 48) <= 0.5
+
+    def test_error_names_the_label_when_the_label_is_what_does_not_fit(self, tmp_path: Path):
+        """A label crop far smaller than the patch window: the image is large enough, so the
+        message must not send the reader off to find a larger volume."""
+        self._volumes(tmp_path, img=(128, 128, 128), img_scales=1,
+                      lbl=(4, 4, 4), lbl_tr=(40.0, 40.0, 40.0), lbl_scales=1)
+        with pytest.raises(ValueError, match=r"it is the label \('labels/seg'\)"):
+            self._dataset(tmp_path, [[1.0, 1.0, 1.0]], samples=4)
+
+    # --- The levels of one pyramid need not share an origin. The prevailing OME-NGFF convention
+    # --- records translation_L = (scale_L - scale_0) / 2 on each level, level 0 declaring nothing
+    # --- -- 850 of the 993 multiscale groups in lmd-v0.0.1 are written that way. Reading a coarse
+    # --- image level as though it began where level 0 does puts the image patch
+    # --- (voxel_L - voxel_0) / 2 away from where it is reported to be, and since the label read is
+    # --- anchored on the image window, the label is dragged along with it.
+
+    @pytest.mark.parametrize("res,was", [(12.0, 0.5), (24.0, 1.5), (48.0, 3.5)])
+    def test_image_read_honours_its_own_level_translation(
+        self, tmp_path: Path, res: float, was: float
+    ):
+        """Labels at full resolution only, image read coarse: the case where nothing absorbs the
+        image's own per-level shift.
+
+        Where the label resolves to the same relative scale as the image the two shifts are equal
+        and cancel, and where it does not they do not. With labels at level 0 and the image at
+        level L the gap is (rel - 1) / 2 label voxels -- measured at 0.5 / 1.5 / 3.5 for
+        rel = 2 / 4 / 8 while the image translation was read from level 0 only.
+
+        Only rel = 4 and rel = 8 actually discriminate: at rel = 2 the gap is 0.5, which is also
+        what nearest-voxel rounding onto a coarser grid costs, so that case reads the same either
+        way. It is kept as the low end of the progression.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=1, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[res] * 3], samples=32)
+        gap = self._worst_anchor_gap(ds, 32)
+        assert gap <= 0.5, (
+            f"label displaced {gap} label voxels; {was} is what reading the image translation "
+            "from level 0 only gives at this resolution"
+        )
+
+    @pytest.mark.parametrize("res", [6.0, 12.0, 24.0, 48.0])
+    def test_matched_half_voxel_pyramids_stay_exactly_aligned(self, tmp_path: Path, res: float):
+        """Both pyramids in the same convention, read at the same relative scale: the shifts are
+        equal, so the reads coincide exactly rather than merely within rounding.
+
+        This case reads correctly either way -- the label's own per-level translation absorbs the
+        image's -- so it is here to catch an image-side correction applied twice or with the wrong
+        sign, which would break it.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=4,
+                      img_half_voxel=True, lbl_half_voxel=True)
+        ds = self._dataset(tmp_path, [[res] * 3], samples=32)
+        assert self._worst_anchor_gap(ds, 32) == 0.0
+
+    def test_bbox_reports_the_extent_of_a_shifted_level(self, tmp_path: Path):
+        """The reported bbox is the physical extent of the voxels actually read, measured from the
+        image's level-0 origin, so on a shifted level it carries that level's own origin.
+
+        Level 2 here has voxel 24 and origin 9, so every read starts at 24k + 9. Ignoring the
+        level's origin puts the bbox at 24k -- naming a region 9 units from the data returned.
+        """
+        self._volumes(tmp_path, voxel=(6.0, 6.0, 6.0), lbl_voxel=(6.0, 6.0, 6.0),
+                      img_scales=4, lbl_scales=1, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[24.0] * 3], samples=16)
+        voxel_l, origin_l = 24.0, 9.0
+        for i in range(16):
+            bbox = ds[i]["bbox"][0].numpy()
+            lo, hi = bbox[0], bbox[1]
+            off = (lo - origin_l) / voxel_l
+            assert np.allclose(off, np.round(off)), (
+                f"sample {i}: bbox lo={lo.tolist()} is not an whole number of level-2 voxels "
+                f"from that level's origin ({origin_l}); {(lo / voxel_l).tolist()} whole voxels "
+                "from 0 means the level's own origin was dropped"
+            )
+            assert np.allclose(hi - lo, voxel_l * 8), (
+                f"sample {i}: bbox spans {(hi - lo).tolist()}, expected {voxel_l * 8}"
+            )
+
+    def test_sample_windows_over_a_half_voxel_pyramid(self, tmp_path: Path):
+        """sample_windows converts one level's window extent into another level's index space, so
+        with per-level origins each conversion needs its own offset -- not a shared one.
+
+        The z crop is roomier than in the test above: there, the crop is exactly as wide as the
+        coarse window and admits a single placement, which a half-voxel shift of the image grid
+        removes outright. That knife edge is its own case; this one is about the conversions.
+        """
+        self._volumes(tmp_path, lbl=(24, 96, 96), lbl_tr=(20.0, 0.0, 0.0),
+                      img_scales=2, lbl_scales=2, img_half_voxel=True)
+        ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+                           sample_windows=True, samples=32)
+        assert self._worst_anchor_gap(ds, 32) <= 0.5
