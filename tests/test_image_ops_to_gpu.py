@@ -181,3 +181,62 @@ def test_defer_and_augment_fn_are_refused_together(sample_config: dict):
     }
     with pytest.raises(ValueError, match="defer_image_ops"):
         MiaoConfig(**config)
+
+
+def _axes_volume(root: Path, img_axes: str, n: int = 16) -> Path:
+    """A container that declares `img_axes` for its image and the matching spatial order for its
+    labels. Mirrors `test_dataset._build_axes_volume`; kept local so this file stays readable."""
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    zz, yy, xx = np.meshgrid(*[np.arange(n)] * 3, indexing="ij")
+    val_zyx = (zz * 10000 + yy * 100 + xx).astype(np.float32)
+    lbl_axes = "".join(c for c in img_axes if c in "xyz")
+
+    grp_root = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2)
+    for key, axes_str, dtype in [("raw", img_axes, "float32"), ("seg", lbl_axes, "uint32")]:
+        spatial = "".join(c for c in axes_str if c in "xyz")
+        data = np.transpose(val_zyx, ["zyx".index(c) for c in spatial]).astype(dtype)
+        if "c" in axes_str:
+            data = np.expand_dims(data, axis=axes_str.index("c"))
+        g = grp_root.create_group(key)
+        a = g.create_array("0", shape=data.shape, chunks=data.shape, dtype=dtype, overwrite=True)
+        a[:] = data
+        axes = [
+            {"name": c, "type": ("channel" if c == "c" else "space")}
+            | ({} if c == "c" else {"unit": "micrometer"})
+            for c in axes_str
+        ]
+        (root / key / ".zattrs").write_text(json.dumps({"multiscales": [{
+            "version": "0.4", "axes": axes,
+            "datasets": [{"path": "0", "coordinateTransformations": [
+                {"type": "scale", "scale": [1.0] * len(axes_str)}]}],
+        }]}))
+    return root
+
+
+@pytest.mark.parametrize("img_axes", ["cxyz", "xyzc", "zyx"])
+@pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["no_resample", "resample"])
+def test_deferred_handles_a_squeezed_channel_axis(tmp_path: Path, img_axes, resolutions):
+    """A stored channel axis that `output_axes` drops must not break the deferred path.
+
+    The worker squeezes the channel off before handing the crop over, so the descriptor has to
+    describe the crop as handed over -- `img_spatial_idx` indexes the *stored* axes, and for the
+    conventional channel-first order it points one past the squeezed crop's last axis. Both
+    orders are parametrized because only channel-first exposes it: with 'xyzc' the indices happen
+    to survive the squeeze unchanged.
+    """
+    path = _axes_volume(tmp_path / f"{img_axes}_{len(resolutions)}.zarr", img_axes)
+    config = dict(
+        volumes=[{"name": "v", "path": str(path), "image_key": "raw", "label_key": "seg"}],
+        resolutions=resolutions, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
+    )
+    plain, deferred = _pair(config)
+
+    expected = _draw(plain, 0, seed=17)["img"]
+    got = finish_images(collate_deferred([_draw(deferred, 0, seed=17)]))["img"][0]
+
+    assert got.shape == expected.shape
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)

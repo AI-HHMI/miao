@@ -1282,7 +1282,15 @@ class VolumeDataset(torch.utils.data.Dataset):
                 "add_channel": add_channel,
                 "has_channel": has_img_channel and not squeeze_channel,
                 "channel_pos": vol_info.img_axes.index("c") if "c" in vol_info.img_axes else -1,
-                "spatial_idx": list(vol_info.img_spatial_idx),
+                # Indices into the crop the worker actually hands over, not into the stored
+                # axes: when the channel is squeezed off above, the crop is spatial-only and
+                # `img_spatial_idx` (an index into `img_axes`) points past its last axis. The
+                # label path shifts the same indices for the same reason.
+                "spatial_idx": (
+                    list(range(len(vol_info.img_spatial_idx)))
+                    if squeeze_channel
+                    else list(vol_info.img_spatial_idx)
+                ),
                 "image_dtype": self.config.image_dtype,
                 "normalize": bool(vol_info.config.normalize),
                 # -inf as "unset": None does not survive the default collate, and no real
