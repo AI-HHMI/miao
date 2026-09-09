@@ -223,7 +223,11 @@ def _patch_normalize_image_tensor(
     Statistics come from a single scale level and are applied to every level, so the scales of a
     multi-scale sample stay on a common intensity scale.
     """
-    ref = img_tensor.index_select(l_dim, torch.tensor([ref_level])).float()
+    # `narrow` rather than `index_select`: it needs no index tensor, so there is none to build on
+    # the wrong device. The `index_select` this replaces allocated its index on the CPU, which was
+    # invisible while this only ever ran in a worker and became a hard failure once `finish_images`
+    # began calling it with the image already on an accelerator.
+    ref = img_tensor.narrow(l_dim, ref_level, 1).float()
     std = ref.std().clamp_min(1e-8)
     out = (img_tensor.float() - ref.mean()) / std
     return out.to(img_tensor.dtype)
@@ -406,6 +410,16 @@ class VolumeDataset(torch.utils.data.Dataset):
         assert augment_fn is None or callable(augment_fn), (
             f"augment_fn must be a callable augment_fn(sample) -> sample, "
             f"got {type(augment_fn).__name__}"
+        )
+        # The same refusal `MiaoConfig` applies to `config.augment_fn`, on the route the config
+        # cannot see: this argument never reaches the validator, so without this the pair is
+        # accepted here and the augment_fn is handed a deferred sample. See
+        # `MiaoConfig.validate_defer_image_ops` for why that cannot be made to work.
+        assert not (config.defer_image_ops and augment_fn is not None), (
+            "defer_image_ops=True cannot be combined with an augment_fn: a deferred sample's "
+            "image is a list of crops at their stored resolutions, which an augment_fn cannot "
+            "transform, and its labels are already resampled so a geometric transform would "
+            "de-register the two. Apply augmentation after miao.finish_images instead."
         )
         if config.augment_fn is not None:
             # Validate the dotted path now (typos fail at construction); the factory call itself
@@ -1454,7 +1468,11 @@ class VolumeDataset(torch.utils.data.Dataset):
             else:
                 sp_shape = tuple(patch.shape)
 
-            if sp_shape != target_size:
+            if sp_shape != target_size and self.config.defer_image_ops:
+                # Left at its stored shape and dtype for `finish_images` to resample on device.
+                # Nothing else in this loop touches the image, so the crop simply passes through.
+                pass
+            elif sp_shape != target_size:
                 patch_t = torch.from_numpy(patch).float()
                 if has_channel_in_patch:
                     # Rearrange to (C, spatial...) so F.interpolate sees (N,C,D,H,W)
@@ -1500,26 +1518,73 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl = lbl_t.numpy().astype(vol_info.label_np_dtype)
                 label_crops.append(lbl)
 
-        # Stack across levels → (L, *storage_axes), then permute to output_axes
-        img_stacked = torch.from_numpy(np.stack(img_crops))
-        if add_channel:
-            img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
         from miao.config import IMAGE_DTYPE_MAP
         _img_dtype = IMAGE_DTYPE_MAP[self.config.image_dtype]
-        img_tensor = img_stacked.permute(img_perm).to(_img_dtype)
-        img_tensor = _normalize_image_tensor(
-            img_tensor,
-            normalize=vol_info.config.normalize,
-            normalize_min=vol_info.config.normalize_min,
-            normalize_max=vol_info.config.normalize_max,
-            image_dtype=vol_info.image_dtype,
-        )
-        if vol_info.config.patch_normalize:
-            img_tensor = _patch_normalize_image_tensor(
+
+        deferred: dict | None = None
+        if self.config.defer_image_ops:
+            # Per level, not stacked: the levels still have their stored shapes, and stacking is
+            # exactly what resampling makes possible. `finish_images` resamples each to
+            # `target_size` and then repeats the steps below verbatim.
+            img_tensor = [torch.from_numpy(np.ascontiguousarray(c)) for c in img_crops]
+            deferred = {
+                "target_size": list(target_size),
+                "img_perm": list(img_perm),
+                "add_channel": add_channel,
+                "has_channel": has_img_channel and not squeeze_channel,
+                "channel_pos": vol_info.img_axes.index("c") if "c" in vol_info.img_axes else -1,
+                # Indices into the crop the worker actually hands over, not into the stored
+                # axes: when the channel is squeezed off above, the crop is spatial-only and
+                # `img_spatial_idx` (an index into `img_axes`) points past its last axis. The
+                # label path shifts the same indices for the same reason.
+                "spatial_idx": (
+                    list(range(len(vol_info.img_spatial_idx)))
+                    if squeeze_channel
+                    else list(vol_info.img_spatial_idx)
+                ),
+                "image_dtype": self.config.image_dtype,
+                "normalize": bool(vol_info.config.normalize),
+                # -inf as "unset": None does not survive the default collate, and no real
+                # normalization bound is infinite.
+                "normalize_min": float(
+                    vol_info.config.normalize_min
+                    if vol_info.config.normalize_min is not None
+                    else float("-inf")
+                ),
+                "normalize_max": float(
+                    vol_info.config.normalize_max
+                    if vol_info.config.normalize_max is not None
+                    else float("-inf")
+                ),
+                "integer_source": bool(np.issubdtype(vol_info.image_dtype, np.integer)),
+                "source_max": float(
+                    np.iinfo(vol_info.image_dtype).max
+                    if np.issubdtype(vol_info.image_dtype, np.integer)
+                    else 0.0
+                ),
+                "patch_normalize": bool(vol_info.config.patch_normalize),
+                "l_dim": self.config.output_axes.index("l"),
+                "ref_level": _coarsest_scale_index(scales.resolutions),
+            }
+        else:
+            # Stack across levels → (L, *storage_axes), then permute to output_axes
+            img_stacked = torch.from_numpy(np.stack(img_crops))
+            if add_channel:
+                img_stacked = img_stacked.unsqueeze(-1)  # add singleton C at end
+            img_tensor = img_stacked.permute(img_perm).to(_img_dtype)
+            img_tensor = _normalize_image_tensor(
                 img_tensor,
-                l_dim=self.config.output_axes.index("l"),
-                ref_level=_coarsest_scale_index(scales.resolutions),
+                normalize=vol_info.config.normalize,
+                normalize_min=vol_info.config.normalize_min,
+                normalize_max=vol_info.config.normalize_max,
+                image_dtype=vol_info.image_dtype,
             )
+            if vol_info.config.patch_normalize:
+                img_tensor = _patch_normalize_image_tensor(
+                    img_tensor,
+                    l_dim=self.config.output_axes.index("l"),
+                    ref_level=_coarsest_scale_index(scales.resolutions),
+                )
         if label_crops:
             label_tensor = torch.from_numpy(np.stack(label_crops)).permute(lbl_perm).to(vol_info.label_torch_dtype)
         else:
@@ -1570,6 +1635,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 # grid_index only present in sequential mode; None breaks DataLoader collation
                 **({"grid_index": grid_index_out} if grid_index_out is not None else {}),
             },
+            **({"deferred": deferred} if deferred is not None else {}),
         }
 
         augment_fn = self._get_augment_fn()
@@ -1582,3 +1648,103 @@ class VolumeDataset(torch.utils.data.Dataset):
             )
 
         return x
+
+
+# --------------------------------------------------------------------------------------------
+# Deferred image ops: `MiaoConfig.defer_image_ops`
+#
+# The pair below is the other half of that flag. They exist here, beside the code they replace,
+# because they have to stay in step with it: `finish_images` performs the same resample, cast,
+# normalization and patch normalization that `__getitem__` would have, in the same order, and a
+# change to one that is not mirrored in the other is a silent difference in what a model trains
+# on. `tests/test_defer_image_ops.py` pins them equal.
+# --------------------------------------------------------------------------------------------
+
+
+def collate_deferred(samples: list[dict]) -> dict:
+    """Collate samples whose images are still at their stored shapes.
+
+    The default collate cannot be used, and the reason is the point of the flag: two samples come
+    from different volumes, so their crops have different read shapes until something resamples
+    them. Images and their `deferred` descriptors are therefore kept as lists, in sample order,
+    and everything else goes through the default collate unchanged.
+    """
+    from torch.utils.data import default_collate
+
+    if not samples:
+        raise ValueError("collate_deferred received an empty batch")
+    if "deferred" not in samples[0]:
+        raise KeyError(
+            "collate_deferred expects samples produced with defer_image_ops=True; this batch "
+            "carries no 'deferred' key. Use the default collate, or set defer_image_ops."
+        )
+    rest = [{k: v for k, v in s.items() if k not in ("img", "deferred")} for s in samples]
+    batch = default_collate(rest)
+    batch["img"] = [s["img"] for s in samples]
+    batch["deferred"] = [s["deferred"] for s in samples]
+    return batch
+
+
+def finish_images(batch: dict, device: "torch.device | str" = "cpu") -> dict:
+    """Resample and normalize a `collate_deferred` batch, returning the standard stacked image.
+
+    Equivalent to what `VolumeDataset.__getitem__` does with `defer_image_ops=False`, moved to
+    whichever device is asked for. The returned batch has the same `img` a default-collated batch
+    would: `(B, *output_axes)` in `image_dtype`, normalized.
+
+    Per sample rather than over the whole batch, since read shape, axis permutation and
+    normalization policy are all properties of the volume a sample was drawn from, and a batch
+    spans volumes. The expensive part is the interpolation, which runs on `device` either way.
+    """
+    from miao.config import IMAGE_DTYPE_MAP
+
+    if "deferred" not in batch:
+        return batch
+    out_dtype = None
+    finished: list[torch.Tensor] = []
+    for crops, spec in zip(batch["img"], batch["deferred"], strict=True):
+        target = tuple(int(s) for s in spec["target_size"])
+        levels: list[torch.Tensor] = []
+        for crop in crops:
+            crop = crop.to(device, non_blocking=True)
+            spatial = tuple(int(crop.shape[i]) for i in spec["spatial_idx"])
+            if spatial != target:
+                work = crop.float()
+                if spec["has_channel"]:
+                    perm = [int(spec["channel_pos"])] + [int(i) for i in spec["spatial_idx"]]
+                    inverse = [0] * len(perm)
+                    for position, axis in enumerate(perm):
+                        inverse[axis] = position
+                    work = F.interpolate(
+                        work.permute(perm).unsqueeze(0),
+                        size=target, mode="trilinear", align_corners=False,
+                    ).squeeze(0).permute(inverse)
+                else:
+                    work = F.interpolate(
+                        work.unsqueeze(0).unsqueeze(0),
+                        size=target, mode="trilinear", align_corners=False,
+                    ).squeeze(0).squeeze(0)
+                crop = work
+            levels.append(crop)
+
+        stacked = torch.stack(levels)
+        if spec["add_channel"]:
+            stacked = stacked.unsqueeze(-1)
+        out_dtype = IMAGE_DTYPE_MAP[spec["image_dtype"]]
+        image = stacked.permute([int(p) for p in spec["img_perm"]]).to(out_dtype)
+
+        if spec["normalize"]:
+            low, high = float(spec["normalize_min"]), float(spec["normalize_max"])
+            if low != float("-inf") and high != float("-inf"):
+                image = (image.clamp(low, high) - low) / (high - low)
+            elif spec["integer_source"]:
+                image = image / float(spec["source_max"])
+        if spec["patch_normalize"]:
+            image = _patch_normalize_image_tensor(
+                image, l_dim=int(spec["l_dim"]), ref_level=int(spec["ref_level"])
+            )
+        finished.append(image)
+
+    out = {k: v for k, v in batch.items() if k != "deferred"}
+    out["img"] = torch.stack(finished).to(out_dtype)
+    return out

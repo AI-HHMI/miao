@@ -1,0 +1,310 @@
+"""`defer_image_ops` must move the work, not change it.
+
+The flag exists so that resampling and normalization can run on an accelerator instead of in a
+dataloader worker. That is only worth having if the result is the same tensor, so the tests that
+matter here compare the deferred path against the ordinary one on identical draws rather than
+checking the deferred path in isolation.
+
+The RNG is pinned around each `__getitem__` because the sampler draws a volume and a centre per
+call; without that the two paths would read different crops and the comparison would be vacuous.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from miao import collate_deferred, finish_images
+from miao.config import MiaoConfig
+from miao.dataset import VolumeDataset, _coarsest_scale_index
+
+RES_1 = [[1, 1, 1]]
+RES_2 = [[1, 1, 1], [2, 2, 2]]
+
+# `finish_images` defaults to device="cpu", so a suite that never passes anything else leaves the
+# accelerator path -- the entire point of the flag -- untested. That is how a CPU-only index
+# tensor inside `_patch_normalize_image_tensor` survived: correct on CPU, a hard failure on CUDA.
+DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="no CUDA device")),
+]
+
+
+def _draw(dataset: VolumeDataset, index: int, seed: int) -> dict:
+    """One sample with the sampler's randomness pinned, so two datasets read the same crop."""
+    np.random.seed(seed)
+    return dataset[index]
+
+
+def _pair(config: dict) -> tuple[VolumeDataset, VolumeDataset]:
+    """The same configuration with the flag off and on."""
+    plain = MiaoConfig(**{**config, "defer_image_ops": False})
+    deferred = MiaoConfig(**{**config, "defer_image_ops": True})
+    return VolumeDataset(plain), VolumeDataset(deferred)
+
+
+# ------------------------------------------------------------------ equivalence
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["one_scale", "two_scales"])
+def test_deferred_finish_reproduces_the_worker_path(sample_config: dict, resolutions, device):
+    """The whole contract, at one and at several scales.
+
+    Several scales matter on their own: until something resamples them the levels have different
+    read shapes, so the deferred sample cannot be a stacked tensor at all, and `finish_images` is
+    what makes the stack possible.
+    """
+    config = {**sample_config, "resolutions": resolutions}
+    plain, deferred = _pair(config)
+
+    for index in range(4):
+        expected = _draw(plain, index, seed=1000 + index)["img"]
+        raw = _draw(deferred, index, seed=1000 + index)
+        got = finish_images(collate_deferred([raw]), device=device)["img"][0].cpu()
+
+        assert got.shape == expected.shape, f"{got.shape} != {expected.shape}"
+        assert got.dtype == expected.dtype
+        torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_deferred_sample_is_raw_and_unstacked(sample_config: dict):
+    """What the worker hands back: the volume's stored dtype, one entry per scale.
+
+    Pinned because it is the whole point -- a crop still in its stored dtype at its stored size is
+    what makes the transfer smaller and the worker cheap. Asserted against the volume's own dtype
+    rather than against `uint8`, since the fixture stores float32 and the property being checked is
+    "untouched", not "integer".
+    """
+    config = {**sample_config, "resolutions": RES_2}
+    _, deferred = _pair(config)
+    sample = _draw(deferred, 0, seed=7)
+
+    assert isinstance(sample["img"], list), "deferred images stay per scale until resampled"
+    assert len(sample["img"]) == len(RES_2)
+    assert "deferred" in sample
+
+    stored = torch.from_numpy(np.empty(0, dtype=deferred._volumes[0].image_dtype)).dtype
+    assert sample["img"][0].dtype == stored, (
+        f"deferred crop was converted to {sample['img'][0].dtype}; it should still be the stored "
+        f"{stored}, or the transfer saving is lost"
+    )
+
+
+def test_normalization_is_applied_exactly_once(sample_config: dict):
+    """Deferring must not leave the crop un-normalized, nor normalize it twice."""
+    config = {**sample_config, "resolutions": RES_1}
+    plain, deferred = _pair(config)
+
+    expected = _draw(plain, 0, seed=11)["img"]
+    got = finish_images(collate_deferred([_draw(deferred, 0, seed=11)]))["img"][0]
+
+    assert expected.max() <= 1.0 + 1e-6, "fixture is expected to normalize into [0, 1]"
+    torch.testing.assert_close(got.max(), expected.max(), rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(got.mean(), expected.mean(), rtol=1e-5, atol=1e-5)
+
+
+# ------------------------------------------------------------------ batching
+
+
+def test_collate_handles_a_batch_spanning_shapes(sample_config: dict):
+    """A batch draws several volumes, so read shapes differ -- the reason default collate fails."""
+    config = {**sample_config, "resolutions": RES_1}
+    _, deferred = _pair(config)
+
+    batch = collate_deferred([_draw(deferred, i, seed=200 + i) for i in range(3)])
+    assert len(batch["img"]) == 3
+    finished = finish_images(batch)["img"]
+
+    assert finished.shape[0] == 3
+    assert "deferred" not in finished if isinstance(finished, dict) else True
+
+
+def test_collate_keeps_every_other_field(sample_config: dict):
+    config = {**sample_config, "resolutions": RES_1}
+    plain, deferred = _pair(config)
+
+    reference = _draw(plain, 0, seed=5)
+    batch = finish_images(collate_deferred([_draw(deferred, 0, seed=5)]))
+
+    for key in ("label", "bbox", "pixel_size"):
+        assert key in batch, f"{key} was dropped by the deferred path"
+        torch.testing.assert_close(batch[key][0], reference[key])
+    assert batch["meta"]["volume"][0] == reference["meta"]["volume"]
+
+
+def test_labels_are_not_deferred(sample_config: dict):
+    """Labels stay on the worker: nearest-neighbour on integers is cheap, and a float round trip
+    through interpolation is exactly how instance ids get merged."""
+    config = {**sample_config, "resolutions": RES_1}
+    plain, deferred = _pair(config)
+
+    reference = _draw(plain, 0, seed=13)["label"]
+    got = _draw(deferred, 0, seed=13)["label"]
+
+    assert got.dtype == reference.dtype
+    torch.testing.assert_close(got, reference)
+
+
+# ------------------------------------------------------------------ guardrails
+
+
+def test_collate_deferred_rejects_an_undeferred_batch(sample_config: dict):
+    plain, _ = _pair({**sample_config, "resolutions": RES_1})
+    with pytest.raises(KeyError, match="defer_image_ops"):
+        collate_deferred([_draw(plain, 0, seed=1)])
+
+
+def test_collate_deferred_rejects_an_empty_batch():
+    with pytest.raises(ValueError, match="empty batch"):
+        collate_deferred([])
+
+
+def test_finish_images_passes_an_ordinary_batch_through(sample_config: dict):
+    """So a caller can apply it unconditionally without branching on the flag."""
+    from torch.utils.data import default_collate
+
+    plain, _ = _pair({**sample_config, "resolutions": RES_1})
+    batch = default_collate([_draw(plain, 0, seed=3)])
+    assert finish_images(batch) is batch
+
+
+def test_flag_defaults_off(sample_config: dict):
+    assert MiaoConfig(**sample_config).defer_image_ops is False
+
+
+def test_defer_and_augment_fn_are_refused_together(sample_config: dict):
+    """The pair cannot work, so it fails at config time rather than inside a worker.
+
+    Worth an explicit check because both halves of the failure are opaque: an `augment_fn` sees a
+    list where it expects an array, and if it happened to tolerate that, it would transform an
+    image whose labels were already resampled -- de-registering them with no error at all.
+    """
+    config = {
+        **sample_config,
+        "defer_image_ops": True,
+        "augment_fn": "miao.augment_std.identity",
+    }
+    with pytest.raises(ValueError, match="defer_image_ops"):
+        MiaoConfig(**config)
+
+
+def test_defer_and_the_augment_fn_argument_are_refused_together(sample_config: dict):
+    """The constructor argument is refused too, because the config validator cannot see it.
+
+    `augment_fn` reaches `VolumeDataset` two ways, and only `config.augment_fn` passes through
+    `MiaoConfig`. Without a check here the argument route accepted the pair and ran the callable
+    on a deferred sample -- verified before the fix: the augment_fn was handed `sample["img"]` as
+    a `list`, silently, which is the failure the config validator exists to prevent.
+    """
+    config = MiaoConfig(**{**sample_config, "defer_image_ops": True})
+    with pytest.raises(AssertionError, match="defer_image_ops"):
+        VolumeDataset(config, augment_fn=lambda sample: sample)
+
+
+def test_the_augment_fn_argument_is_still_accepted_without_deferring(sample_config: dict):
+    """The guard must not cost the ordinary case its augmentation."""
+    config = MiaoConfig(**{**sample_config, "defer_image_ops": False})
+    calls: list[str] = []
+
+    def augment(sample):
+        calls.append(type(sample["img"]).__name__)
+        return sample
+
+    VolumeDataset(config, augment_fn=augment)[0]
+    assert calls == ["Tensor"]
+
+
+def _axes_volume(root: Path, img_axes: str, n: int = 16) -> Path:
+    """A container that declares `img_axes` for its image and the matching spatial order for its
+    labels. Mirrors `test_dataset._build_axes_volume`; kept local so this file stays readable."""
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    zz, yy, xx = np.meshgrid(*[np.arange(n)] * 3, indexing="ij")
+    val_zyx = (zz * 10000 + yy * 100 + xx).astype(np.float32)
+    lbl_axes = "".join(c for c in img_axes if c in "xyz")
+
+    grp_root = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2)
+    for key, axes_str, dtype in [("raw", img_axes, "float32"), ("seg", lbl_axes, "uint32")]:
+        spatial = "".join(c for c in axes_str if c in "xyz")
+        data = np.transpose(val_zyx, ["zyx".index(c) for c in spatial]).astype(dtype)
+        if "c" in axes_str:
+            data = np.expand_dims(data, axis=axes_str.index("c"))
+        g = grp_root.create_group(key)
+        a = g.create_array("0", shape=data.shape, chunks=data.shape, dtype=dtype, overwrite=True)
+        a[:] = data
+        axes = [
+            {"name": c, "type": ("channel" if c == "c" else "space")}
+            | ({} if c == "c" else {"unit": "micrometer"})
+            for c in axes_str
+        ]
+        (root / key / ".zattrs").write_text(json.dumps({"multiscales": [{
+            "version": "0.4", "axes": axes,
+            "datasets": [{"path": "0", "coordinateTransformations": [
+                {"type": "scale", "scale": [1.0] * len(axes_str)}]}],
+        }]}))
+    return root
+
+
+@pytest.mark.parametrize("img_axes", ["cxyz", "xyzc", "zyx"])
+@pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["no_resample", "resample"])
+def test_deferred_handles_a_squeezed_channel_axis(tmp_path: Path, img_axes, resolutions):
+    """A stored channel axis that `output_axes` drops must not break the deferred path.
+
+    The worker squeezes the channel off before handing the crop over, so the descriptor has to
+    describe the crop as handed over -- `img_spatial_idx` indexes the *stored* axes, and for the
+    conventional channel-first order it points one past the squeezed crop's last axis. Both
+    orders are parametrized because only channel-first exposes it: with 'xyzc' the indices happen
+    to survive the squeeze unchanged.
+    """
+    path = _axes_volume(tmp_path / f"{img_axes}_{len(resolutions)}.zarr", img_axes)
+    config = dict(
+        volumes=[{"name": "v", "path": str(path), "image_key": "raw", "label_key": "seg"}],
+        resolutions=resolutions, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
+    )
+    plain, deferred = _pair(config)
+
+    expected = _draw(plain, 0, seed=17)["img"]
+    got = finish_images(collate_deferred([_draw(deferred, 0, seed=17)]))["img"][0]
+
+    assert got.shape == expected.shape
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("resolutions", [RES_1, RES_2], ids=["one_scale", "two_scales"])
+def test_patch_normalize_survives_the_device_it_is_finished_on(
+    sample_config: dict, resolutions, device
+):
+    """`patch_normalize` on the accelerator, which nothing else here covers.
+
+    It takes its statistics from one scale level, and reaching for that level is the only place
+    `finish_images` needs an index rather than arithmetic -- so it was the one operation that
+    could be correct on the CPU and raise on CUDA. Parametrized over resolutions because the
+    reference level is only a real choice when there is more than one.
+    """
+    config = {**sample_config, "resolutions": resolutions}
+    config["volumes"] = [{**v, "patch_normalize": True} for v in config["volumes"]]
+    plain, deferred = _pair(config)
+
+    expected = _draw(plain, 0, seed=23)["img"]
+    got = finish_images(collate_deferred([_draw(deferred, 0, seed=23)]), device=device)
+    got = got["img"][0].cpu()
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+    # Pinned so a silently skipped normalization cannot pass by matching an equally unnormalized
+    # reference. Checked on the reference level rather than the whole sample: the statistics come
+    # from one level and are applied to all of them, so with several scales only that level is
+    # centered -- which is the property `ref_level` exists to provide.
+    ref = got.float().index_select(
+        int(sample_config["output_axes"].index("l")),
+        torch.tensor([_coarsest_scale_index([np.asarray(r) for r in resolutions])]),
+    )
+    assert abs(float(ref.mean())) < 1e-4, "patch_normalize did not center the reference level"

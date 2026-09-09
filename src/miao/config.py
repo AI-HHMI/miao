@@ -212,6 +212,17 @@ class MiaoConfig(BaseModel):
     sample_windows: bool = False
     image_dtype: str = "float32"  # output image tensor dtype: "float32", "bfloat16", or "float16"
     chunk_aligned: bool = False  # constrain random patches to stay within a single chunk
+    # Hand the image's resampling and normalization to the caller instead of doing them in the
+    # worker, so they can run on an accelerator (prevents GPU starvation). Off by default.
+    #
+    # What changes for the caller: `sample["img"]` becomes a *list* of per-scale crops in storage
+    # axis order and stored dtype, because the scales have different read shapes until something
+    # resamples them and so cannot be stacked; `sample["deferred"]` carries everything needed to
+    # finish. Batches of them cannot go through the default collate for the same reason, use
+    # `miao.collate_deferred`, then `miao.finish_images(batch, device=...)`, which performs exactly
+    # the steps `__getitem__` would have. Labels are unaffected and are still resampled here:
+    # nearest-neighbour on an integer array is cheap.
+    defer_image_ops: bool = False
 
     @field_validator("size_weighting_exponent")
     @classmethod
@@ -219,6 +230,29 @@ class MiaoConfig(BaseModel):
         if v < 0:
             raise ValueError(f"size_weighting_exponent must be >= 0, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def validate_defer_image_ops(self) -> "MiaoConfig":
+        """`augment_fn` cannot run on a deferred sample, so refuse the pair rather than break.
+
+        A deferred sample's image is a list of crops at their stored resolutions, and an
+        `augment_fn` written against the finished tensor sees a list where it expects an array. The
+        failure is an `AttributeError` several frames inside a dataloader worker, which says
+        nothing about the configuration that caused it -- and geometric augmentation is worse than
+        a crash if it half-works, because the labels here are already resampled and shifting an
+        image by a voxel count at a different resolution silently de-registers the pair.
+
+        An augmentation that wants both must run after `finish_images`, where the image and its
+        labels are on the device and back at the same resolution.
+        """
+        if self.defer_image_ops and self.augment_fn is not None:
+            raise ValueError(
+                "defer_image_ops=True cannot be combined with augment_fn: a deferred sample's "
+                "image is a list of crops at their stored resolutions, which an augment_fn cannot "
+                "transform, and its labels are already resampled so a geometric transform would "
+                "de-register the two. Apply augmentation after miao.finish_images instead."
+            )
+        return self
 
     @field_validator("image_dtype")
     @classmethod
