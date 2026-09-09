@@ -213,30 +213,15 @@ class MiaoConfig(BaseModel):
     image_dtype: str = "float32"  # output image tensor dtype: "float32", "bfloat16", or "float16"
     chunk_aligned: bool = False  # constrain random patches to stay within a single chunk
     # Hand the image's resampling and normalization to the caller instead of doing them in the
-    # worker, so they can run on an accelerator. Off by default: it changes what __getitem__
-    # returns, and a caller that ignores the change gets raw un-normalized crops at their stored
-    # resolution rather than an error.
+    # worker, so they can run on an accelerator (prevents GPU starvation). Off by default.
     #
-    # Why it exists. Both operations are elementwise or interpolation over the whole crop, which is
-    # the worst possible shape of work for one worker core. Profiled on a 256^3 sample of the
-    # 87-volume LMD corpus, one worker spends ~235 ms per sample: 47% in the trilinear
-    # `F.interpolate` and 14% in normalization, with only 23% in the actual read. Only 17 of those
-    # 87 volumes are stored at the requested resolution, so nearly every sample pays the
-    # interpolation. Deferred, the same work is a handful of kernels on a device that has the crop
-    # anyway.
-    #
-    # The second gain is transfer size. Normalization is what turns stored `uint8` into `float32`;
-    # deferring it lets the crop cross the host-to-device boundary in its stored dtype, four times
-    # smaller for the common `uint8` corpus.
-    #
-    # What changes for the caller. `sample["img"]` becomes a *list* of per-scale crops in storage
+    # What changes for the caller: `sample["img"]` becomes a *list* of per-scale crops in storage
     # axis order and stored dtype, because the scales have different read shapes until something
     # resamples them and so cannot be stacked; `sample["deferred"]` carries everything needed to
-    # finish. Batches of them cannot go through the default collate for the same reason — use
+    # finish. Batches of them cannot go through the default collate for the same reason, use
     # `miao.collate_deferred`, then `miao.finish_images(batch, device=...)`, which performs exactly
     # the steps `__getitem__` would have. Labels are unaffected and are still resampled here:
-    # nearest-neighbour on an integer array is cheap, and moving it would put label identity at the
-    # mercy of a float round trip.
+    # nearest-neighbour on an integer array is cheap.
     defer_image_ops: bool = False
 
     @field_validator("size_weighting_exponent")
