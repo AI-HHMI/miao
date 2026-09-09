@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Optional, Union
 
-import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# Mapping from config string to torch dtype for image tensors.
-IMAGE_DTYPE_MAP: dict[str, torch.dtype] = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-}
+if TYPE_CHECKING:
+    import torch
+
+VALID_IMAGE_DTYPES = {"float32", "bfloat16", "float16"}
+
+
+def __getattr__(name: str):
+    if name == "IMAGE_DTYPE_MAP":
+        import torch
+
+        # Mapping from config string to torch dtype for image tensors.
+        return {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 class ResolutionSampling(BaseModel):
     """Spec for randomly sampling output resolutions per __getitem__ call.
@@ -144,6 +154,29 @@ class VolumeConfig(BaseModel):
                 )
         return self
 
+    def to_yaml(
+        self,
+        path: str | Path | None = None,
+        *,
+        exclude_none: bool = True,
+        exclude_defaults: bool = False,
+        sort_keys: bool = False,
+        **yaml_kwargs,
+    ) -> str:
+        """Serialize volume configuration to a YAML string, and optionally write to a file."""
+        data = self.model_dump(
+            mode="json",
+            exclude_none=exclude_none,
+            exclude_defaults=exclude_defaults,
+        )
+        yaml_str = yaml.safe_dump(data, sort_keys=sort_keys, **yaml_kwargs)
+        if path is not None:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w") as f:
+                f.write(yaml_str)
+        return yaml_str
+
 
 class AugmentFnConfig(BaseModel):
     """A dotted-path factory plus kwargs, resolved to an augment_fn once in each worker.
@@ -257,9 +290,9 @@ class MiaoConfig(BaseModel):
     @field_validator("image_dtype")
     @classmethod
     def validate_image_dtype(cls, v: str) -> str:
-        if v not in IMAGE_DTYPE_MAP:
+        if v not in VALID_IMAGE_DTYPES:
             raise ValueError(
-                f"image_dtype must be one of {set(IMAGE_DTYPE_MAP)}, got {v!r}"
+                f"image_dtype must be one of {VALID_IMAGE_DTYPES}, got {v!r}"
             )
         return v
 
@@ -488,6 +521,40 @@ class MiaoConfig(BaseModel):
                 )
         return self
 
+    def to_yaml(
+        self,
+        path: str | Path | None = None,
+        *,
+        exclude_none: bool = True,
+        exclude_defaults: bool = False,
+        sort_keys: bool = False,
+        **yaml_kwargs,
+    ) -> str:
+        """Serialize configuration to a YAML string, and optionally write to a file.
+
+        Args:
+            path: Optional destination path. If provided, writes YAML to this file.
+            exclude_none: Whether to omit fields with None values (default: True).
+            exclude_defaults: Whether to omit fields with default values (default: False).
+            sort_keys: Whether to sort keys alphabetically (default: False, preserving model field order).
+            **yaml_kwargs: Additional keyword arguments forwarded to yaml.safe_dump.
+
+        Returns:
+            The YAML string representation.
+        """
+        data = self.model_dump(
+            mode="json",
+            exclude_none=exclude_none,
+            exclude_defaults=exclude_defaults,
+        )
+        yaml_str = yaml.safe_dump(data, sort_keys=sort_keys, **yaml_kwargs)
+        if path is not None:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w") as f:
+                f.write(yaml_str)
+        return yaml_str
+
 
 def load_config(path: str | Path) -> MiaoConfig:
     """Load and validate a YAML config file."""
@@ -495,3 +562,23 @@ def load_config(path: str | Path) -> MiaoConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
     return MiaoConfig(**data)
+
+
+def save_config(
+    config: MiaoConfig,
+    path: str | Path,
+    *,
+    exclude_none: bool = True,
+    exclude_defaults: bool = False,
+    sort_keys: bool = False,
+    **yaml_kwargs,
+) -> None:
+    """Save a MiaoConfig to a YAML file."""
+    config.to_yaml(
+        path=path,
+        exclude_none=exclude_none,
+        exclude_defaults=exclude_defaults,
+        sort_keys=sort_keys,
+        **yaml_kwargs,
+    )
+
