@@ -47,6 +47,16 @@ for batch in loader:
 
 Runnable notebooks live in [`examples/`](examples/).
 
+## Load and Save Configs
+
+```python
+## save a modified version of a config
+from miao import VolumeDataset, load_config
+cfg = load_config("config.yaml")
+cfg.samples_per_epoch = 500
+save_config(cfg, "new_config.yaml")
+```
+
 ## Batch format
 
 Tensors follow `output_axes` with the batch dim prepended, so `output_axes: "lczyx"` yields `img`
