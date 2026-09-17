@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from miao.config import MiaoConfig, VolumeConfig, load_config
+from miao.config import AugmentFnConfig, MiaoConfig, ResolutionSampling, VolumeConfig, load_config, save_config
 
 
 def _vol(name="a", **kw):
@@ -257,3 +257,59 @@ class TestLoadConfig:
             yaml.dump(sample_config, f)
         cfg = load_config(config_path)
         assert cfg.volumes[0].name == "test_raw"
+
+
+class TestSaveConfig:
+    def test_to_yaml_string(self, sample_config):
+        cfg = MiaoConfig(**sample_config)
+        yaml_str = cfg.to_yaml()
+        assert isinstance(yaml_str, str)
+        loaded_dict = yaml.safe_load(yaml_str)
+        loaded_cfg = MiaoConfig(**loaded_dict)
+        assert loaded_cfg == cfg
+
+    def test_to_yaml_file(self, tmp_path, sample_config):
+        cfg = MiaoConfig(**sample_config)
+        out_file = tmp_path / "subdir" / "saved_config.yaml"
+        yaml_str = cfg.to_yaml(out_file)
+        assert out_file.is_file()
+        assert out_file.read_text() == yaml_str
+        loaded_cfg = load_config(out_file)
+        assert loaded_cfg == cfg
+
+    def test_save_config_function(self, tmp_path, sample_config):
+        cfg = MiaoConfig(**sample_config)
+        out_file = tmp_path / "saved_via_func.yaml"
+        save_config(cfg, out_file)
+        assert out_file.is_file()
+        loaded_cfg = load_config(out_file)
+        assert loaded_cfg == cfg
+
+    def test_volume_config_to_yaml(self):
+        v = VolumeConfig(name="vol1", path="/data/v1.zarr", image_key="raw", weight=2.0)
+        yaml_str = v.to_yaml()
+        loaded = VolumeConfig(**yaml.safe_load(yaml_str))
+        assert loaded == v
+
+    def test_roundtrip_with_augment_fn(self, tmp_path, sample_config):
+        cfg = MiaoConfig(
+            **sample_config,
+            augment_fn=AugmentFnConfig(factory="my.aug.fn", kwargs={"scale": 1.5}),
+        )
+        out_file = tmp_path / "aug_config.yaml"
+        save_config(cfg, out_file)
+        loaded = load_config(out_file)
+        assert loaded == cfg
+
+    def test_roundtrip_with_sampling(self, tmp_path):
+        cfg = MiaoConfig(
+            volumes=[_vol()],
+            resolution_sampling=SAMPLING,
+            output_axes="lzyx",
+            patch_size=[8, 8, 8],
+        )
+        out_file = tmp_path / "sampling_config.yaml"
+        save_config(cfg, out_file)
+        loaded = load_config(out_file)
+        assert loaded == cfg
+
