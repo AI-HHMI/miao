@@ -1774,3 +1774,59 @@ class TestLabelTranslation:
         ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
                            sample_windows=True, samples=32)
         assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+
+class TestFixedAxes:
+    """fixed_axes pins a stored axis to one index and drops it from every patch."""
+
+    @staticmethod
+    def _timeseries(tmp_path: Path) -> Path:
+        from conftest import _create_ome_ngff_zarr2
+
+        # Every frame holds its level-0 time index, so a patch's values say which frame it read.
+        # The fixture halves t along the pyramid too, which exercises the per-level index mapping.
+        axes = [{"name": "t", "type": "time"}] + [
+            {"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"
+        ]
+
+        def frames(shape, level):
+            t = np.arange(shape[0]) * 2**level
+            return np.broadcast_to(t[:, None, None, None], shape)
+
+        path = tmp_path / "ts.zarr"
+        for key in ("raw", "labels/seg"):
+            _create_ome_ngff_zarr2(path, key, (8, 32, 32, 32), num_scales=2, axes=axes,
+                                   data_fn=frames)
+        return path
+
+    def _config(self, path: Path, fixed: dict, **kw) -> MiaoConfig:
+        vol = dict(name="ts", path=str(path), image_key="raw", label_key="labels/seg",
+                   zarr_version="zarr2", fixed_axes=fixed, normalize=False)
+        return MiaoConfig(**{
+            "volumes": [vol], "resolutions": [[1, 1, 1], [2, 2, 2]], "output_axes": "lczyx",
+            "patch_size": [8, 8, 8], "samples_per_epoch": 4, **kw,
+        })
+
+    def test_drops_axis_and_reads_the_fixed_frame(self, tmp_path: Path):
+        ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 5}))
+        sample = ds[0]
+        assert sample["img"].shape == (2, 1, 8, 8, 8)
+        assert sample["label"].shape == (2, 8, 8, 8)
+        assert len(sample["meta"]["coordinate"]) == 3
+        # Level 0 reads frame 5; level 1 reads frame floor(5 / 2) = 2, which covers level-0 t=4.
+        assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
+        assert torch.all(sample["label"][0] == 5) and torch.all(sample["label"][1] == 4)
+
+    def test_sequential(self, tmp_path: Path):
+        ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 3},
+                                        sampling="sequential"))
+        assert len(ds) > 0
+        assert all(torch.all(ds[i]["img"][0] == 3) for i in range(len(ds)))
+
+    def test_unknown_axis(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="not among the stored axes"):
+            VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 1, "q": 0}))
+
+    def test_out_of_range(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="outside its extent"):
+            VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 8}))

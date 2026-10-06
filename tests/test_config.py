@@ -18,6 +18,15 @@ SAMPLING = {
 
 
 class TestVolumeConfig:
+    def test_fixed_axes_negative(self):
+        with pytest.raises(ValueError, match="fixed_axes index"):
+            VolumeConfig(**_vol(fixed_axes={"t": -1}))
+
+    def test_fixed_axes_in_output_axes(self):
+        with pytest.raises(ValueError, match="also appear in output_axes"):
+            MiaoConfig(volumes=[_vol(fixed_axes={"t": 3})], resolutions=[[1, 1, 1, 1]],
+                       output_axes="ltzyx", patch_size=[1, 8, 8, 8])
+
     def test_valid(self):
         v = VolumeConfig(
             name="raw",

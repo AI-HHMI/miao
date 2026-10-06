@@ -125,6 +125,18 @@ class VolumeConfig(BaseModel):
     # Strictly contains every window's read extent (all scales, including coarser sample_windows
     # patches), not just the patch center. Must be at least as large as the coarsest window.
     bounding_box: Optional[list[list[int]]] = None
+    # Pin stored axes to one index each, e.g. {"t": 10}: index in level-0 voxels. A pinned axis is
+    # removed before sampling, so it must not appear in output_axes, patch_size, resolutions or
+    # bounding_box.
+    fixed_axes: Optional[dict[str, int]] = None
+
+    @field_validator("fixed_axes")
+    @classmethod
+    def validate_fixed_axes(cls, v: Optional[dict[str, int]]) -> Optional[dict[str, int]]:
+        for name, idx in (v or {}).items():
+            if idx < 0:
+                raise ValueError(f"fixed_axes index must be >= 0, got {name}={idx}")
+        return v
 
     @field_validator("weight")
     @classmethod
@@ -500,6 +512,17 @@ class MiaoConfig(BaseModel):
         names = [v.name for v in self.volumes]
         if len(names) != len(set(names)):
             raise ValueError("Volume names must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def validate_fixed_axes_not_output(self) -> "MiaoConfig":
+        for vol in self.volumes:
+            clash = sorted(set(vol.fixed_axes or {}) & set(self.output_axes))
+            if clash:
+                raise ValueError(
+                    f"Volume {vol.name!r}: fixed_axes {clash} also appear in output_axes "
+                    f"{self.output_axes!r}; a fixed axis is removed, so drop it from output_axes"
+                )
         return self
 
     @model_validator(mode="after")

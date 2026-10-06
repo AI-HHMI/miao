@@ -21,7 +21,7 @@ from miao.axes import (
 )
 from miao.config import AugmentFnConfig, MiaoConfig, ResolutionSampling, VolumeConfig
 from miao.store import create_context, open_store
-from miao.zarr_meta import OmeMetadata, read_ome_metadata
+from miao.zarr_meta import OmeMetadata, fix_axes, read_ome_metadata
 
 
 def _random_patch_origin_covering_fine_extent(
@@ -569,6 +569,13 @@ class VolumeDataset(torch.utils.data.Dataset):
                 vol_cfg.path, vol_cfg.label_key, vol_cfg.zarr_version, None
             )
 
+        # Pinned axes are dropped here, so everything below sees an array without them.
+        if vol_cfg.fixed_axes:
+            where = f"Volume {vol_cfg.name!r}: "
+            image_meta = fix_axes(image_meta, vol_cfg.fixed_axes, where)
+            if label_meta is not None:
+                label_meta = fix_axes(label_meta, vol_cfg.fixed_axes, where)
+
         # Derive axes from OME-NGFF metadata
         img_axes = "".join(image_meta.axis_names)
         img_spatial = spatial_axes(img_axes)
@@ -1094,6 +1101,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                     )
                     stores[vol_name]["img"][level] = open_store(
                         img_array_path, zarr_ver, ctx,
+                        vol_info.image_meta.scales[level].fixed_index,
                     )
 
                 if vol_info.config.label_key and vol_info.label_meta:
@@ -1105,6 +1113,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                         )
                         stores[vol_name]["label"][level] = open_store(
                             lbl_array_path, zarr_ver, ctx,
+                            vol_info.label_meta.scales[level].fixed_index,
                         )
 
             self._worker_stores[worker_id] = stores

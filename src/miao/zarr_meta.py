@@ -24,6 +24,9 @@ class ScaleMetadata:
     dtype: np.dtype
     # Physical position of this level's origin, in the same units as scale_factors.
     translation: list[float] = field(default_factory=list)
+    # Axes removed by fix_axes: on-disk dimension position -> index into it at this level. The
+    # other fields describe the array with these dimensions already removed.
+    fixed_index: dict[int, int] = field(default_factory=dict)
 
     def translation_or_zeros(self) -> list[float]:
         """The translation, or zeros matching the array rank when none was declared."""
@@ -231,4 +234,60 @@ def read_ome_metadata(
         zarr_version=zarr_version,
         outer_scale=outer_scale,
         outer_translation=outer_translation,
+    )
+
+
+def fix_axes(meta: OmeMetadata, fixed: dict[str, int], where: str = "") -> OmeMetadata:
+    """Drop the axes in `fixed` from `meta`, pinning each one to a single index.
+
+    `fixed` maps an axis name to an index in level-0 voxels. Each level gets the index of the
+    voxel containing that level-0 voxel, floor(i * scale_0 / scale_level), so an axis that is
+    downsampled along the pyramid stays on the same physical position. The returned metadata
+    describes the arrays with those dimensions removed; `ScaleMetadata.fixed_index` records the
+    on-disk positions and indices for `open_store` to apply.
+    """
+    if not fixed:
+        return meta
+    for name in fixed:
+        if name not in meta.axis_names:
+            raise ValueError(
+                f"{where}fixed_axes names axis {name!r}, which is not among the stored axes "
+                f"{''.join(meta.axis_names)!r}"
+            )
+    dims = sorted(meta.axis_names.index(name) for name in fixed)
+    keep = [i for i in range(len(meta.axis_names)) if i not in dims]
+
+    def _keep(values: list) -> list:
+        return [values[i] for i in keep] if values else values
+
+    base = meta.scales[min(meta.scales)]
+    scales: dict[int, ScaleMetadata] = {}
+    for level, sm in meta.scales.items():
+        fixed_index = {}
+        for d in dims:
+            name = meta.axis_names[d]
+            idx = int(np.floor(fixed[name] * base.scale_factors[d] / sm.scale_factors[d]))
+            if not 0 <= idx < sm.shape[d]:
+                raise ValueError(
+                    f"{where}fixed_axes {name}={fixed[name]} maps to index {idx} at level "
+                    f"{level}, outside its extent [0, {sm.shape[d]})"
+                )
+            fixed_index[d] = idx
+        scales[level] = ScaleMetadata(
+            path=sm.path,
+            scale_factors=_keep(sm.scale_factors),
+            shape=_keep(sm.shape),
+            chunks=_keep(sm.chunks),
+            dtype=sm.dtype,
+            translation=_keep(sm.translation),
+            fixed_index=fixed_index,
+        )
+
+    return OmeMetadata(
+        axes=_keep(meta.axes),
+        axis_names=_keep(meta.axis_names),
+        scales=scales,
+        zarr_version=meta.zarr_version,
+        outer_scale=_keep(meta.outer_scale),
+        outer_translation=_keep(meta.outer_translation),
     )

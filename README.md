@@ -424,6 +424,7 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `normalize_min` / `normalize_max` | `None` | Set both to clip to that range and map it linearly to [0, 1] |
 | `patch_normalize` | `false` | Standardize each sample to zero mean / unit variance after `normalize`. Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | `None` | `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window |
+| `fixed_axes` | `None` | `{axis: index}`, e.g. `{t: 10}`: pins a stored axis to one level-0 index and removes it, so a time series samples as a 3D volume at that frame. A pinned axis must not appear in `output_axes`, `patch_size`, `resolutions` or `bounding_box` |
 
 ## Recipe: 2D datasets
 
