@@ -1817,6 +1817,16 @@ class TestFixedAxes:
         assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
         assert torch.all(sample["label"][0] == 5) and torch.all(sample["label"][1] == 4)
 
+    def test_multiple_axes(self, tmp_path: Path):
+        # Pinning z on top of t leaves 2D yx crops; z is downsampled along the pyramid too.
+        ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 5, "z": 10},
+                                        resolutions=[[1, 1], [2, 2]], output_axes="lcyx",
+                                        patch_size=[8, 8]))
+        sample = ds[0]
+        assert sample["img"].shape == (2, 1, 8, 8)
+        assert sample["label"].shape == (2, 8, 8)
+        assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
+
     def test_sequential(self, tmp_path: Path):
         ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 3},
                                         sampling="sequential"))
