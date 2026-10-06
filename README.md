@@ -189,6 +189,29 @@ the positions that still cover the previous level's patch, staying strictly insi
 `bounding_box`. `resolutions` must then run fine to coarse (non-decreasing voxel size per axis,
 e.g. `[[8,8,8], [16,16,16]]`); a coarser resolution first raises.
 
+### Fixing axes (e.g. time series)
+
+`fixed_axes` pins a stored axis to level-0 indices and removes it, so a `t c z y x` time series
+samples like a 3D volume. Leave a pinned axis out of `output_axes`, `patch_size` and `resolutions`:
+
+```yaml
+volumes:
+  - name: fish
+    path: /data/timeseries.zarr
+    image_key: raw
+    zarr_version: zarr3
+    fixed_axes: {t: 10}        # one frame
+    # fixed_axes: {t: [25, 40]}  # a list of frames
+    # fixed_axes: {t: "1:25"}    # a range, stop exclusive: frames 1..24
+output_axes: lczyx
+patch_size: [32, 128, 128]
+resolutions: [[1, 1, 1]]
+```
+
+With several indices, the volume expands into one volume per frame (`fish[t=25]`, `fish[t=40]`), which
+split its `weight` evenly. `meta["volume"]` names the frame a sample came from, and sequential mode
+walks every frame. Runnable: [`examples/example_timeseries.ipynb`](examples/example_timeseries.ipynb).
+
 ## Augmentation
 
 Two composable modules, both used from one `augment_fn`:
@@ -424,7 +447,7 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `normalize_min` / `normalize_max` | `None` | Set both to clip to that range and map it linearly to [0, 1] |
 | `patch_normalize` | `false` | Standardize each sample to zero mean / unit variance after `normalize`. Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | `None` | `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window |
-| `fixed_axes` | `None` | `{axis: index}`, e.g. `{t: 10}`: pins a stored axis to one level-0 index and removes it, so a time series samples as a 3D volume at that frame. A pinned axis must not appear in `output_axes`, `patch_size`, `resolutions` or `bounding_box` |
+| `fixed_axes` | `None` | `{axis: index}`, e.g. `{t: 10}`: pins a stored axis to a level-0 index and removes it, so a time series samples as a 3D volume at that frame. A value may also list indices (`[25, 40]`) or give a `"start:stop[:step]"` range with exclusive stop (`"1:25"`); the volume then expands into one per index (per combination across axes), named e.g. `vol[t=25]`, splitting its `weight` evenly. A pinned axis must not appear in `output_axes`, `patch_size`, `resolutions` or `bounding_box` |
 
 ## Recipe: 2D datasets
 

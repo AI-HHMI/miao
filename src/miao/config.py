@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
@@ -90,6 +91,29 @@ class ResolutionSampling(BaseModel):
         return out
 
 
+def _fixed_indices(name: str, spec: Union[int, list[int], str]) -> list[int]:
+    """Indices a fixed_axes value selects: an int, a list of ints, or "start:stop[:step]"."""
+    if isinstance(spec, str):
+        try:
+            parts = [int(p) for p in spec.split(":")]
+        except ValueError:
+            parts = []
+        if len(parts) not in (2, 3):
+            raise ValueError(
+                f"fixed_axes {name}={spec!r}: a string must be a 'start:stop[:step]' range"
+            )
+        indices = list(range(*parts))
+    else:
+        indices = [spec] if isinstance(spec, int) else list(spec)
+    if not indices:
+        raise ValueError(f"fixed_axes {name}={spec!r} selects no index")
+    if min(indices) < 0:
+        raise ValueError(f"fixed_axes index must be >= 0, got {name}={spec!r}")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"fixed_axes {name}={spec!r} repeats an index")
+    return indices
+
+
 class VolumeConfig(BaseModel):
     """Configuration for a single zarr volume."""
 
@@ -125,18 +149,38 @@ class VolumeConfig(BaseModel):
     # Strictly contains every window's read extent (all scales, including coarser sample_windows
     # patches), not just the patch center. Must be at least as large as the coarsest window.
     bounding_box: Optional[list[list[int]]] = None
-    # Pin stored axes to one index each, e.g. {"t": 10}: index in level-0 voxels. A pinned axis is
-    # removed before sampling, so it must not appear in output_axes, patch_size, resolutions or
-    # bounding_box.
-    fixed_axes: Optional[dict[str, int]] = None
+    # Pin stored axes to level-0 indices, e.g. {"t": 10}. A pinned axis is removed before
+    # sampling, so it must not appear in output_axes, patch_size, resolutions or bounding_box.
+    # Each value is an index, a list of indices ([25, 40]) or a "start:stop[:step]" range with an
+    # exclusive stop ("1:25" is 1..24). Several indices expand the volume into one per index (one
+    # per combination across axes), named e.g. "vol[t=25]", which split its weight evenly.
+    fixed_axes: Optional[dict[str, Union[int, list[int], str]]] = None
 
     @field_validator("fixed_axes")
     @classmethod
-    def validate_fixed_axes(cls, v: Optional[dict[str, int]]) -> Optional[dict[str, int]]:
-        for name, idx in (v or {}).items():
-            if idx < 0:
-                raise ValueError(f"fixed_axes index must be >= 0, got {name}={idx}")
+    def validate_fixed_axes(cls, v):
+        for name, spec in (v or {}).items():
+            _fixed_indices(name, spec)
         return v
+
+    def expand_fixed_axes(self) -> list["VolumeConfig"]:
+        """One copy of this volume per combination of fixed indices, each pinned to one index."""
+        if not self.fixed_axes:
+            return [self]
+        names = list(self.fixed_axes)
+        combos = list(itertools.product(
+            *(_fixed_indices(n, self.fixed_axes[n]) for n in names)
+        ))
+        if len(combos) == 1:
+            return [self.model_copy(update={"fixed_axes": dict(zip(names, combos[0]))})]
+        return [
+            self.model_copy(update={
+                "name": f"{self.name}[{','.join(f'{n}={i}' for n, i in zip(names, combo))}]",
+                "fixed_axes": dict(zip(names, combo)),
+                "weight": self.weight / len(combos),
+            })
+            for combo in combos
+        ]
 
     @field_validator("weight")
     @classmethod

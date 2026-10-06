@@ -435,7 +435,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         # Read metadata and precompute sampling bounds for each volume
         self._volumes: list[VolumeInfo] = []
         for vol_cfg in config.volumes:
-            self._volumes.append(self._resolve_volume(vol_cfg))
+            for sub_cfg in vol_cfg.expand_fixed_axes():
+                self._volumes.append(self._resolve_volume(sub_cfg))
 
         # Normalize sampling weights to probabilities. Runs after resolution because the size
         # term needs each volume's reachable extent.

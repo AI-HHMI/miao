@@ -1817,6 +1817,15 @@ class TestFixedAxes:
         assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
         assert torch.all(sample["label"][0] == 5) and torch.all(sample["label"][1] == 4)
 
+    def test_several_indices(self, tmp_path: Path):
+        ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": [2, 6]},
+                                        samples_per_epoch=40))
+        seen = {}
+        for i in range(len(ds)):
+            sample = ds[i]
+            seen[sample["meta"]["volume"]] = int(sample["img"][0].flatten()[0])
+        assert seen == {"ts[t=2]": 2, "ts[t=6]": 6}
+
     def test_multiple_axes(self, tmp_path: Path):
         # Pinning z on top of t leaves 2D yx crops; z is downsampled along the pyramid too.
         ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 5, "z": 10},
