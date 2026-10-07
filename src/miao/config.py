@@ -413,6 +413,12 @@ class MiaoConfig(BaseModel):
                 f"patch_size has {len(self.patch_size)} elements but "
                 f"output_axes {self.output_axes!r} has {n_spatial} spatial dimensions"
             )
+        for vol in self.volumes:
+            if vol.bounding_box is not None and len(vol.bounding_box) != n_spatial:
+                raise ValueError(
+                    f"Volume {vol.name!r}: bounding_box has {len(vol.bounding_box)} entries but "
+                    f"output_axes {self.output_axes!r} has {n_spatial} spatial dimensions"
+                )
         return self
 
     @model_validator(mode="after")

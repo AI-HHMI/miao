@@ -50,6 +50,13 @@ class TestVolumeConfig:
         vol = VolumeConfig(**_vol(fixed_axes={"t": "1:25", "c": [0, 2]}))
         assert VolumeConfig(**yaml.safe_load(vol.to_yaml())).fixed_axes == vol.fixed_axes
 
+    def test_bounding_box_dims(self):
+        # A pinned t left in bounding_box would shift every entry onto the wrong axis.
+        with pytest.raises(ValueError, match="bounding_box has 4 entries"):
+            MiaoConfig(volumes=[_vol(fixed_axes={"t": 3},
+                                     bounding_box=[[0, 48], [0, 152], [0, 508], [0, 1466]])],
+                       resolutions=[[1, 1, 1]], output_axes="lzyx", patch_size=[8, 8, 8])
+
     def test_fixed_axes_in_output_axes(self):
         with pytest.raises(ValueError, match="also appear in output_axes"):
             MiaoConfig(volumes=[_vol(fixed_axes={"t": 3})], resolutions=[[1, 1, 1, 1]],
