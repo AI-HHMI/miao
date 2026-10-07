@@ -73,6 +73,31 @@ class TestVolumeConfig:
                 normalize_max=1.0,
             )
 
+    def test_channels_default_none(self):
+        v = VolumeConfig(**_vol())
+        assert v.image_channels is None and v.label_channels is None
+
+    def test_channels_accepted(self):
+        v = VolumeConfig(**_vol(label_key="raw", image_channels=[2], label_channels=[1, 0]))
+        assert v.image_channels == [2] and v.label_channels == [1, 0]
+
+    @pytest.mark.parametrize("field", ["image_channels", "label_channels"])
+    @pytest.mark.parametrize(
+        "bad, match",
+        [([], "must be non-empty"), ([-1], "must be non-negative"), ([0, 0], "must not repeat")],
+    )
+    def test_channels_rejected(self, field, bad, match):
+        with pytest.raises(ValueError, match=f"{field} {match}"):
+            VolumeConfig(**_vol(label_key="seg", **{field: bad}))
+
+    def test_label_channels_need_label_key(self):
+        with pytest.raises(ValueError, match="label_channels is set but label_key is not"):
+            VolumeConfig(**_vol(label_channels=[0]))
+
+    def test_old_channels_key_rejected(self):
+        with pytest.raises(ValueError, match="channels"):
+            VolumeConfig(**_vol(channels=[0]))
+
 
 class TestMiaoConfig:
     def test_valid(self, sample_config: dict):

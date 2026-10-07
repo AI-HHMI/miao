@@ -17,6 +17,10 @@ volumes:
     normalize: true  # Auto-normalize images to [0, 1] by dtype max (default: `true`)
     # Optionally override the global resolutions for a single volume:
     # resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]
+    # For multi-channel data, return only some channels, by index in the order listed. The two
+    # are independent, so with image_key == label_key one array can hold both:
+    # image_channels: [2]
+    # label_channels: [0, 1]
 
 # Desired output resolutions (one per scale), in output_axes spatial order — like patch_size.
 # resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]

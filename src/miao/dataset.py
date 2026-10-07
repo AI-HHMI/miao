@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -320,6 +320,44 @@ class VolumeInfo:
     label_np_dtype: np.dtype = np.dtype(np.int64)
     label_torch_dtype: torch.dtype = torch.int64
 
+    # Indices applied to the image / label channel axis on every read (from
+    # VolumeConfig.image_channels / label_channels): a slice for a contiguous ascending run, else
+    # an index array. n_channels / n_label_channels are the resulting channel counts, 1 when the
+    # array has no channel axis.
+    img_channel_index: slice | np.ndarray = field(default_factory=lambda: slice(None))
+    n_channels: int = 1
+    lbl_channel_index: slice | np.ndarray = field(default_factory=lambda: slice(None))
+    n_label_channels: int = 1
+    # Whether the returned label tensor carries a channel axis: only when several label channels
+    # are returned. A single one is squeezed off, as a channel-less label array would be.
+    keep_lbl_channel: bool = False
+
+
+def _channel_selection(
+    sel: list[int] | None, axes: str, meta: OmeMetadata, vol_name: str, key: str, field_name: str
+) -> tuple[slice | np.ndarray, int]:
+    """Resolve a channel list into a channel-axis index and the channel count it yields."""
+    if "c" not in axes:
+        if sel is not None:
+            raise ValueError(
+                f"Volume {vol_name!r}: {field_name}={sel} is set, but {key!r} has no channel "
+                f"axis (axes {axes!r})"
+            )
+        return slice(None), 1
+    n_stored = int(meta.scales[0].shape[axes.index("c")])
+    if sel is None:
+        return slice(None), n_stored
+    out_of_range = [c for c in sel if c >= n_stored]
+    if out_of_range:
+        raise ValueError(
+            f"Volume {vol_name!r}: {field_name} {out_of_range} out of range for {key!r}, which "
+            f"has {n_stored} channel(s)"
+        )
+    # A contiguous ascending run reads as a plain slice; anything else needs an index array.
+    if sel == list(range(sel[0], sel[0] + len(sel))):
+        return slice(sel[0], sel[0] + len(sel)), len(sel)
+    return np.array(sel, dtype=np.int64), len(sel)
+
 
 def _label_dtypes(source_dtype: np.dtype) -> tuple[np.dtype, torch.dtype]:
     """Pick the smallest safe integer dtypes for label data.
@@ -437,6 +475,26 @@ class VolumeDataset(torch.utils.data.Dataset):
         for vol_cfg in config.volumes:
             self._volumes.append(self._resolve_volume(vol_cfg))
 
+        # Samples from different volumes are stacked into one batch, so with a channel axis in
+        # the output every volume must yield the same channel count.
+        if "c" in config.output_axes:
+            counts = {v.config.name: v.n_channels for v in self._volumes}
+            if len(set(counts.values())) > 1:
+                raise ValueError(
+                    f"Volumes return differing image channel counts {counts}; samples could not "
+                    "be batched together. Use each volume's image_channels field to select the "
+                    "same number of channels from every volume."
+                )
+        lbl_counts = {
+            v.config.name: v.n_label_channels for v in self._volumes if v.label_meta is not None
+        }
+        if len(set(lbl_counts.values())) > 1:
+            raise ValueError(
+                f"Volumes return differing label channel counts {lbl_counts}; samples could not "
+                "be batched together. Use each volume's label_channels field to select the same "
+                "number of channels from every volume."
+            )
+
         # Normalize sampling weights to probabilities. Runs after resolution because the size
         # term needs each volume's reachable extent.
         weights = np.array(
@@ -485,6 +543,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 f"    image: axes={vi.img_axes!r}, shape={finest_meta.shape}, "
                 f"dtype={finest_meta.dtype}",
             ]
+            if vi.config.image_channels is not None:
+                lines.append(f"    image_channels: {vi.config.image_channels}")
             if vi.config.exp_factor != 1.0:
                 lines.append(
                     f"    exp_factor: {vi.config.exp_factor} "
@@ -518,6 +578,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                     f"    label: axes={vi.lbl_axes!r}, shape={lbl_meta.shape}, "
                     f"dtype={lbl_meta.dtype} -> {vi.label_np_dtype}"
                 )
+                if vi.config.label_channels is not None:
+                    lines.append(f"    label_channels: {vi.config.label_channels}")
             lines.append(f"    sampling: p={prob:.4g}, size={vi.size:.4g} reachable voxels, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
             if self.config.chunk_aligned:
@@ -575,6 +637,19 @@ class VolumeDataset(torch.utils.data.Dataset):
         img_sp_idx = spatial_indices(img_axes)
         output_spatial = spatial_axes(self.config.output_axes)
 
+        img_channel_index, n_channels = _channel_selection(
+            vol_cfg.image_channels, img_axes, image_meta, vol_cfg.name, vol_cfg.image_key,
+            "image_channels",
+        )
+        # Dropping the channel axis squeezes it off each read, which only works for one channel.
+        if "c" in img_axes and "c" not in self.config.output_axes and n_channels != 1:
+            raise ValueError(
+                f"Volume {vol_cfg.name!r}: output_axes {self.config.output_axes!r} has no 'c', "
+                f"which drops the image's channel axis, but {n_channels} channels would be "
+                "returned. Add 'c' to output_axes, or set image_channels to select a single "
+                "channel."
+            )
+
         lbl_axes = None
         lbl_spatial = None
         lbl_sp_idx = None
@@ -600,6 +675,21 @@ class VolumeDataset(torch.utils.data.Dataset):
                     f"  image_key={vol_cfg.image_key!r}\n"
                     f"  label_key={vol_cfg.label_key!r}"
                 )
+
+        lbl_channel_index, n_label_channels = slice(None), 1
+        if label_meta is not None and lbl_axes is not None:
+            lbl_channel_index, n_label_channels = _channel_selection(
+                vol_cfg.label_channels, lbl_axes, label_meta, vol_cfg.name, vol_cfg.label_key,
+                "label_channels",
+            )
+        # Several label channels keep a channel axis, placed where output_axes puts 'c'.
+        keep_lbl_channel = n_label_channels > 1
+        if keep_lbl_channel and "c" not in self.config.output_axes:
+            raise ValueError(
+                f"Volume {vol_cfg.name!r}: {n_label_channels} label channels would be returned, "
+                f"but output_axes {self.config.output_axes!r} has no 'c' to hold them. Add 'c' "
+                "to output_axes, or set label_channels to select a single channel."
+            )
 
         # Output patch size in image spatial axis order (interpolation target for every scale)
         read_shape = map_patch_size_to_input(
@@ -707,6 +797,11 @@ class VolumeDataset(torch.utils.data.Dataset):
             bounding_box=bounding_box,
             label_np_dtype=lbl_np_dt,
             label_torch_dtype=lbl_torch_dt,
+            img_channel_index=img_channel_index,
+            n_channels=n_channels,
+            lbl_channel_index=lbl_channel_index,
+            n_label_channels=n_label_channels,
+            keep_lbl_channel=keep_lbl_channel,
         )
 
         sampling_spec = self.config.resolution_sampling_for(vol_cfg)
@@ -1118,15 +1213,17 @@ class VolumeDataset(torch.utils.data.Dataset):
     def _build_img_slices(
         self, origin: np.ndarray, read_shape: np.ndarray, vol_info: VolumeInfo
     ) -> tuple:
-        """Build slices for image array: spatial dims get crop, channel gets slice(None)."""
+        """Build slices for image array: spatial dims get crop, channel gets the channel selection."""
         slices = []
         sp_i = 0
-        for dim_i, _ax_char in enumerate(vol_info.img_axes):
+        for dim_i, ax_char in enumerate(vol_info.img_axes):
             if dim_i in vol_info.img_spatial_idx:
                 slices.append(slice(int(origin[sp_i]), int(origin[sp_i] + read_shape[sp_i])))
                 sp_i += 1
+            elif ax_char == "c":
+                slices.append(vol_info.img_channel_index)
             else:
-                slices.append(slice(None))  # channel dim: take all
+                slices.append(slice(None))
         return tuple(slices)
 
     def _sample_chunk_aligned_center(self, vol_info: VolumeInfo) -> np.ndarray:
@@ -1237,12 +1334,17 @@ class VolumeDataset(torch.utils.data.Dataset):
         img_perm = compute_permutation(img_intermediate_for_perm, self.config.output_axes)
 
         # Label intermediate/output handling:
-        # - labels are returned without channel axis
-        # - if label storage has 'c', squeeze it before stacking/permuting
-        lbl_output_axes = self.config.output_axes.replace("c", "")
+        # - labels are returned without channel axis, unless several label channels are selected
+        #   (keep_lbl_channel), which keep it where output_axes puts 'c'
+        # - otherwise, if label storage has 'c', squeeze it before stacking/permuting
+        keep_lbl_channel = vol_info.keep_lbl_channel
+        lbl_output_axes = (
+            self.config.output_axes if keep_lbl_channel
+            else self.config.output_axes.replace("c", "")
+        )
         has_lbl_channel = vol_info.lbl_axes is not None and "c" in vol_info.lbl_axes
         if vol_info.lbl_axes is not None:
-            if has_lbl_channel:
+            if has_lbl_channel and not keep_lbl_channel:
                 lbl_intermediate = "l" + spatial_axes(vol_info.lbl_axes)
             else:
                 lbl_intermediate = "l" + vol_info.lbl_axes
@@ -1442,12 +1544,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                     # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
                     lbl_slices = []
                     sp_i = 0
-                    for dim_i, _ax_char in enumerate(vol_info.lbl_axes):
+                    for dim_i, ax_char in enumerate(vol_info.lbl_axes):
                         if dim_i in vol_info.lbl_spatial_idx:
                             lbl_slices.append(
                                 slice(int(lbl_origin[sp_i]), int(lbl_origin[sp_i] + lbl_eff_shape[sp_i]))
                             )
                             sp_i += 1
+                        elif ax_char == "c":
+                            lbl_slices.append(vol_info.lbl_channel_index)
                         else:
                             lbl_slices.append(slice(None))
                     lbl_futures.append(vol_stores["label"][lbl_level][tuple(lbl_slices)].read(batch=batch))
@@ -1500,11 +1604,23 @@ class VolumeDataset(torch.utils.data.Dataset):
             if lbl_future is not None:
                 lbl = np.asarray(lbl_future.result())
 
-                if has_lbl_channel and vol_info.lbl_axes is not None:
+                if has_lbl_channel and not keep_lbl_channel and vol_info.lbl_axes is not None:
                     c_idx = vol_info.lbl_axes.index("c")
                     lbl = np.squeeze(lbl, axis=c_idx)
 
                 # Resample labels with nearest-neighbor to preserve integer IDs
+                if keep_lbl_channel and vol_info.lbl_axes is not None:
+                    # Channel kept: the spatial indices still address the stored axes.
+                    c_idx = vol_info.lbl_axes.index("c")
+                    lbl_spatial_shape = tuple(int(lbl.shape[i]) for i in vol_info.lbl_spatial_idx)
+                    if lbl_spatial_shape != target_size:
+                        # Move the channel first so F.interpolate sees (N, C, spatial...); the
+                        # stored spatial order is unchanged by this, so it moves straight back.
+                        lbl_t = torch.from_numpy(lbl).float().movedim(c_idx, 0).unsqueeze(0)
+                        lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0)
+                        lbl = lbl_t.movedim(0, c_idx).numpy().astype(vol_info.label_np_dtype)
+                    label_crops.append(lbl)
+                    continue
                 if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
                     # After squeeze, spatial indices shift left past removed channel.
                     c_idx = vol_info.lbl_axes.index("c")

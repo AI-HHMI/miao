@@ -384,7 +384,7 @@ for batch in loader:
 ## Configuration reference
 
 Input axes come from OME-NGFF metadata (`multiscales.axes`) and do not need to be specified. Channel
-dimensions are picked up automatically when present. Unknown keys are rejected, so typos fail loudly.
+dimensions are picked up automatically when present; select a subset with the per-volume `image_channels` / `label_channels` fields. Unknown keys are rejected, so typos fail loudly.
 
 ### Dataset fields
 
@@ -424,6 +424,8 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `normalize_min` / `normalize_max` | `None` | Set both to clip to that range and map it linearly to [0, 1] |
 | `patch_normalize` | `false` | Standardize each sample to zero mean / unit variance after `normalize`. Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | `None` | `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window |
+| `image_channels` | `None` | Image channels to return, as indices along the stored channel axis in the order listed — e.g. `[0]` for the first of three. `None` returns all. Requires a channel axis. Dropping `c` from `output_axes` requires exactly one channel, and with `c` in `output_axes` every volume must yield the same count |
+| `label_channels` | `None` | The same for the `label_key` array, independently of `image_channels` — so one array can hold both, e.g. `image_key` = `label_key`, `image_channels: [2]`, `label_channels: [0, 1]`. One label channel is squeezed off as usual; several keep a channel axis where `output_axes` puts `c` (which must then be present), so label-side transforms need the image's `spatial_dims` rather than the channel-less default. Every volume with labels must yield the same count |
 
 ## Recipe: 2D datasets
 

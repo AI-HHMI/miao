@@ -1774,3 +1774,211 @@ class TestLabelTranslation:
         ds = self._dataset(tmp_path, [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
                            sample_windows=True, samples=32)
         assert self._worst_anchor_gap(ds, 32) <= 0.5
+
+
+def _build_channel_volume(root: Path, img_axes: str, n_channels: int, n: int = 16) -> Path:
+    """A single-level container whose 'raw' image holds `n_channels` constant channels.
+
+    Channel k is filled with k + 1, so which channels came back, and in what order, can be read
+    straight off the returned values — resampling a constant leaves it unchanged.
+    """
+    import json
+
+    import zarr
+    from zarr.storage import LocalStore
+
+    spatial_shape = [n if a in "xyz" else n_channels for a in img_axes]
+    c_idx = img_axes.index("c") if "c" in img_axes else None
+    data = np.ones(spatial_shape, dtype=np.float32)
+    if c_idx is not None:
+        bcast = [1] * len(img_axes)
+        bcast[c_idx] = n_channels
+        data = data * np.arange(1, n_channels + 1, dtype=np.float32).reshape(bcast)
+
+    grp_root = zarr.open_group(LocalStore(str(root)), mode="a", zarr_format=2)
+    g = grp_root.create_group("raw")
+    a = g.create_array("0", shape=data.shape, chunks=data.shape, dtype="float32", overwrite=True)
+    a[:] = data
+    axes = [
+        {"name": c, "type": ("channel" if c == "c" else "space")}
+        | ({} if c == "c" else {"unit": "micrometer"})
+        for c in img_axes
+    ]
+    (root / "raw" / ".zattrs").write_text(json.dumps({"multiscales": [{
+        "version": "0.4", "axes": axes,
+        "datasets": [{"path": "0", "coordinateTransformations": [
+            {"type": "scale", "scale": [1.0] * len(img_axes)}]}],
+    }]}))
+    return root
+
+
+class TestChannelSelection:
+    """VolumeConfig.image_channels picks which stored image channels are returned, in order."""
+
+    def _cfg(self, volumes: list[dict], output_axes: str = "lczyx", **kw) -> MiaoConfig:
+        return MiaoConfig(
+            volumes=volumes, resolutions=kw.pop("resolutions", RES_1), output_axes=output_axes,
+            patch_size=[4, 4, 4], samples_per_epoch=2, **kw,
+        )
+
+    def _vol(self, path: Path, name: str = "v", **kw) -> dict:
+        return {"name": name, "path": str(path), "image_key": "raw", **kw}
+
+    @staticmethod
+    def _channel_values(img: torch.Tensor) -> list[float]:
+        """Per-channel value of an (L, C, z, y, x) image whose channels are each constant."""
+        return [float(img[0, c].mean()) for c in range(img.shape[1])]
+
+    def test_all_channels_by_default(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        img = VolumeDataset(self._cfg([self._vol(p)]))[0]["img"]
+        assert img.shape == (1, 3, 4, 4, 4)
+        assert self._channel_values(img) == [1.0, 2.0, 3.0]
+
+    @pytest.mark.parametrize("img_axes", ["czyx", "zyxc"])
+    @pytest.mark.parametrize(
+        "channels, expected",
+        [([0], [1.0]), ([1, 2], [2.0, 3.0]), ([2, 0], [3.0, 1.0])],
+        ids=["first", "contiguous", "reordered"],
+    )
+    @pytest.mark.parametrize("resolutions", [RES_1, [[1, 1, 1], [2, 2, 2]]],
+                             ids=["no_resample", "resample"])
+    def test_subset_returned_in_order(self, tmp_path: Path, img_axes, channels, expected,
+                                      resolutions):
+        p = _build_channel_volume(tmp_path / "v.zarr", img_axes, 3)
+        cfg = self._cfg([self._vol(p, image_channels=channels)], resolutions=resolutions)
+        img = VolumeDataset(cfg)[0]["img"]
+        assert img.shape == (len(resolutions), len(channels), 4, 4, 4)
+        for s in range(len(resolutions)):
+            assert self._channel_values(img[s:s + 1]) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("img_axes", ["czyx", "zyxc"])
+    def test_single_channel_squeezed_when_output_has_no_c(self, tmp_path: Path, img_axes):
+        p = _build_channel_volume(tmp_path / "v.zarr", img_axes, 3)
+        cfg = self._cfg([self._vol(p, image_channels=[1])], output_axes="lzyx")
+        img = VolumeDataset(cfg)[0]["img"]
+        assert img.shape == (1, 4, 4, 4)
+        assert float(img.mean()) == pytest.approx(2.0)
+
+    def test_deferred_path_honours_selection(self, tmp_path: Path):
+        from miao.dataset import collate_deferred, finish_images
+
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        cfg = self._cfg([self._vol(p, image_channels=[2, 0])], resolutions=[[1, 1, 1], [2, 2, 2]],
+                        defer_image_ops=True)
+        img = finish_images(collate_deferred([VolumeDataset(cfg)[0]]))["img"][0]
+        assert img.shape == (2, 2, 4, 4, 4)
+        assert self._channel_values(img[1:]) == pytest.approx([3.0, 1.0])
+
+    def test_multiple_channels_without_c_in_output_rejected(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        with pytest.raises(ValueError, match="drops the image's channel axis"):
+            VolumeDataset(self._cfg([self._vol(p)], output_axes="lzyx"))
+        with pytest.raises(ValueError, match="drops the image's channel axis"):
+            VolumeDataset(self._cfg([self._vol(p, image_channels=[0, 1])], output_axes="lzyx"))
+
+    def test_out_of_range_rejected(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        with pytest.raises(ValueError, match=r"image_channels \[3\] out of range"):
+            VolumeDataset(self._cfg([self._vol(p, image_channels=[0, 3])]))
+
+    def test_channels_without_channel_axis_rejected(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "zyx", 1)
+        with pytest.raises(ValueError, match="has no channel axis"):
+            VolumeDataset(self._cfg([self._vol(p, image_channels=[0])]))
+
+    def test_mismatched_channel_counts_across_volumes(self, tmp_path: Path):
+        a = _build_channel_volume(tmp_path / "a.zarr", "czyx", 3)
+        b = _build_channel_volume(tmp_path / "b.zarr", "czyx", 2)
+        with pytest.raises(ValueError, match="differing image channel counts"):
+            VolumeDataset(self._cfg([self._vol(a, "a"), self._vol(b, "b")]))
+        # Selecting the same count from each makes them batchable.
+        vols = [self._vol(a, "a", image_channels=[0, 2]), self._vol(b, "b")]
+        ds = VolumeDataset(self._cfg(vols))
+        assert ds[0]["img"].shape == (1, 2, 4, 4, 4)
+
+    def test_no_channel_axis_counts_as_one(self, tmp_path: Path):
+        """A volume without 'c' gets a singleton channel added, so it pairs with one channel."""
+        a = _build_channel_volume(tmp_path / "a.zarr", "czyx", 3)
+        b = _build_channel_volume(tmp_path / "b.zarr", "zyx", 1)
+        ds = VolumeDataset(self._cfg([self._vol(a, "a", image_channels=[0]), self._vol(b, "b")]))
+        assert ds[0]["img"].shape == (1, 1, 4, 4, 4)
+
+
+class TestLabelChannelSelection:
+    """VolumeConfig.label_channels picks label channels independently of the image's, so one
+    array can serve as both — e.g. channel 2 the image and channels 0 and 1 the labels."""
+
+    def _cfg(self, volumes: list[dict], output_axes: str = "lczyx", **kw) -> MiaoConfig:
+        return MiaoConfig(
+            volumes=volumes, resolutions=kw.pop("resolutions", RES_1), output_axes=output_axes,
+            patch_size=[4, 4, 4], samples_per_epoch=2, **kw,
+        )
+
+    def _vol(self, path: Path, name: str = "v", **kw) -> dict:
+        return {"name": name, "path": str(path), "image_key": "raw", "label_key": "raw", **kw}
+
+    @pytest.mark.parametrize("img_axes, output_axes", [("czyx", "lczyx"), ("zyxc", "lzyxc")])
+    @pytest.mark.parametrize("resolutions", [RES_1, [[1, 1, 1], [2, 2, 2]]],
+                             ids=["no_resample", "resample"])
+    def test_one_array_split_into_image_and_labels(self, tmp_path: Path, img_axes, output_axes,
+                                                   resolutions):
+        p = _build_channel_volume(tmp_path / "v.zarr", img_axes, 3)
+        cfg = self._cfg([self._vol(p, image_channels=[2], label_channels=[0, 1])],
+                        output_axes=output_axes, resolutions=resolutions)
+        sample = VolumeDataset(cfg)[0]
+        img, lbl = sample["img"], sample["label"]
+        c = output_axes.index("c")
+        n_l = len(resolutions)
+        assert img.shape[c] == 1 and img.shape[0] == n_l
+        assert lbl.shape[c] == 2 and lbl.shape[0] == n_l
+        assert lbl.shape == img.shape[:c] + (2,) + img.shape[c + 1:]
+        assert torch.all(img == 3.0)
+        assert not lbl.is_floating_point()
+        assert torch.all(lbl.select(c, 0) == 1) and torch.all(lbl.select(c, 1) == 2)
+
+    def test_reordered_label_channels(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        cfg = self._cfg([self._vol(p, image_channels=[2], label_channels=[1, 0])])
+        lbl = VolumeDataset(cfg)[0]["label"]
+        assert torch.all(lbl[:, 0] == 2) and torch.all(lbl[:, 1] == 1)
+
+    def test_single_label_channel_squeezed(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        cfg = self._cfg([self._vol(p, image_channels=[2], label_channels=[1])])
+        lbl = VolumeDataset(cfg)[0]["label"]
+        assert lbl.shape == (1, 4, 4, 4)
+        assert torch.all(lbl == 2)
+
+    def test_multiple_label_channels_need_c_in_output(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        cfg = self._cfg([self._vol(p, image_channels=[2], label_channels=[0, 1])],
+                        output_axes="lzyx")
+        with pytest.raises(ValueError, match="no 'c' to hold them"):
+            VolumeDataset(cfg)
+
+    def test_all_label_channels_by_default(self, tmp_path: Path):
+        """Without label_channels a multi-channel label array returns every channel."""
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        lbl = VolumeDataset(self._cfg([self._vol(p, image_channels=[2])]))[0]["label"]
+        assert lbl.shape == (1, 3, 4, 4, 4)
+
+    def test_out_of_range_rejected(self, tmp_path: Path):
+        p = _build_channel_volume(tmp_path / "v.zarr", "czyx", 3)
+        with pytest.raises(ValueError, match=r"label_channels \[5\] out of range"):
+            VolumeDataset(self._cfg([self._vol(p, image_channels=[2], label_channels=[0, 5])]))
+
+    def test_label_channels_without_channel_axis_rejected(self, tmp_path: Path):
+        p = _build_axes_volume(tmp_path / "v.zarr", "zyx", "zyx")
+        cfg = self._cfg([{"name": "v", "path": str(p), "image_key": "raw", "label_key": "seg",
+                          "label_channels": [0]}], output_axes="lzyx")
+        with pytest.raises(ValueError, match="label_channels=\\[0\\] is set, but 'seg' has no"):
+            VolumeDataset(cfg)
+
+    def test_mismatched_label_channel_counts_across_volumes(self, tmp_path: Path):
+        a = _build_channel_volume(tmp_path / "a.zarr", "czyx", 3)
+        b = _build_channel_volume(tmp_path / "b.zarr", "czyx", 3)
+        vols = [self._vol(a, "a", image_channels=[2], label_channels=[0, 1]),
+                self._vol(b, "b", image_channels=[2], label_channels=[0])]
+        with pytest.raises(ValueError, match="differing label channel counts"):
+            VolumeDataset(self._cfg(vols))

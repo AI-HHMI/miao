@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 if TYPE_CHECKING:
     import torch
@@ -125,6 +125,36 @@ class VolumeConfig(BaseModel):
     # Strictly contains every window's read extent (all scales, including coarser sample_windows
     # patches), not just the patch center. Must be at least as large as the coarsest window.
     bounding_box: Optional[list[list[int]]] = None
+    # Channels to return, as indices along the stored channel axis of the image_key / label_key
+    # array, in the order listed (e.g. [0] for the first of three). None returns every channel;
+    # setting one requires that array to have a channel axis. The two are independent, so one
+    # array can serve as both, e.g. image_channels: [2] and label_channels: [0, 1] with
+    # image_key == label_key. A single label channel is squeezed off as usual; several keep a
+    # channel axis, placed where 'c' sits in output_axes.
+    image_channels: Optional[list[int]] = None
+    label_channels: Optional[list[int]] = None
+
+    @field_validator("image_channels", "label_channels")
+    @classmethod
+    def validate_channels(
+        cls, v: Optional[list[int]], info: ValidationInfo
+    ) -> Optional[list[int]]:
+        if v is None:
+            return v
+        name = info.field_name
+        if not v:
+            raise ValueError(f"{name} must be non-empty; omit it to return every channel")
+        if any(c < 0 for c in v):
+            raise ValueError(f"{name} must be non-negative indices, got {v}")
+        if len(set(v)) != len(v):
+            raise ValueError(f"{name} must not repeat an index, got {v}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_label_channels_need_labels(self) -> "VolumeConfig":
+        if self.label_channels is not None and self.label_key is None:
+            raise ValueError("label_channels is set but label_key is not")
+        return self
 
     @field_validator("weight")
     @classmethod
