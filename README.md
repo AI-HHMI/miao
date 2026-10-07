@@ -205,12 +205,16 @@ volumes:
     # fixed_axes: {t: "1:25"}    # a range, stop exclusive: frames 1..24
 output_axes: lczyx
 patch_size: [32, 128, 128]
-resolutions: [[1, 1, 1]]
+resolutions: [[200, 108, 108]]   # z, y, x in nm (output_axes order)
 ```
 
 With several indices, the volume expands into one volume per frame (`fish[t=25]`, `fish[t=40]`), which
 split its `weight` evenly. `meta["volume"]` names the frame a sample came from, and sequential mode
-walks every frame. Runnable: [`examples/example_timeseries.ipynb`](examples/example_timeseries.ipynb).
+walks every frame. Every expanded frame reads the label array at its own index too, so a frame the
+labels leave unannotated is sampled with an empty label. Per-frame annotations stored in separate
+label arrays therefore need one volume entry per frame, each with its own `label_key` and the one
+frame it annotates in `fixed_axes`. Runnable:
+[`examples/example_timeseries.ipynb`](examples/example_timeseries.ipynb).
 
 ## Augmentation
 
