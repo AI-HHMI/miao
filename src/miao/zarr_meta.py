@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -245,6 +246,9 @@ def fix_axes(meta: OmeMetadata, fixed: dict[str, int], where: str = "") -> OmeMe
     downsampled along the pyramid stays on the same physical position. The returned metadata
     describes the arrays with those dimensions removed; `ScaleMetadata.fixed_index` records the
     on-disk positions and indices for `open_store` to apply.
+
+    A pinned time axis is the exception: a level that downsamples it averages neighbouring frames,
+    so such levels are dropped and coarser scales are resampled from a level holding the frame.
     """
     if not fixed:
         return meta
@@ -261,8 +265,13 @@ def fix_axes(meta: OmeMetadata, fixed: dict[str, int], where: str = "") -> OmeMe
         return [values[i] for i in keep] if values else values
 
     base = meta.scales[min(meta.scales)]
+    time_dims = [d for d in dims if meta.axes[d].get("type") == "time"]
     scales: dict[int, ScaleMetadata] = {}
+    skipped: list[int] = []
     for level, sm in meta.scales.items():
+        if any(sm.scale_factors[d] != base.scale_factors[d] for d in time_dims):
+            skipped.append(level)
+            continue
         fixed_index = {}
         for d in dims:
             name = meta.axis_names[d]
@@ -281,6 +290,11 @@ def fix_axes(meta: OmeMetadata, fixed: dict[str, int], where: str = "") -> OmeMe
             dtype=sm.dtype,
             translation=_keep(sm.translation),
             fixed_index=fixed_index,
+        )
+    if skipped:
+        warnings.warn(
+            f"{where}fixed_axes pins a time axis that levels {skipped} downsample; skipping "
+            "them, so coarser scales are resampled from a finer level instead"
         )
 
     return OmeMetadata(

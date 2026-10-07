@@ -1784,7 +1784,7 @@ class TestFixedAxes:
         from conftest import _create_ome_ngff_zarr2
 
         # Every frame holds its level-0 time index, so a patch's values say which frame it read.
-        # The fixture halves t along the pyramid too, which exercises the per-level index mapping.
+        # The fixture halves t along the pyramid too, which a pinned t must not read from.
         axes = [{"name": "t", "type": "time"}] + [
             {"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"
         ]
@@ -1813,9 +1813,8 @@ class TestFixedAxes:
         assert sample["img"].shape == (2, 1, 8, 8, 8)
         assert sample["label"].shape == (2, 8, 8, 8)
         assert len(sample["meta"]["coordinate"]) == 3
-        # Level 0 reads frame 5; level 1 reads frame floor(5 / 2) = 2, which covers level-0 t=4.
-        assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
-        assert torch.all(sample["label"][0] == 5) and torch.all(sample["label"][1] == 4)
+        # The fixture's level 1 averages frames along t, so it is skipped: both scales read frame 5.
+        assert torch.all(sample["img"] == 5) and torch.all(sample["label"] == 5)
 
     def test_several_indices(self, tmp_path: Path):
         ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": [2, 6]},
@@ -1827,14 +1826,35 @@ class TestFixedAxes:
         assert seen == {"ts[t=2]": 2, "ts[t=6]": 6}
 
     def test_multiple_axes(self, tmp_path: Path):
-        # Pinning z on top of t leaves 2D yx crops; z is downsampled along the pyramid too.
+        # Pinning z on top of t leaves 2D yx crops. A single native scale: with t's coarse level
+        # skipped, a second one would need 2D resampling, which the trilinear resampler lacks.
         ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 5, "z": 10},
-                                        resolutions=[[1, 1], [2, 2]], output_axes="lcyx",
+                                        resolutions=[[1, 1]], output_axes="lcyx",
                                         patch_size=[8, 8]))
         sample = ds[0]
-        assert sample["img"].shape == (2, 1, 8, 8)
-        assert sample["label"].shape == (2, 8, 8)
-        assert torch.all(sample["img"][0] == 5) and torch.all(sample["img"][1] == 4)
+        assert sample["img"].shape == (1, 1, 8, 8)
+        assert sample["label"].shape == (1, 8, 8)
+        assert torch.all(sample["img"] == 5)
+
+    def test_pinned_space_axis_reads_coarse_levels(self, tmp_path: Path):
+        from conftest import _create_ome_ngff_zarr2
+
+        # Each z-slice holds its level-0 z index. Unlike t, a pinned z keeps the coarse level:
+        # level 1 reads slice floor(11 / 2) = 5, which covers level-0 z=10.
+        _create_ome_ngff_zarr2(tmp_path / "v.zarr", "raw", (32, 32, 32), num_scales=2,
+                               data_fn=lambda shape, level: np.broadcast_to(
+                                   (np.arange(shape[0]) * 2**level)[:, None, None], shape))
+        ds = VolumeDataset(MiaoConfig(
+            volumes=[dict(name="v", path=str(tmp_path / "v.zarr"), image_key="raw",
+                          fixed_axes={"z": 11}, normalize=False)],
+            resolutions=[[1, 1], [2, 2]], output_axes="lcyx", patch_size=[8, 8],
+        ))
+        sample = ds[0]
+        assert torch.all(sample["img"][0] == 11) and torch.all(sample["img"][1] == 10)
+
+    def test_time_axis_skips_levels_with_a_warning(self, tmp_path: Path):
+        with pytest.warns(UserWarning, match=r"levels \[1\] downsample"):
+            VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 5}))
 
     def test_sequential(self, tmp_path: Path):
         ds = VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 3},
