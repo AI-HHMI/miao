@@ -18,6 +18,50 @@ SAMPLING = {
 
 
 class TestVolumeConfig:
+    def test_fixed_axes_negative(self):
+        with pytest.raises(ValueError, match="fixed_axes index"):
+            VolumeConfig(**_vol(fixed_axes={"t": -1}))
+
+    @pytest.mark.parametrize("spec, expected", [
+        (10, [10]), ([25, 40], [25, 40]), ("1:4", [1, 2, 3]), ("0:6:2", [0, 2, 4]),
+    ])
+    def test_fixed_axes_forms(self, spec, expected):
+        subs = VolumeConfig(**_vol(fixed_axes={"t": spec}, weight=2.0)).expand_fixed_axes()
+        assert [s.fixed_axes["t"] for s in subs] == expected
+        assert sum(s.weight for s in subs) == pytest.approx(2.0)
+        if len(expected) > 1:
+            assert [s.name for s in subs] == [f"a[t={i}]" for i in expected]
+
+    def test_fixed_axes_combinations(self):
+        subs = VolumeConfig(**_vol(fixed_axes={"t": [1, 2], "c": "0:2"})).expand_fixed_axes()
+        assert [s.fixed_axes for s in subs] == [
+            {"t": 1, "c": 0}, {"t": 1, "c": 1}, {"t": 2, "c": 0}, {"t": 2, "c": 1},
+        ]
+
+    @pytest.mark.parametrize("spec, match", [
+        ("1-25", "start:stop"), ("5:5", "selects no index"), ([3, 3], "repeats"),
+        ([-1, 2], ">= 0"),
+    ])
+    def test_fixed_axes_invalid(self, spec, match):
+        with pytest.raises(ValueError, match=match):
+            VolumeConfig(**_vol(fixed_axes={"t": spec}))
+
+    def test_fixed_axes_yaml_roundtrip(self):
+        vol = VolumeConfig(**_vol(fixed_axes={"t": "1:25", "c": [0, 2]}))
+        assert VolumeConfig(**yaml.safe_load(vol.to_yaml())).fixed_axes == vol.fixed_axes
+
+    def test_bounding_box_dims(self):
+        # A pinned t left in bounding_box would shift every entry onto the wrong axis.
+        with pytest.raises(ValueError, match="bounding_box has 4 entries"):
+            MiaoConfig(volumes=[_vol(fixed_axes={"t": 3},
+                                     bounding_box=[[0, 48], [0, 152], [0, 508], [0, 1466]])],
+                       resolutions=[[1, 1, 1]], output_axes="lzyx", patch_size=[8, 8, 8])
+
+    def test_fixed_axes_in_output_axes(self):
+        with pytest.raises(ValueError, match="also appear in output_axes"):
+            MiaoConfig(volumes=[_vol(fixed_axes={"t": 3})], resolutions=[[1, 1, 1, 1]],
+                       output_axes="ltzyx", patch_size=[1, 8, 8, 8])
+
     def test_valid(self):
         v = VolumeConfig(
             name="raw",

@@ -23,6 +23,7 @@ def open_store(
     path: str | Path,
     zarr_version: ZarrVersion,
     context: ts.Context | None = None,
+    fixed_index: dict[int, int] | None = None,
 ) -> ts.TensorStore:
     """Open a tensorstore handle for a zarr array.
 
@@ -30,6 +31,8 @@ def open_store(
         path: Path to the zarr array directory.
         zarr_version: "zarr2" or "zarr3".
         context: Optional tensorstore context with cache settings.
+        fixed_index: Optional {dimension: index} to pin; those dimensions are removed from the
+            returned handle (see `zarr_meta.fix_axes`).
     """
     driver = "zarr" if zarr_version == "zarr2" else "zarr3"
     spec = {
@@ -41,4 +44,8 @@ def open_store(
     if context is not None:
         kwargs["context"] = context
 
-    return ts.open(spec, **kwargs).result()
+    store = ts.open(spec, **kwargs).result()
+    if fixed_index:
+        dims = sorted(fixed_index)
+        store = store[ts.d[tuple(dims)][tuple(fixed_index[d] for d in dims)]]
+    return store
