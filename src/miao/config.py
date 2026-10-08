@@ -134,6 +134,13 @@ class VolumeConfig(BaseModel):
     # alike, before any level selection or resampling. Leave at 1.0 for unexpanded data.
     exp_factor: float = 1.0
     label_key: Optional[str] = None
+    # The label value given to the voxels of a window that fall outside the label array. Unset (the
+    # default), every window lies inside the label array, so a label crop smaller than the window
+    # cannot be sampled at all. Set -- to a value the loss ignores, such as -1 -- a window may reach
+    # past the crop, its image taken from the surrounding volume within `bounding_box`, as long as
+    # its centre lies on the label array; the part of its label read outside the array takes this
+    # value. It must fit the integer type labels are returned in (int16 for a uint8 label array).
+    label_fill: Optional[int] = None
     weight: float = 1.0
     normalize: bool = True  # scale images to [0, 1]; see normalize_min / normalize_max
     # If both set: clip to [normalize_min, normalize_max] then linear map to [0, 1].
@@ -195,6 +202,15 @@ class VolumeConfig(BaseModel):
         if v <= 0:
             raise ValueError(f"exp_factor must be positive, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def validate_label_fill(self) -> "VolumeConfig":
+        if self.label_fill is not None and self.label_key is None:
+            raise ValueError(
+                f"Volume {self.name!r}: label_fill is set but there is no label_key, so there is "
+                "no label read for it to fill"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_normalize_range(self) -> "VolumeConfig":
