@@ -515,9 +515,11 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lines.append(f"      range {lo}..{hi} x{k}{iso}")
             if vi.label_meta is not None:
                 lbl_meta = vi.label_meta.scales[0]
+                fill = vi.config.label_fill
                 lines.append(
                     f"    label: axes={vi.lbl_axes!r}, shape={lbl_meta.shape}, "
                     f"dtype={lbl_meta.dtype} -> {vi.label_np_dtype}"
+                    + ("" if fill is None else f", windows may extend past it (filled with {fill})")
                 )
             lines.append(f"    sampling: p={prob:.4g}, size={vi.size:.4g} reachable voxels, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
@@ -681,6 +683,14 @@ class VolumeDataset(torch.utils.data.Dataset):
             )
         else:
             lbl_np_dt, lbl_torch_dt = np.dtype(np.int64), torch.int64
+        if vol_cfg.label_fill is not None:
+            bounds = np.iinfo(lbl_np_dt)
+            if not bounds.min <= vol_cfg.label_fill <= bounds.max:
+                raise ValueError(
+                    f"Volume {vol_cfg.name!r}: label_fill={vol_cfg.label_fill} does not fit the "
+                    f"{lbl_np_dt} its labels are returned in (from the stored "
+                    f"{label_meta.scales[0].dtype}), whose range is [{bounds.min}, {bounds.max}]"
+                )
 
         # bounding_box is specified in output_axes spatial order; reorder it to image storage
         # spatial order so it can be compared against storage-ordered read extents downstream.
@@ -750,6 +760,10 @@ class VolumeDataset(torch.utils.data.Dataset):
                         f"({vol_cfg.label_key!r}) the window does not fit: a label array smaller "
                         "than the patch window, or one whose OME-NGFF translation places it "
                         "outside the region the image can offer, leaves nowhere to sample."
+                        + (
+                            " label_fill lets windows extend past a label crop. "
+                            if vol_cfg.label_fill is None else ""
+                        )
                     )
             raise ValueError(
                 f"Volume {vol_cfg.name!r}: no valid sampling region — the patch window does not "
@@ -870,7 +884,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         Keeps every scale's (image and label) read extent inside the volume and, when a
         ``bounding_box`` is set, strictly inside that box. The bounding box constrains the read
         *extent* (not just the center), so a centered patch placed at any returned center lies
-        fully within the box; the most restrictive (coarsest/largest) scale dominates.
+        fully within the box; the most restrictive (coarsest/largest) scale dominates. A volume
+        with ``label_fill`` keeps only its centres on the label array, not its label reads.
         """
         img_sp_idx = vol_info.img_spatial_idx
         finest_spatial_shape = np.array(vol_info.image_meta.scales[0].shape)[img_sp_idx]
@@ -965,9 +980,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                     if scale_res.label_center_offsets is not None
                     else 0.0
                 )
+                # With label_fill the label read may reach past the array -- the part outside is
+                # filled -- so only the window's centre has to lie on it. 
+                lbl_read = scale_res.label_read_shapes[s].astype(np.float64)
+                if vol_info.config.label_fill is not None:
+                    lbl_read = np.ones_like(lbl_read)
                 _apply(
                     scale_res.label_relative_scale_factors[s],
-                    scale_res.label_read_shapes[s].astype(np.float64),
+                    lbl_read,
                     lbl_sp_shape,
                     lbl_start,
                     quantize=scale_res.relative_scale_factors[s],
@@ -1292,6 +1312,9 @@ class VolumeDataset(torch.utils.data.Dataset):
         # Phase 1: Compute slices and issue all reads concurrently via ts.Batch
         img_futures: list[ts.Future] = []
         lbl_futures: list[ts.Future | None] = []
+        # Per scale, for a label read that reaches past the label array (label_fill): where the
+        # part read sits in the full read, and the full read's shape. None for a read inside it.
+        lbl_pads: list[tuple[np.ndarray, np.ndarray] | None] = []
 
         # Whether this sample reads labels at all; needed before the per-scale label block below
         # because the label extent also constrains where a sample_windows window may be placed.
@@ -1361,10 +1384,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                             vol_info.label_meta.scales[scales.label_chosen_levels[s]].shape,
                             dtype=np.float64,
                         )[vol_info.lbl_spatial_idx]
+                        # With label_fill only the window's centre must lie on the label array
+                        lbl_roi_read = scales.label_read_shapes[s].astype(np.float64)
+                        if vol_info.config.label_fill is not None:
+                            lbl_roi_read = np.ones_like(lbl_roi_read)
                         lbl_roi_lo, lbl_roi_hi = _label_window_roi(
                             roi_lbl_start,
                             roi_lbl_shape,
-                            scales.label_read_shapes[s].astype(np.float64),
+                            lbl_roi_read,
                             scales.label_relative_scale_factors[s],
                             eff_shape.astype(np.float64),
                             rel_factors,
@@ -1443,29 +1470,38 @@ class VolumeDataset(torch.utils.data.Dataset):
                         (center_fine + lbl_offset) / lbl_rel_factors + 0.5
                     ).astype(np.int64)
                     lbl_origin = lbl_center - lbl_eff_half
-                    # Clamp into the label volume (same per-level rounding concern as the image).
                     lbl_sp_shape = np.array(
                         vol_info.label_meta.scales[lbl_level].shape, dtype=np.int64
                     )[vol_info.lbl_spatial_idx]
-                    lbl_origin = np.clip(lbl_origin, 0, lbl_sp_shape - lbl_eff_shape)
+                    if vol_info.config.label_fill is None:
+                        # Clamp into the label volume (same per-level rounding concern as the
+                        # image).
+                        lbl_origin = np.clip(lbl_origin, 0, lbl_sp_shape - lbl_eff_shape)
+                        read_lo, read_hi = lbl_origin, lbl_origin + lbl_eff_shape
+                        lbl_pads.append(None)
+                    else:
+                        # The window may reach past the label array: read the part on it, and
+                        # Phase 2 places that inside a read-shaped block of label_fill.
+                        read_lo = np.clip(lbl_origin, 0, lbl_sp_shape)
+                        read_hi = np.clip(lbl_origin + lbl_eff_shape, 0, lbl_sp_shape)
+                        lbl_pads.append((read_lo - lbl_origin, lbl_eff_shape))
                     # Build label slices from label axes metadata:
                     # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
                     lbl_slices = []
                     sp_i = 0
                     for dim_i, _ax_char in enumerate(vol_info.lbl_axes):
                         if dim_i in vol_info.lbl_spatial_idx:
-                            lbl_slices.append(
-                                slice(int(lbl_origin[sp_i]), int(lbl_origin[sp_i] + lbl_eff_shape[sp_i]))
-                            )
+                            lbl_slices.append(slice(int(read_lo[sp_i]), int(read_hi[sp_i])))
                             sp_i += 1
                         else:
                             lbl_slices.append(slice(None))
                     lbl_futures.append(vol_stores["label"][lbl_level][tuple(lbl_slices)].read(batch=batch))
                 else:
                     lbl_futures.append(None)
+                    lbl_pads.append(None)
 
         # Phase 2: Collect results (all reads already completed when batch exited)
-        for img_future, lbl_future in zip(img_futures, lbl_futures):
+        for img_future, lbl_future, lbl_pad in zip(img_futures, lbl_futures, lbl_pads):
             patch = np.asarray(img_future.result())
             if has_img_channel and not wants_channel:
                 c_idx = vol_info.img_axes.index("c")
@@ -1513,6 +1549,20 @@ class VolumeDataset(torch.utils.data.Dataset):
                 if has_lbl_channel and vol_info.lbl_axes is not None:
                     c_idx = vol_info.lbl_axes.index("c")
                     lbl = np.squeeze(lbl, axis=c_idx)
+
+                if lbl_pad is not None:
+                    # A read that reached past the label array: its part on the array goes back
+                    # where it was cut from, everything else is label_fill. In the returned label
+                    # type, which a negative fill fits and the stored (e.g. uint8) type may not.
+                    offset, full_shape = lbl_pad
+                    filled = np.full(
+                        tuple(int(n) for n in full_shape), vol_info.config.label_fill,
+                        dtype=vol_info.label_np_dtype,
+                    )
+                    filled[tuple(
+                        slice(int(o), int(o) + n) for o, n in zip(offset, lbl.shape)
+                    )] = lbl
+                    lbl = filled
 
                 # Resample labels with nearest-neighbor to preserve integer IDs
                 if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
