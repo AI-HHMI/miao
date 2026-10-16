@@ -332,6 +332,45 @@ class VolumeInfo:
     # are returned. A single one is squeezed off, as a channel-less label array would be.
     keep_lbl_channel: bool = False
 
+    # `sampling: foreground` only. Indices (N, Nd_spatial, int32, label spatial order) of the
+    # reachable foreground voxels on the scanned label level, plus that level's number, relative
+    # voxel size and origin offset against the reference frame: voxel k's centre is at reference
+    # coordinate k * fg_rel - fg_offset. None outside foreground mode; empty (N == 0) when the
+    # volume has no reachable foreground, in which case every draw falls back to random.
+    fg_voxels: np.ndarray | None = None
+    fg_level: int | None = None
+    fg_rel: np.ndarray | None = None
+    fg_offset: np.ndarray | None = None
+
+
+def _covered_extent(
+    scales: ScaleResolution, centered: list[int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference voxels every centred crop is guaranteed to contain, as offsets from its centre.
+
+    A crop centred on integer reference coordinate c contains every reference voxel in
+    [c - lo, c + hi], for each scale in ``centered``. The floor that snaps the centre onto the
+    level's grid can pull the crop up to one level voxel low, so the high side gives that voxel
+    up, except where the level is the reference grid itself and the floor is exact. A level voxel
+    covers ``rel`` reference voxels, which widens the extent by (rel - 1) / 2 on each side.
+    """
+    los, his = [], []
+    for s in centered:
+        rel = scales.relative_scale_factors[s]
+        eff = scales.read_shapes[s].astype(np.float64)
+        eff_half = np.floor(eff / 2)
+        off = (
+            scales.image_center_offsets[s]
+            if scales.image_center_offsets is not None
+            else np.zeros_like(rel)
+        )
+        exact = np.isclose(rel, 1.0) & np.isclose(off, np.round(off))
+        slack = np.where(exact, 0.0, 1.0)
+        spread = np.maximum(rel - 1.0, 0.0) / 2
+        los.append(eff_half * rel + spread)
+        his.append((eff - eff_half - 1.0 - slack) * rel + spread)
+    return np.min(los, axis=0), np.maximum(np.min(his, axis=0), 0.0)
+
 
 def _channel_selection(
     sel: list[int] | None, axes: str, meta: OmeMetadata, vol_name: str, key: str, field_name: str
@@ -415,7 +454,8 @@ class VolumeDataset(torch.utils.data.Dataset):
 
     Each __getitem__ call:
     1. Randomly picks one volume (weighted sampling).
-    2. Picks a random coordinate in that volume's finest-scale space.
+    2. Picks a random coordinate in that volume's finest-scale space (in foreground mode, with
+       probability ``foreground.fraction``, one whose crops contain a foreground voxel).
     3. Extracts patch_size voxels from each requested scale level.
     4. Returns {"img": Tensor, "label": Tensor, "bbox": Tensor,
        "pixel_size": Tensor, "meta": dict}.
@@ -506,6 +546,9 @@ class VolumeDataset(torch.utils.data.Dataset):
         self._grid: list[tuple[int, np.ndarray, tuple]] = []
         if config.sampling == "sequential":
             self._build_sequential_grid()
+        elif config.sampling == "foreground":
+            for vol_info in self._volumes:
+                self._build_foreground_index(vol_info)
 
         # Print summary
         self._print_summary()
@@ -518,6 +561,13 @@ class VolumeDataset(torch.utils.data.Dataset):
         if self.config.sampling == "sequential":
             ov = self.config.overlap
             mode_str = f"sequential, {len(self._grid)} total positions, overlap={ov}"
+        elif self.config.sampling == "foreground":
+            fg = self.config.foreground
+            thr = "label != 0" if fg.threshold is None else f"label > {fg.threshold}"
+            mode_str = (
+                f"foreground, {self.config.samples_per_epoch} samples/epoch, "
+                f"fraction={fg.fraction}, {thr}"
+            )
         else:
             mode_str = f"random, {self.config.samples_per_epoch} samples/epoch"
         print(f"VolumeDataset: {len(self._volumes)} volume(s), "
@@ -582,6 +632,12 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lines.append(f"    label_channels: {vi.config.label_channels}")
             lines.append(f"    sampling: p={prob:.4g}, size={vi.size:.4g} reachable voxels, "
                          f"center_range=[{vi.min_center.tolist()}, {vi.max_center.tolist()}]")
+            if vi.fg_voxels is not None:
+                fg_voxel = (vi.fg_rel * vi.finest_voxel_size).tolist()
+                lines.append(
+                    f"    foreground: {len(vi.fg_voxels)} reachable voxels at label level "
+                    f"{vi.fg_level} (voxel_size={fg_voxel})"
+                )
             if self.config.chunk_aligned:
                 sp_chunks = [finest_meta.chunks[i] for i in vi.img_spatial_idx]
                 lines.append(f"    chunk_aligned: spatial_chunks={sp_chunks}")
@@ -1130,6 +1186,129 @@ class VolumeDataset(torch.utils.data.Dataset):
                 )
                 self._grid.append((vol_idx, center, grid_idx))
 
+    def _centered_scales(self, n_scales: int) -> list[int]:
+        """Scales whose crop is centred on the sample centre. Under sample_windows only scale 0
+        is; each coarser window is placed to cover the one before, so it contains it anyway."""
+        return [0] if self.config.sample_windows else list(range(n_scales))
+
+    def _build_foreground_index(self, vol_info: VolumeInfo) -> None:
+        """Scan one label level of a volume for foreground (``sampling: foreground``).
+
+        Reads the whole level once, in the main process, so the chosen level should be a coarse
+        one. Keeps only the voxels some valid patch centre can bring into the crop: the rest (for
+        instance, outside a bounding_box) could never be shown and would only skew the draw.
+        """
+        fg_cfg = self.config.foreground
+        assert fg_cfg is not None and vol_info.label_meta is not None
+        assert vol_info.lbl_axes is not None and vol_info.lbl_spatial_idx is not None
+        assert vol_info.lbl_level_voxels is not None
+        name = vol_info.config.name
+
+        levels = sorted(vol_info.label_meta.scales.keys())
+        try:
+            level = levels[fg_cfg.level]
+        except IndexError:
+            raise ValueError(
+                f"Volume {name!r}: foreground level {fg_cfg.level} is out of range for label "
+                f"{vol_info.config.label_key!r}, which has {len(levels)} level(s)"
+            ) from None
+
+        store = open_store(
+            Path(vol_info.config.path)
+            / vol_info.config.label_key
+            / vol_info.label_meta.scales[level].path,
+            vol_info.config.zarr_version,
+        )
+        slices = tuple(
+            vol_info.lbl_channel_index if ax == "c" else slice(None) for ax in vol_info.lbl_axes
+        )
+        arr = np.asarray(store[slices].read().result())
+        mask = arr > fg_cfg.threshold if fg_cfg.threshold is not None else arr != 0
+        if "c" in vol_info.lbl_axes:
+            mask = mask.any(axis=vol_info.lbl_axes.index("c"))
+        voxels = np.argwhere(mask).astype(np.int32)
+
+        rel = vol_info.lbl_level_voxels[level] / vol_info.finest_voxel_size
+        lbl_translation = (
+            vol_info.lbl_level_translations[level]
+            if vol_info.lbl_level_translations is not None
+            else np.zeros_like(rel)
+        )
+        offset = (vol_info.img_translation - lbl_translation) / vol_info.finest_voxel_size
+
+        # The extent a crop is sure to cover, from the scales that bound the centre range: the
+        # cached ones, or in resolution-sampling mode the coarsest draw _resolve_volume used.
+        if vol_info.scales is not None:
+            bound_scales = vol_info.scales
+        else:
+            n_axes = len(vol_info.read_shape)
+            bound_scales = self._resolve_scales(
+                vol_info, [vol_info.sampling_spec.max_resolution(n_axes)]
+            )
+        lo, hi = _covered_extent(
+            bound_scales, self._centered_scales(len(bound_scales.resolutions))
+        )
+        spread = np.maximum(rel - 1.0, 0.0) / 2
+        if len(voxels):
+            centers = voxels * rel - offset
+            reachable = np.all(
+                (centers + spread >= vol_info.min_center - lo)
+                & (centers - spread <= vol_info.max_center + hi),
+                axis=1,
+            )
+            voxels = voxels[reachable]
+
+        if np.any(2 * spread > lo + hi):
+            warnings.warn(
+                f"Volume {name!r}: a foreground voxel at label level {level} "
+                f"({(rel * vol_info.finest_voxel_size).tolist()}) is wider than the crop on some "
+                "axis, so a foreground draw only guarantees the crop holds part of that voxel, "
+                "not the foreground itself. Set foreground.level to a finer level.",
+                stacklevel=2,
+            )
+        if len(voxels) == 0:
+            warnings.warn(
+                f"Volume {name!r}: no reachable foreground at label level {level}; every draw "
+                "from this volume will be uniformly random.",
+                stacklevel=2,
+            )
+
+        vol_info.fg_voxels = voxels
+        vol_info.fg_level = level
+        vol_info.fg_rel = rel
+        vol_info.fg_offset = offset
+
+    def _sample_foreground_center(
+        self, vol_info: VolumeInfo, scales: ScaleResolution
+    ) -> np.ndarray:
+        """Pick a patch centre that puts a random foreground voxel somewhere inside every crop.
+
+        Uniform over the centres whose crops contain the whole voxel, so the foreground lands
+        anywhere in the patch rather than always at its middle. On an axis where the voxel is
+        wider than the crop, a random point of it is contained instead. The result is clipped to
+        the valid centre range, which near the volume's edge can only keep the voxel as close to
+        the crop as the edge allows.
+        """
+        assert vol_info.fg_voxels is not None and len(vol_info.fg_voxels) > 0
+        assert vol_info.fg_rel is not None and vol_info.fg_offset is not None
+        voxel = vol_info.fg_voxels[np.random.randint(len(vol_info.fg_voxels))]
+        rel = vol_info.fg_rel
+        center = voxel * rel - vol_info.fg_offset
+        spread = np.maximum(rel - 1.0, 0.0) / 2
+        lo, hi = _covered_extent(scales, self._centered_scales(len(scales.resolutions)))
+
+        c_lo = np.ceil(center + spread - hi - 1e-9)
+        c_hi = np.floor(center - spread + lo + 1e-9)
+        too_wide = c_lo > c_hi
+        if np.any(too_wide):
+            point = center + np.random.uniform(-spread, spread)
+            c_lo = np.where(too_wide, np.ceil(point - hi - 1e-9), c_lo)
+            c_hi = np.where(too_wide, np.floor(point + lo + 1e-9), c_hi)
+            c_hi = np.maximum(c_hi, c_lo)
+        c_lo = np.clip(c_lo, vol_info.min_center, vol_info.max_center).astype(np.int64)
+        c_hi = np.clip(c_hi, vol_info.min_center, vol_info.max_center).astype(np.int64)
+        return np.array([np.random.randint(a, b + 1) for a, b in zip(c_lo, c_hi)])
+
     def _get_worker_id(self) -> int:
         worker_info = torch.utils.data.get_worker_info()
         return worker_info.id if worker_info is not None else 0
@@ -1350,8 +1529,17 @@ class VolumeDataset(torch.utils.data.Dataset):
                 lbl_intermediate = "l" + vol_info.lbl_axes
             lbl_perm = compute_permutation(lbl_intermediate, lbl_output_axes)
 
-        # Pick center coordinate (random mode only; sequential already set center above)
-        if self.config.sampling == "random":
+        # Pick center coordinate (sequential already set it above). A foreground draw centres on a
+        # foreground voxel; the rest are uniformly random, as in random mode.
+        foreground_draw: bool | None = None
+        if self.config.sampling == "foreground":
+            foreground_draw = bool(
+                len(vol_info.fg_voxels) > 0
+                and np.random.random() < self.config.foreground.fraction
+            )
+        if foreground_draw:
+            center = self._sample_foreground_center(vol_info, scales)
+        elif self.config.sampling != "sequential":
             if self.config.chunk_aligned:
                 center = self._sample_chunk_aligned_center(vol_info)
             else:
@@ -1750,6 +1938,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 "source_levels": scales.chosen_levels,
                 # grid_index only present in sequential mode; None breaks DataLoader collation
                 **({"grid_index": grid_index_out} if grid_index_out is not None else {}),
+                # Whether this sample was centred on foreground; foreground mode only.
+                **({"foreground": foreground_draw} if foreground_draw is not None else {}),
             },
             **({"deferred": deferred} if deferred is not None else {}),
         }

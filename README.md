@@ -68,7 +68,7 @@ as `(B, L, C, Z, Y, X)`. `L` is the number of scales, `Nd` the number of spatial
 | `label` | `output_axes` minus `c` | Label patch per scale; empty tensor without a `label_key` |
 | `bbox` | `(B, L, 2, Nd)` | Patch extent in physical units, world or center-relative (see `bbox_mode`) |
 | `pixel_size` | `(B, L, Nd)` | Effective output voxel size, as actually used for that sample |
-| `meta` | dict | `volume`, `coordinate`, `resolutions`, `source_levels`, plus `grid_index` in sequential mode |
+| `meta` | dict | `volume`, `coordinate`, `resolutions`, `source_levels`, plus `grid_index` in sequential mode and `foreground` (whether the draw was centered on foreground) in foreground mode |
 
 Spatial entries of `bbox`, `pixel_size` and every `meta` field are in `output_axes` spatial
 order.
@@ -180,6 +180,38 @@ The grid tiles the volume at the **first scale's** target resolution, striding o
 minus `overlap` worth of physical extent. Coverage is gap-free even on anisotropic source data.
 `samples_per_epoch`, `weight` and `size_weighting_exponent` are ignored here, and volumes are
 exhausted in order — the grid already visits each in proportion to its sampleable extent.
+
+### Foreground (sparse-object training)
+
+Random sampling, except that a share of the draws is centered on labelled foreground, so sparse
+objects show up in far more patches than their volume fraction would give them.
+
+```yaml
+sampling: foreground
+foreground:
+  fraction: 0.5      # share of draws centered on foreground; the rest are uniformly random
+  threshold: null    # null: any non-zero label is foreground; else label > threshold
+  level: -1          # label pyramid level to scan: -1 coarsest (default), 0 finest
+```
+
+When the dataset is built, it reads the chosen level of each volume's label pyramid whole,
+binarizes it, and keeps the foreground voxels a patch can actually reach (one outside a
+`bounding_box`, or too close to the edge for the patch window, is dropped). With `label_channels`
+set, a voxel counts if any selected channel is foreground. Each draw picks a volume exactly as in
+random mode, then, with probability `fraction`, a random foreground voxel of it. The patch center
+is jittered so that voxel lands at a uniformly random position inside **every** scale's crop, not
+at the middle of it. When the coarse voxel fits inside the crop, all of it is inside, so whatever
+foreground produced it is too.
+
+Every volume needs a `label_key`. A volume with no reachable foreground warns and falls back to
+uniformly random draws. `samples_per_epoch`, `weight`, `size_weighting_exponent` and
+`chunk_aligned` (random draws only) behave as in random mode.
+
+Caveat: the scan only sees what the pyramid's downsampling kept. Max-pooled label pyramids keep
+every object. Pyramids built by striding or majority vote can lose objects smaller than a coarse
+voxel, so for very small objects pick a finer `level`. A coarse voxel that is wider than the crop
+on some axis raises a warning: a foreground draw then only guarantees that part of the voxel is
+in the crop.
 
 ### Multi-scale windows
 
@@ -396,7 +428,8 @@ dimensions are picked up automatically when present; select a subset with the pe
 | `output_axes` | — | Tensor dim order: `l` (scales, required), optional `c` (channel), spatial `x`/`y`/`z`/`t` — e.g. `"lcxyz"` |
 | `patch_size` | — | Voxel count per crop, in `output_axes` spatial order |
 | `samples_per_epoch` | `1000` | Samples per epoch; ignored in sequential mode |
-| `sampling` | `"random"` | `"random"` or `"sequential"` — see [Sampling](#sampling) |
+| `sampling` | `"random"` | `"random"`, `"sequential"` or `"foreground"` — see [Sampling](#sampling) |
+| `foreground` | — | `{fraction, threshold, level}` for `sampling: foreground` — see [Foreground](#foreground-sparse-object-training) |
 | `size_weighting_exponent` | `0.0` | Weight volumes by how much data they hold — see [Random](#random-default) |
 | `overlap` | `0` | Patch overlap in voxels, sequential mode only. Integer or per-axis list; each entry must be `< patch_size` |
 | `sample_windows` | `false` | Randomize each coarser scale's patch origin — see [Multi-scale windows](#multi-scale-windows) |

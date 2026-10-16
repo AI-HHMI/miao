@@ -90,6 +90,39 @@ class ResolutionSampling(BaseModel):
         return out
 
 
+class ForegroundSampling(BaseModel):
+    """Spec for `sampling: foreground` — oversample patches that contain sparse foreground.
+
+    At construction, one level of each volume's label pyramid (the coarsest by default) is read
+    whole and binarized: a voxel is foreground where any returned label channel is non-zero, or,
+    with `threshold` set, greater than `threshold`. Each draw then picks a volume as in random
+    mode and, with probability `fraction`, centers on a foreground voxel of that volume instead
+    of a uniformly random location. The center is jittered so the foreground voxel lands at a
+    uniformly random position inside every scale's crop, not at its middle.
+
+    The scanned level only sees what its downsampling kept: a pyramid built by striding or mode
+    can drop objects smaller than its voxel, so pick a finer `level` for very small objects.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Probability that a draw is centered on foreground; the rest are uniformly random.
+    fraction: float = 0.5
+    # None: any non-zero label is foreground (binary masks, instance ids). Otherwise
+    # foreground is `label > threshold` (e.g. probability maps).
+    threshold: Optional[float] = None
+    # Label pyramid level to scan, indexed into the sorted levels: -1 is the coarsest,
+    # 0 the finest.
+    level: int = -1
+
+    @field_validator("fraction")
+    @classmethod
+    def validate_fraction(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(f"foreground fraction must be in [0, 1], got {v}")
+        return v
+
+
 class VolumeConfig(BaseModel):
     """Configuration for a single zarr volume."""
 
@@ -257,8 +290,11 @@ class MiaoConfig(BaseModel):
     samples_per_epoch: int = 1000
     cache_bytes: int = 1 << 30  # 1 GB
     file_io_concurrency: int = 64
-    sampling: Literal["random", "sequential"] = "random"
-    # Exponent for automatic volume-size weighting in `sampling: random` mode. Volume i is drawn
+    sampling: Literal["random", "sequential", "foreground"] = "random"
+    # Settings for `sampling: foreground` (defaults apply when omitted); rejected in other modes.
+    foreground: Optional[ForegroundSampling] = None
+    # Exponent for automatic volume-size weighting in `sampling: random` mode (and the volume
+    # draw of `sampling: foreground`). Volume i is drawn
     # with probability proportional to
     #     volumes[i].weight * size_i ** size_weighting_exponent
     # where size_i is the number of distinct stored voxels the sampler can reach in that volume
@@ -530,6 +566,25 @@ class MiaoConfig(BaseModel):
         names = [v.name for v in self.volumes]
         if len(names) != len(set(names)):
             raise ValueError("Volume names must be unique")
+        return self
+
+    @model_validator(mode="after")
+    def validate_foreground(self) -> "MiaoConfig":
+        if self.sampling != "foreground":
+            if self.foreground is not None:
+                raise ValueError(
+                    f"foreground is set but sampling={self.sampling!r}; it only applies to "
+                    "sampling='foreground'"
+                )
+            return self
+        if self.foreground is None:
+            self.foreground = ForegroundSampling()
+        unlabelled = [v.name for v in self.volumes if v.label_key is None]
+        if unlabelled:
+            raise ValueError(
+                f"sampling='foreground' finds foreground in the labels, but volume(s) "
+                f"{unlabelled} have no label_key"
+            )
         return self
 
     @model_validator(mode="after")
