@@ -1869,3 +1869,132 @@ class TestFixedAxes:
     def test_out_of_range(self, tmp_path: Path):
         with pytest.raises(ValueError, match="outside its extent"):
             VolumeDataset(self._config(self._timeseries(tmp_path), {"t": 8}))
+
+
+class TestLabelFill:
+    """`label_fill` lets a window reach past a label crop smaller than it.
+
+    The image is a ramp along z (value == z index at its level) and the label crop a ramp too
+    (value == its own z index + 1000), sitting at physical z 20..36 of a 64-long image. So a label
+    voxel read in the right place differs from its image voxel by a known constant, and a voxel
+    outside the crop must hold the fill: both are checked on content, voxel by voxel.
+    """
+
+    FILL = -1
+
+    @staticmethod
+    def _ramp(shape, level):
+        out = np.zeros(shape, dtype=np.float64)
+        return out + np.arange(shape[0]).reshape(-1, *([1] * (len(shape) - 1)))
+
+    def _build(self, tmp_path: Path, scales: int = 1, label_dtype: str = "uint16") -> Path:
+        from conftest import _create_ome_ngff_zarr2
+
+        _create_ome_ngff_zarr2(
+            tmp_path, "raw", (64, 16, 16), num_scales=scales,
+            base_scale_factors=[1.0, 1.0, 1.0], data_fn=self._ramp,
+        )
+        _create_ome_ngff_zarr2(
+            tmp_path, "labels/seg", (16, 16, 16), num_scales=scales, dtype=label_dtype,
+            base_scale_factors=[1.0, 1.0, 1.0], base_translation=[20.0, 0.0, 0.0],
+            data_fn=lambda shape, level: (self._ramp(shape, level) + 1000) % 256
+            if label_dtype == "uint8" else self._ramp(shape, level) + 1000,
+        )
+        return tmp_path
+
+    def _config(self, root: Path, resolutions, patch_z: int = 32, fill=FILL, box: bool = True,
+                **extra) -> MiaoConfig:
+        volume = {
+            "name": "crop",
+            "path": str(root),
+            "image_key": "raw",
+            "label_key": "labels/seg",
+            "label_fill": fill,
+        }
+        if box:
+            # Output order is xyz, the arrays zyx: z, the axis the crop is short on, is last.
+            volume["bounding_box"] = [[0, 16], [0, 16], [0, 64]]
+        return MiaoConfig(
+            volumes=[volume],
+            resolutions=resolutions,
+            output_axes="lcxyz",
+            # 4 across, so that even read at level 1 a window stays inside the 16-wide box.
+            patch_size=[4, 4, patch_z],
+            samples_per_epoch=16,
+            **extra,
+        )
+
+    def _check(self, img: torch.Tensor, lbl: torch.Tensor, crop_lo: float, crop_hi: float,
+               offset: float) -> None:
+        """Inside the crop (by the image's own position values) the label is in register; outside
+        it, the fill. The window's centre voxel lies on the crop."""
+        img, lbl = img.double(), lbl.double()
+        inside = (img >= crop_lo) & (img < crop_hi)
+        assert inside.any() and (~inside).any(), "the window should straddle the crop's edge"
+        assert (lbl[~inside] == self.FILL).all()
+        assert (lbl[inside] - img[inside]).unique().tolist() == [offset]
+        centre = tuple(n // 2 for n in lbl.shape)
+        assert lbl[centre] != self.FILL
+
+    def test_a_window_larger_than_the_crop_is_filled_around_it(self, tmp_path: Path):
+        ds = VolumeDataset(self._config(self._build(tmp_path), [[1.0, 1.0, 1.0]]))
+        for i in range(16):
+            sample = ds[i]
+            assert sample["label"].dtype == torch.int32          # uint16 is returned as int32
+            # Label voxel k sits at image z 20 + k: label - image == 1000 - 20 in register.
+            self._check(sample["img"][0, 0], sample["label"][0], 20, 36, 980.0)
+
+    def test_a_coarser_level_is_filled_in_its_own_voxels(self, tmp_path: Path):
+        """At 2 units both arrays are read at level 1: the crop is 8 voxels there, the window 16."""
+        ds = VolumeDataset(self._config(
+            self._build(tmp_path, scales=2), [[2.0, 2.0, 2.0]], patch_z=16,
+        ))
+        for i in range(16):
+            sample = ds[i]
+            # Level-1 label voxel k covers physical 20 + 2k, image level-1 voxel 10 + k.
+            self._check(sample["img"][0, 0], sample["label"][0], 10, 18, 990.0)
+
+    def test_off_centre_coarse_windows_keep_their_centre_on_the_crop(self, tmp_path: Path):
+        """sample_windows places the coarse window off-centre; with label_fill its centre, not its
+        whole label read, has to stay on the crop. Windows: 24 voxels at both scales."""
+        ds = VolumeDataset(self._config(
+            self._build(tmp_path, scales=2), [[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
+            patch_z=24, sample_windows=True,
+        ))
+        for i in range(16):
+            sample = ds[i]
+            self._check(sample["img"][0, 0], sample["label"][0], 20, 36, 980.0)
+            self._check(sample["img"][1, 0], sample["label"][1], 10, 18, 990.0)
+
+    def test_deferred_image_ops_return_the_same_labels(self, tmp_path: Path):
+        root = self._build(tmp_path)
+        plain = VolumeDataset(self._config(root, [[1.0, 1.0, 1.0]]))
+        deferred = VolumeDataset(self._config(root, [[1.0, 1.0, 1.0]], defer_image_ops=True))
+        for i in range(4):
+            np.random.seed(i)
+            a = plain[0]
+            np.random.seed(i)
+            b = deferred[0]
+            assert torch.equal(a["label"], b["label"])
+
+    def test_without_fill_the_crop_must_hold_the_window(self, tmp_path: Path):
+        """No box, so the collapse is the label's alone and says so, naming the way out."""
+        with pytest.raises(ValueError, match="label_fill lets windows extend past a label crop"):
+            VolumeDataset(self._config(
+                self._build(tmp_path), [[1.0, 1.0, 1.0]], fill=None, box=False,
+            ))
+
+    def test_the_fill_must_fit_the_returned_label_type(self, tmp_path: Path):
+        """A uint8 label array is returned as int16, which -1 fits and 40000 does not."""
+        root = self._build(tmp_path, label_dtype="uint8")
+        VolumeDataset(self._config(root, [[1.0, 1.0, 1.0]]))
+        with pytest.raises(ValueError, match="does not fit the int16"):
+            VolumeDataset(self._config(root, [[1.0, 1.0, 1.0]], fill=40000))
+
+    def test_a_fill_needs_a_label(self):
+        from pydantic import ValidationError
+
+        from miao.config import VolumeConfig
+
+        with pytest.raises(ValidationError, match="no label_key"):
+            VolumeConfig(name="v", path="/nowhere", image_key="raw", label_fill=-1)

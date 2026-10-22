@@ -443,6 +443,7 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `path` | — | Path to the OME-NGFF zarr container |
 | `image_key` | — | Group key within the zarr for image data |
 | `label_key` | `None` | Optional group key for labels in the same zarr |
+| `label_fill` | `None` | Set this (e.g. `-1`) to sample patches larger than the label array: the image is read around the labels, and label voxels outside the label array take this value. The patch center always lies inside the label array, and `bounding_box` still confines the read.  When unset (default), every patch must fit inside the label array |
 | `zarr_version` | `"zarr2"` | `"zarr2"` or `"zarr3"` |
 | `weight` | `1.0` | Sampling weight; multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` |
 | `exp_factor` | `1.0` | Divides the zarr's metadata voxel size to give the effective one, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
