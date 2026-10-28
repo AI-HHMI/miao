@@ -1998,3 +1998,69 @@ class TestLabelFill:
 
         with pytest.raises(ValidationError, match="no label_key"):
             VolumeConfig(name="v", path="/nowhere", image_key="raw", label_fill=-1)
+
+
+class TestLabelIds:
+    """Resampled labels keep every stored id, however large.
+
+    Every label voxel holds its own id, so a returned id names the stored voxel it came from. The
+    large copy adds a real MICrONS minnie65 segment id (~8.6e17) to the small one: float32, which
+    labels used to be resampled through, spaces its values 2**36 apart there, so a patch of such
+    ids came back as one or two.
+    """
+
+    BASE = 864691135975739203
+
+    def _build(self, tmp_path: Path) -> Path:
+        from conftest import _create_ome_ngff_zarr2
+
+        # z is stored 3x coarser, so labels are resampled along z, by a ratio that is not a whole
+        # number: a 16-voxel window at 1 unit reads 6 stored planes.
+        shape, scale = (12, 32, 32), [3.0, 1.0, 1.0]
+        ids = np.arange(int(np.prod(shape)), dtype=np.int64).reshape(shape)
+        _create_ome_ngff_zarr2(tmp_path, "raw", shape, num_scales=1, base_scale_factors=scale)
+        for key, offset in (("labels/small", 1), ("labels/large", self.BASE)):
+            _create_ome_ngff_zarr2(
+                tmp_path, key, shape, num_scales=1, dtype="uint64", base_scale_factors=scale,
+                data_fn=lambda level_shape, level, offset=offset: ids + offset,
+            )
+        return tmp_path
+
+    def _dataset(self, root: Path, label_key: str) -> VolumeDataset:
+        return VolumeDataset(MiaoConfig(
+            volumes=[{"name": "v", "path": str(root), "image_key": "raw", "label_key": label_key}],
+            resolutions=[[1.0, 1.0, 1.0]],
+            output_axes="lcxyz",
+            patch_size=[16, 16, 16],
+            samples_per_epoch=8,
+        ))
+
+    def test_the_lookup_is_torchs_nearest(self):
+        """The lookup must pick what F.interpolate(mode="nearest") picks, or labels with small ids
+        would change."""
+        from miao.dataset import _nearest_lookup
+
+        for target in (1, 2, 3, 7, 8, 16, 100, 144, 255, 256, 288, 316, 496):
+            for source in range(1, 701):
+                ramp = torch.arange(source, dtype=torch.float32).reshape(1, 1, source, 1, 1)
+                torch_pick = torch.nn.functional.interpolate(
+                    ramp, size=(target, 1, 1), mode="nearest"
+                ).reshape(-1).long().numpy()
+                assert np.array_equal(_nearest_lookup(source, target), torch_pick), (source, target)
+
+    def test_ids_beyond_float32_survive_resampling(self, tmp_path: Path):
+        root = self._build(tmp_path)
+        small, large = self._dataset(root, "labels/small"), self._dataset(root, "labels/large")
+        for i in range(8):
+            np.random.seed(i)
+            a = small[0]["label"]
+            np.random.seed(i)
+            b = large[0]["label"]
+            expected = a + (self.BASE - 1)
+            # Resampled (6 planes looked up 16 times repeat some), and with ids float32 cannot
+            # hold apart, so the test exercises the merge it guards against.
+            assert a.unique().numel() < a.numel()
+            assert np.unique(expected.numpy().astype(np.float32)).size < expected.unique().numel()
+            # Id for id the same stored voxels as the small copy.
+            assert b.dtype == torch.int64
+            assert torch.equal(b, expected)
