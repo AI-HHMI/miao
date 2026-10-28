@@ -121,6 +121,20 @@ def _label_window_roi(
     return c_lo - eff_half * rel, c_hi + (eff - eff_half) * rel
 
 
+def _nearest_lookup(source: int, target: int) -> np.ndarray:
+    """Which stored voxel each output voxel takes when `source` voxels are resampled to `target`.
+
+    Exactly torch's `nearest`: `floor(j * scale)` with torch's float32 `scale = source / target`,
+    the product rounded to float32 before the floor as its `floorf` does, and clamped to the last
+    stored voxel. Indexing the stored ids with it, unlike interpolating them, keeps every id exact:
+    a float32 resampling merges ids beyond 2**24. Returns `(target,)` int64.
+    """
+    scale = np.float32(source) / np.float32(target)
+    j = np.arange(target, dtype=np.float64)
+    index = np.floor((j * np.float64(scale)).astype(np.float32)).astype(np.int64)
+    return np.minimum(index, source - 1)
+
+
 def _select_level_for_resolution(
     level_voxels: dict[int, np.ndarray], target: np.ndarray
 ) -> int:
@@ -1564,7 +1578,9 @@ class VolumeDataset(torch.utils.data.Dataset):
                     )] = lbl
                     lbl = filled
 
-                # Resample labels with nearest-neighbor to preserve integer IDs
+                # Resample labels with nearest-neighbor by looking the stored ids up, one axis at a
+                # time: interpolating them would round them through float32, which merges ids
+                # beyond 2**24 (connectomics segment ids are ~1e17).
                 if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
                     # After squeeze, spatial indices shift left past removed channel.
                     c_idx = vol_info.lbl_axes.index("c")
@@ -1573,9 +1589,10 @@ class VolumeDataset(torch.utils.data.Dataset):
                 else:
                     lbl_spatial_shape = tuple(int(s) for s in lbl.shape)
                 if lbl_spatial_shape != target_size:
-                    lbl_t = torch.from_numpy(lbl).float().unsqueeze(0).unsqueeze(0)
-                    lbl_t = F.interpolate(lbl_t, size=target_size, mode="nearest").squeeze(0).squeeze(0)
-                    lbl = lbl_t.numpy().astype(vol_info.label_np_dtype)
+                    for axis, (n, p) in enumerate(zip(lbl.shape, target_size, strict=True)):
+                        if n != p:
+                            lbl = np.take(lbl, _nearest_lookup(n, p), axis=axis)
+                    lbl = lbl.astype(vol_info.label_np_dtype, copy=False)
                 label_crops.append(lbl)
 
         from miao.config import IMAGE_DTYPE_MAP
