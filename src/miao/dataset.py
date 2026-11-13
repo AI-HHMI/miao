@@ -743,9 +743,10 @@ class VolumeDataset(torch.utils.data.Dataset):
 
         sampling_spec = self.config.resolution_sampling_for(vol_cfg)
         if sampling_spec is not None:
-            # Sampling mode: resolutions drawn per __getitem__. Bound centers using the coarsest
-            # case (the per-axis max upper bound across all ranges) — the largest physical extent
-            # is the binding constraint, so any sampled resolution is guaranteed to fit.
+            # Sampling mode: resolutions drawn per __getitem__, and each draw's center is bounded
+            # by that draw's own window there. Here the coarsest case (the per-axis max upper
+            # bound across all ranges) must fit: it is the largest physical extent, so a volume
+            # it fits holds every draw. min_center/max_center keep its (narrowest) range.
             vol_info.sampling_spec = sampling_spec
             n_axes = len(output_spatial)
             bound_res = [sampling_spec.max_resolution(n_axes)]
@@ -788,14 +789,17 @@ class VolumeDataset(torch.utils.data.Dataset):
             )
 
         # Reachable stored voxels, measured on the finest level any scale reads. In sampling mode
-        # the centre bounds come from the coarsest resolution, but a sampled draw may read a finer
-        # level, so measure there instead — otherwise `size` is understated.
+        # that is the finest draw, measured with its own center range: it reads a finer level and
+        # reaches further than the coarsest draw -- otherwise `size` is understated.
         if sampling_spec is not None:
             size_res = self._resolve_scales(
                 vol_info, [sampling_spec.min_resolution(len(output_spatial))]
             )
+            size_lo, size_hi = self._center_bounds(vol_info, size_res)
+            size_lo, size_hi = np.ceil(size_lo), np.floor(size_hi)
         else:
             size_res = scale_res
+            size_lo, size_hi = vol_info.min_center, vol_info.max_center
         finest_level = min(size_res.chosen_levels)
         at_finest = [i for i, lv in enumerate(size_res.chosen_levels) if lv == finest_level]
         # Several scales can resolve to one level; take the largest window so `size` does not
@@ -805,7 +809,7 @@ class VolumeDataset(torch.utils.data.Dataset):
         level_shape = np.array(
             image_meta.scales[finest_level].shape, dtype=np.float64
         )[img_sp_idx]
-        reachable = (vol_info.max_center - vol_info.min_center) / rel + window
+        reachable = (size_hi - size_lo) / rel + window
         vol_info.size = float(np.prod(np.minimum(reachable, level_shape)))
         return vol_info
 
@@ -1173,7 +1177,12 @@ class VolumeDataset(torch.utils.data.Dataset):
                 slices.append(slice(None))  # channel dim: take all
         return tuple(slices)
 
-    def _sample_chunk_aligned_center(self, vol_info: VolumeInfo) -> np.ndarray:
+    def _sample_chunk_aligned_center(
+        self,
+        vol_info: VolumeInfo,
+        min_center: np.ndarray | None = None,
+        max_center: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Sample a random patch center constrained to lie within a single chunk.
 
         For each spatial axis:
@@ -1181,8 +1190,11 @@ class VolumeDataset(torch.utils.data.Dataset):
             center within it such that the full patch fits inside one chunk.
           - If chunk_size < patch_size: fall back to unconstrained random.
 
-        Returns center array in image spatial axis order.
+        `min_center`/`max_center` is the sample's valid center range: a resolution draw's own,
+        or by default the volume's. Returns center array in image spatial axis order.
         """
+        if min_center is None:
+            min_center, max_center = vol_info.min_center, vol_info.max_center
         # Level 0 is the finest pyramid level and the frame center coordinates live in.
         full_chunks = vol_info.image_meta.scales[0].chunks
         spatial_chunks = [full_chunks[i] for i in vol_info.img_spatial_idx]
@@ -1192,8 +1204,8 @@ class VolumeDataset(torch.utils.data.Dataset):
         for ax in range(len(vol_info.img_spatial_idx)):
             chunk_sz = spatial_chunks[ax]
             patch_sz = vol_info.read_shape[ax]
-            lo = int(vol_info.min_center[ax])
-            hi = int(vol_info.max_center[ax])
+            lo = int(min_center[ax])
+            hi = int(max_center[ax])
 
             if chunk_sz < patch_sz:
                 center[ax] = np.random.randint(lo, hi + 1)
@@ -1248,7 +1260,10 @@ class VolumeDataset(torch.utils.data.Dataset):
         output_spatial = spatial_axes(self.config.output_axes)
         spatial_perm = compute_permutation(vol_info.img_spatial_axes, output_spatial)
 
-        # Per-scale reads: cached (fixed resolutions) or freshly drawn (resolution sampling).
+        # Per-scale reads: cached (fixed resolutions) or freshly drawn (resolution sampling). A
+        # drawn set gets its own center range: a fine draw's smaller window can sit nearer the
+        # edges than the coarsest draw's, whose range is the one stored at construction.
+        min_center, max_center = vol_info.min_center, vol_info.max_center
         if vol_info.scales is not None:
             scales = vol_info.scales
         else:
@@ -1256,6 +1271,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 vol_info.sampling_spec, len(output_spatial), np.random
             )
             scales = self._resolve_scales(vol_info, sampled)
+            lo, hi = self._center_bounds(vol_info, scales)
+            min_center, max_center = np.ceil(lo).astype(np.int64), np.floor(hi).astype(np.int64)
 
         # Determine image intermediate axes after stacking: "l" + img_axes
         # Handle channel mismatch:
@@ -1295,13 +1312,10 @@ class VolumeDataset(torch.utils.data.Dataset):
         # Pick center coordinate (random mode only; sequential already set center above)
         if self.config.sampling == "random":
             if self.config.chunk_aligned:
-                center = self._sample_chunk_aligned_center(vol_info)
+                center = self._sample_chunk_aligned_center(vol_info, min_center, max_center)
             else:
                 center = np.array(
-                    [
-                        np.random.randint(lo, hi + 1)
-                        for lo, hi in zip(vol_info.min_center, vol_info.max_center)
-                    ]
+                    [np.random.randint(lo, hi + 1) for lo, hi in zip(min_center, max_center)]
                 )
 
         read_shape = np.array(vol_info.read_shape)
@@ -1427,9 +1441,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                         (center + img_offset) / rel_factors
                     ).astype(np.int64)
                     origin = center_at_level - eff_half
-                    # Clamp into the valid range: when resolutions are sampled, the chosen level
-                    # (and its read shape) differ from the one used to derive min/max_center, so
-                    # per-level floor() rounding can nudge the origin a voxel out of bounds.
+                    # Clamp into the valid range: per-level floor() rounding can nudge the origin
+                    # a voxel out of bounds.
                     img_sp_shape = np.array(
                         vol_info.image_meta.scales[level].shape, dtype=np.int64
                     )[vol_info.img_spatial_idx]

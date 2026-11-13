@@ -128,6 +128,12 @@ The shape of each bound decides isotropy:
 Ranges stack: `[[[1], [2]], [[4], [8]]]` with `n_scales: [1, 1]` gives two scales, `L` being the sum
 across ranges. Draws are log-uniform and redrawn every `__getitem__`.
 
+A volume must hold the window of the coarsest resolution its ranges allow, which is checked when
+the dataset is built. Each sample's center is then drawn from the range its own drawn resolutions
+allow, so a fine draw's smaller window reaches nearer the edges of the volume (or its
+`bounding_box`) than the coarsest draw's could. A volume's `size` for `size_weighting_exponent` is
+measured at the finest resolution its ranges allow.
+
 Constraints: exactly one of `resolutions` / `resolution_sampling` per config and per volume
 override; `resolution_sampling` rules out `sampling: sequential`; `sample_windows` demands isotropic
 ranges.
