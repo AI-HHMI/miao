@@ -450,6 +450,7 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `resolutions` / `resolution_sampling` | — | Per-volume override of the global setting; set at most one |
 | `normalize` | `true` | Scale images to [0, 1]: integer dtypes by their max, float dtypes left unchanged |
 | `normalize_min` / `normalize_max` | `None` | Set both to clip to that range and map it linearly to [0, 1] |
+| `normalize_clip` | `true` | Set to `false` to skip the clip: the `normalize_min` / `normalize_max` window is then a plain linear map, so values outside it fall below 0 or above 1 |
 | `patch_normalize` | `false` | Standardize each sample to zero mean / unit variance after `normalize`. Multi-scale: statistics come from the coarsest crop and apply to all scales |
 | `bounding_box` | `None` | `[[min, max], ...]` per spatial axis in level-0 voxels. Confines every read extent at every scale, `sample_windows` patches included — not merely the patch center. Must be at least as large as the coarsest window |
 | `fixed_axes` | `None` | `{axis: index}`, e.g. `{t: 10}`: pins a stored axis to a level-0 index and removes it, so a time series samples as a 3D volume at that frame. A value may also list indices (`[25, 40]`) or give a `"start:stop[:step]"` range with exclusive stop (`"1:25"`); the volume then expands into one per index (per combination across axes), named e.g. `vol[t=25]`, splitting its `weight` evenly. A pinned axis must not appear in `output_axes`, `patch_size`, `resolutions` or `bounding_box` |

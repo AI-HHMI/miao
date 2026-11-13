@@ -207,14 +207,16 @@ def _normalize_image_tensor(
     normalize_min: float | None,
     normalize_max: float | None,
     image_dtype: np.dtype,
+    clip: bool = True,
 ) -> torch.Tensor:
-    """Scale image values to approximately [0, 1] for training."""
+    """Scale image values to approximately [0, 1] for training (exactly, unless `clip` is off)."""
     if not normalize:
         return img_tensor
     if normalize_min is not None and normalize_max is not None:
         lo = float(normalize_min)
         hi = float(normalize_max)
-        img_tensor = img_tensor.clamp(lo, hi)
+        if clip:
+            img_tensor = img_tensor.clamp(lo, hi)
         return (img_tensor - lo) / (hi - lo)
     if np.issubdtype(image_dtype, np.integer):
         return img_tensor / float(np.iinfo(image_dtype).max)
@@ -547,7 +549,8 @@ class VolumeDataset(torch.utils.data.Dataset):
                 ):
                     lines.append(
                         "    normalize: "
-                        f"clamp [{vi.config.normalize_min}, {vi.config.normalize_max}] -> [0, 1]"
+                        + ("clamp" if vi.config.normalize_clip else "linear, unclipped,")
+                        + f" [{vi.config.normalize_min}, {vi.config.normalize_max}] -> [0, 1]"
                     )
                 elif np.issubdtype(vi.image_dtype, np.integer):
                     lines.append(
@@ -1633,6 +1636,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                     if vol_info.config.normalize_max is not None
                     else float("-inf")
                 ),
+                "normalize_clip": bool(vol_info.config.normalize_clip),
                 "integer_source": bool(np.issubdtype(vol_info.image_dtype, np.integer)),
                 "source_max": float(
                     np.iinfo(vol_info.image_dtype).max
@@ -1655,6 +1659,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 normalize_min=vol_info.config.normalize_min,
                 normalize_max=vol_info.config.normalize_max,
                 image_dtype=vol_info.image_dtype,
+                clip=vol_info.config.normalize_clip,
             )
             if vol_info.config.patch_normalize:
                 img_tensor = _patch_normalize_image_tensor(
@@ -1813,7 +1818,9 @@ def finish_images(batch: dict, device: "torch.device | str" = "cpu") -> dict:
         if spec["normalize"]:
             low, high = float(spec["normalize_min"]), float(spec["normalize_max"])
             if low != float("-inf") and high != float("-inf"):
-                image = (image.clamp(low, high) - low) / (high - low)
+                if spec["normalize_clip"]:
+                    image = image.clamp(low, high)
+                image = (image - low) / (high - low)
             elif spec["integer_source"]:
                 image = image / float(spec["source_max"])
         if spec["patch_normalize"]:
