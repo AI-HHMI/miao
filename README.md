@@ -65,7 +65,7 @@ as `(B, L, C, Z, Y, X)`. `L` is the number of scales, `Nd` the number of spatial
 | Key | Shape | Description |
 |---|---|---|
 | `img` | `output_axes` order | Image patch per scale |
-| `label` | `output_axes` minus `c` | Label patch per scale; empty tensor without a `label_key` |
+| `label` | `output_axes` minus `c` | Label patch per scale; empty tensor without a `label_key`. With `label_margin`, each spatial axis is `patch_size + 2 * label_margin` long |
 | `bbox` | `(B, L, 2, Nd)` | Patch extent in physical units, world or center-relative (see `bbox_mode`) |
 | `pixel_size` | `(B, L, Nd)` | Effective output voxel size, as actually used for that sample |
 | `meta` | dict | `volume`, `coordinate`, `resolutions`, `source_levels`, plus `grid_index` in sequential mode |
@@ -391,6 +391,30 @@ def augment(sample):
             "affinities": torch.stack([affinities(l) for l in lab])}
 ```
 
+### Labels beyond the patch
+
+Some targets need labels from outside the patch. An affinity with offset 3 compares each voxel
+with the voxel 3 steps away. For voxels near the border of the patch, that neighbor lies outside
+the patch.
+
+`label_margin` returns the label for the patch plus a margin on each side:
+
+```yaml
+patch_size: [128, 128, 128]
+label_margin: [8, 8, 8]      # per axis, in output_axes spatial order
+label_margin_fill: -1        # value for margin voxels outside the label array
+```
+
+The label then has `patch_size + 2 * label_margin` voxels per spatial axis (144 here), centered on
+the image. The image, `bbox` and sampling do not change.
+
+- The margin continues the patch's own voxel grid. The central `patch_size` part of the label is
+  identical to the label returned without a margin.
+- A margin voxel outside the label array takes the volume's `label_fill`. In a volume without
+  `label_fill` it takes `label_margin_fill`, which is then required.
+- `label_margin` cannot be combined with `augment_fn`, because the augmentations expect the image
+  and the label to have the same shape. Compute the target and augment after collation instead.
+
 ## Moving all image processing to the GPU
 For workloads that are not compute-bound (_i.e._ small models, small inputs), performing image processing operations like resampling and normalization on the CPU (which is the default option) can be inefficient. 
 
@@ -426,6 +450,8 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `sampling` | `"random"` | `"random"` or `"sequential"` — see [Sampling](#sampling) |
 | `size_weighting_exponent` | `0.0` | Weight volumes by how much data they hold — see [Random](#random-default) |
 | `overlap` | `0` | Patch overlap in voxels, sequential mode only. Integer or per-axis list; each entry must be `< patch_size` |
+| `label_margin` | `None` | Extra label voxels to return beyond each side of the patch, per axis in `output_axes` spatial order — see [Labels beyond the patch](#labels-beyond-the-patch) |
+| `label_margin_fill` | `None` | Value for margin voxels that fall outside the label array, in volumes without `label_fill` |
 | `sample_windows` | `false` | Randomize each coarser scale's patch origin — see [Multi-scale windows](#multi-scale-windows) |
 | `chunk_aligned` | `false` | Keep random patches inside a single stored chunk, per axis where the chunk is at least patch-sized |
 | `bbox_mode` | `"absolute"` | `bbox` in world coords, or `"relative"` to the finest-level crop center |
