@@ -117,6 +117,24 @@ class TestVolumeConfig:
                 normalize_max=1.0,
             )
 
+    def test_normalize_clip_needs_a_window(self):
+        with pytest.raises(ValueError, match="no normalize_min / normalize_max window"):
+            VolumeConfig(
+                name="raw",
+                path="/data/test.zarr",
+                image_key="raw",
+                normalize_clip=False,
+            )
+        windowed = VolumeConfig(
+            name="raw",
+            path="/data/test.zarr",
+            image_key="raw",
+            normalize_min=0.0,
+            normalize_max=1.0,
+            normalize_clip=False,
+        )
+        assert windowed.normalize_clip is False
+
 
 class TestMiaoConfig:
     def test_valid(self, sample_config: dict):
