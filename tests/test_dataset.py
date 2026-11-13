@@ -954,6 +954,31 @@ class TestBoundingBox:
     def test_centered_multiscale(self, zarr2_volume: Path):
         self._assert_inside(VolumeDataset(self._cfg(zarr2_volume, resolutions=RES_3)))
 
+    @pytest.mark.parametrize("labels", [False, True])
+    def test_a_box_one_window_long_at_the_stores_resolution(self, zarr2_volume: Path, labels):
+        """At level 0 a read starts at center - patch // 2 exactly, so a box no larger than the
+        window admits exactly that window (the floor's one-voxel slack used to collapse it)."""
+        box = [[10, 18], [12, 20], [9, 17]]
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw", "bounding_box": box}
+        if labels:
+            vol["label_key"] = "labels/seg"
+        cfg = MiaoConfig(volumes=[vol], output_axes="lzyx", patch_size=[8, 8, 8], resolutions=RES_1,
+                         samples_per_epoch=4)
+        ds = VolumeDataset(cfg)
+        assert np.array_equal(ds._volumes[0].min_center, ds._volumes[0].max_center)
+        read = ds[0]["bbox"].numpy()[0] / ds._volumes[0].finest_voxel_size   # (2, 3): lo, hi
+        np.testing.assert_allclose(read, np.array(box, dtype=float).T)
+
+    def test_a_coarser_read_keeps_its_slack(self, zarr2_volume: Path):
+        """At level 1 the read's anchor is floored onto 2-voxel steps and can sit a voxel below
+        the center, so a box exactly one window long there is still refused, as before."""
+        box = [[10, 26], [12, 28], [9, 25]]            # 8 level-1 voxels per axis
+        vol = {"name": "v", "path": str(zarr2_volume), "image_key": "raw", "bounding_box": box}
+        cfg = MiaoConfig(volumes=[vol], output_axes="lzyx", patch_size=[8, 8, 8],
+                         resolutions=[[2, 2, 2]], samples_per_epoch=4)
+        with pytest.raises(ValueError, match="too small to contain"):
+            VolumeDataset(cfg)
+
     def test_centered_misaligned(self, zarr2_volume: Path):
         cfg = self._cfg(zarr2_volume, resolutions=[[1.3, 1.3, 1.3], [2.0, 2.0, 2.0]])
         self._assert_inside(VolumeDataset(cfg))
