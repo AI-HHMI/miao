@@ -135,6 +135,11 @@ def _nearest_lookup(source: int, target: int) -> np.ndarray:
     return np.minimum(index, source - 1)
 
 
+def _whole(value: float | np.ndarray) -> np.ndarray:
+    """Whether a reference-frame offset is a whole number of voxels (per axis)."""
+    return np.isclose(value, np.round(value))
+
+
 def _select_level_for_resolution(
     level_voxels: dict[int, np.ndarray], target: np.ndarray
 ) -> int:
@@ -954,9 +959,18 @@ class VolumeDataset(torch.utils.data.Dataset):
             if bb is not None:
                 # Strict bbox on the read extent. A centered patch spans (ref frame, worst-case
                 # over the floor()/eff//2 quantization) [center - (eff_half + 1)*rel,
-                # center + ceil(eff/2)*rel]; keep that inside [bb_lo, bb_hi).
+                # center + ceil(eff/2)*rel]; keep that inside [bb_lo, bb_hi). The extra voxel is
+                # the floor's worst case, so it is kept only where the read's anchor can fall
+                # below the center. A read of the store's own voxels (rel 1) on a whole-voxel
+                # origin -- and, for a label, anchored on such an image read -- starts at
+                # center - eff_half exactly (centers are whole voxels), and the slack would only
+                # make a box exactly one window long collapse.
                 ceil_half = np.ceil(eff / 2)
-                min_center = np.maximum(min_center, bb[:, 0] + (eff_half + 1.0) * rel)
+                exact = np.isclose(rel, 1.0) & _whole(start)
+                if quantize is not None:
+                    exact &= np.isclose(quantize, 1.0) & _whole(quantize_offset)
+                slack = np.where(exact, 0.0, 1.0)
+                min_center = np.maximum(min_center, bb[:, 0] + (eff_half + slack) * rel)
                 max_center = np.minimum(max_center, bb[:, 1] - ceil_half * rel)
 
         for s in range(len(scale_res.resolutions)):
