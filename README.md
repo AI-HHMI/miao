@@ -534,9 +534,10 @@ physical thickness all survive collation. Index a single scale out with `batch["
   per-axis list with `0` on the thin axis.
 - The three orientations are not equivalent on anisotropic data: at 4×4×33 nm an `xy` plane is a
   stored section, while `xz` and `yz` are mostly interpolation along `z`.
-- Nearest-neighbor label resampling takes the *first* plane of a slab, so on a resampled thin axis
-  the label plane can come from a different depth than the image plane, off by up to half a
-  thickness. Read counts resolve from the *label* pyramid independently, so check both.
+- Labels on a coarser voxel grid than the image (say 16 nm labels under an 8 nm image) can sit up to
+  half a label voxel off the image: the label read starts on a whole label voxel, which need not be
+  where the image read starts. Read counts resolve from the *label* pyramid independently, so check
+  both.
 
 </details>
 

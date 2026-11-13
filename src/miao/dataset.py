@@ -121,17 +121,21 @@ def _label_window_roi(
     return c_lo - eff_half * rel, c_hi + (eff - eff_half) * rel
 
 
-def _nearest_lookup(source: int, target: int) -> np.ndarray:
+def _nearest_exact_lookup(source: int, target: int) -> np.ndarray:
     """Which stored voxel each output voxel takes when `source` voxels are resampled to `target`.
 
-    Exactly torch's `nearest`: `floor(j * scale)` with torch's float32 `scale = source / target`,
-    the product rounded to float32 before the floor as its `floorf` does, and clamped to the last
-    stored voxel. Indexing the stored ids with it, unlike interpolating them, keeps every id exact:
-    a float32 resampling merges ids beyond 2**24. Returns `(target,)` int64.
+    The stored voxel under the output voxel's center, exactly torch's `nearest-exact`:
+    `floor((j + 0.5) * scale)` with torch's float32 `scale = source / target`, the product rounded
+    to float32 before the floor as its `floorf` does, and clamped to the last stored voxel. The
+    image is resampled at output voxel centers too (`align_corners=False`), so the labels stay on
+    it; torch's `nearest` takes `floor(j * scale)`, the first stored voxel an output voxel
+    overlaps, which shifts the labels against the image whenever the ratio is not a whole number.
+    Indexing the stored ids, unlike interpolating them, keeps every id exact: a float32 resampling
+    merges ids beyond 2**24. Returns `(target,)` int64.
     """
     scale = np.float32(source) / np.float32(target)
     j = np.arange(target, dtype=np.float64)
-    index = np.floor((j * np.float64(scale)).astype(np.float32)).astype(np.int64)
+    index = np.floor(((j + 0.5) * np.float64(scale)).astype(np.float32)).astype(np.int64)
     return np.minimum(index, source - 1)
 
 
@@ -1578,9 +1582,10 @@ class VolumeDataset(torch.utils.data.Dataset):
                     )] = lbl
                     lbl = filled
 
-                # Resample labels with nearest-neighbor by looking the stored ids up, one axis at a
-                # time: interpolating them would round them through float32, which merges ids
-                # beyond 2**24 (connectomics segment ids are ~1e17).
+                # Resample labels with nearest-neighbor (the stored voxel under each output voxel's
+                # center) by looking the stored ids up, one axis at a time: interpolating them
+                # would round them through float32, which merges ids beyond 2**24 (connectomics
+                # segment ids are ~1e17).
                 if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
                     # After squeeze, spatial indices shift left past removed channel.
                     c_idx = vol_info.lbl_axes.index("c")
@@ -1591,7 +1596,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                 if lbl_spatial_shape != target_size:
                     for axis, (n, p) in enumerate(zip(lbl.shape, target_size, strict=True)):
                         if n != p:
-                            lbl = np.take(lbl, _nearest_lookup(n, p), axis=axis)
+                            lbl = np.take(lbl, _nearest_exact_lookup(n, p), axis=axis)
                     lbl = lbl.astype(vol_info.label_np_dtype, copy=False)
                 label_crops.append(lbl)
 
