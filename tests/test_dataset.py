@@ -885,6 +885,45 @@ class TestResolutionSampling:
             VolumeDataset(cfg)
 
 
+class TestResolutionSamplingPerDrawBounds:
+    """Each resolution draw's center comes from that draw's own window range."""
+
+    SPEC = {"strategy": "log_uniform", "ranges": [[[1], [4]]], "n_scales": 1}
+
+    def _ds(self, zarr2_volume, **vol):
+        return VolumeDataset(MiaoConfig(
+            volumes=[{"name": "t", "path": str(zarr2_volume), "image_key": "raw", **vol}],
+            resolution_sampling=self.SPEC, output_axes="lzyx", patch_size=[8, 8, 8]))
+
+    @staticmethod
+    def _draws(ds, n, seed):
+        np.random.seed(seed)
+        out = []
+        for i in range(n):
+            meta = ds[i]["meta"]
+            out.append((meta["resolutions"][0][0], np.array(meta["coordinate"], float)))
+        return out
+
+    def test_fine_draws_reach_beyond_the_coarsest_windows_range(self, zarr2_volume: Path):
+        """64^3 volume at voxels 1/2/4, patch 8: the coarsest draw (4) has a 32-voxel window and
+        its center range is the one stored at construction; a draw near 1 has an 8-voxel window
+        and may sit nearer the edges. Every window stays inside the volume."""
+        ds = self._ds(zarr2_volume)
+        lo, hi = ds._volumes[0].min_center, ds._volumes[0].max_center
+        outside = 0
+        for res, c in self._draws(ds, 400, 0):
+            half = 8 * res / 2
+            assert np.all(c - half >= -1) and np.all(c + half <= 64 + 1), (res, c)
+            outside += bool(np.any(c < lo) or np.any(c > hi))
+        assert outside > 0
+
+    def test_windows_stay_inside_the_bounding_box(self, zarr2_volume: Path):
+        ds = self._ds(zarr2_volume, bounding_box=[[8, 56]] * 3)
+        for res, c in self._draws(ds, 300, 1):
+            half = 8 * res / 2
+            assert np.all(c - half >= 8 - 1) and np.all(c + half <= 56 + 1), (res, c)
+
+
 class TestSampleWindows:
     """Multi-scale window sampling (sample_windows=True)."""
 

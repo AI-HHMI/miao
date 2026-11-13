@@ -100,14 +100,16 @@ def test_size_does_not_depend_on_resolution_order(tmp_path):
 
 
 def test_size_uses_the_finest_sampled_resolution(tmp_path):
-    """In sampling mode centres are bounded by the coarsest draw, but size is measured finest."""
+    """In sampling mode each draw's center is bounded by its own window, so size is measured at
+    the finest draw with its own center range: the whole 64^3 volume (40^3 while every draw's
+    center was bounded by the coarsest draw's window, 16..48)."""
     vol = _volume(tmp_path, "v", (64, 64, 64))
     size, = _sizes(
         [vol],
         resolutions=None,
         resolution_sampling={"ranges": [[[1], [4]]], "n_scales": 1},
     )
-    assert size == 40**3
+    assert size == 64**3
 
 
 def test_size_positive_when_only_one_center_fits(tmp_path):
