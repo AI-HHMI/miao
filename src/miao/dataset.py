@@ -142,19 +142,21 @@ def _select_level_for_resolution(
 
     Prefers downsampling: among levels whose voxel size is <= ``target`` on every axis,
     returns the coarsest (largest voxel) — the least data to read while still only
-    downsampling. If no level qualifies (``target`` finer than the finest level), returns
-    the finest level (smallest voxel), so the caller upsamples instead.
+    downsampling. An axis that is already coarser than ``target`` at the finest level (the z of
+    a 4x4x40 nm store asked for 8 nm) is upsampled whichever level is read, so it does not rule
+    a level out as long as the level is no coarser than the finest level on that axis: the
+    store reads its 8x8x40 level instead of the 4x4x40 one, rather than interpolating x and y
+    down from the finest. When ``target`` is finer than the finest level on every axis, that
+    level is returned, and the caller upsamples.
 
     ``level_voxels`` maps pyramid level index -> spatial voxel size (per axis, same frame
     as ``target``).
     """
     eps = 1e-9
-    candidates = [
-        lvl for lvl, v in level_voxels.items() if np.all(v <= target + eps)
-    ]
-    if candidates:
-        return max(candidates, key=lambda lvl: float(np.prod(level_voxels[lvl])))
-    return min(level_voxels, key=lambda lvl: float(np.prod(level_voxels[lvl])))
+    finest = level_voxels[min(level_voxels, key=lambda lvl: float(np.prod(level_voxels[lvl])))]
+    bound = np.maximum(target, finest)
+    candidates = [lvl for lvl, v in level_voxels.items() if np.all(v <= bound + eps)]
+    return max(candidates, key=lambda lvl: float(np.prod(level_voxels[lvl])))
 
 
 def _sample_log_uniform(

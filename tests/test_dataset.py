@@ -2064,3 +2064,53 @@ class TestLabelIds:
             # Id for id the same stored voxels as the small copy.
             assert b.dtype == torch.int64
             assert torch.equal(b, expected)
+
+
+class TestLevelChoice:
+    """Which pyramid level a target resolution reads (`_select_level_for_resolution`)."""
+
+    # A CREMI-like serial-section pyramid, z y x: x and y halve per level, z stays until the
+    # last level.
+    CREMI = {0: [40, 4, 4], 1: [40, 8, 8], 2: [40, 16, 16], 3: [40, 32, 32], 4: [80, 64, 64]}
+
+    @staticmethod
+    def _old_rule(level_voxels, target):
+        """The previous rule: every axis <= target, else the finest level."""
+        fits = [lvl for lvl, v in level_voxels.items() if np.all(np.asarray(v) <= target + 1e-9)]
+        key = lambda lvl: float(np.prod(level_voxels[lvl]))  # noqa: E731
+        return max(fits, key=key) if fits else min(level_voxels, key=key)
+
+    def test_anisotropic_store_reads_the_level_matching_its_fine_axes(self):
+        from miao.dataset import _select_level_for_resolution as pick
+        levels = {k: np.array(v, float) for k, v in self.CREMI.items()}
+        for target, want in ((4, 0), (8, 1), (11, 1), (16, 2), (32, 3), (64, 3), (100, 4)):
+            assert pick(levels, np.full(3, float(target))) == want, target
+        # the previous rule read the finest level whenever z was coarser than the target
+        assert self._old_rule(levels, np.full(3, 8.0)) == 0
+
+    def test_unchanged_where_no_axis_is_coarser_than_the_target(self):
+        """Isotropic pyramids, and any target at least as coarse as the finest level on every
+        axis, pick what the old rule picked."""
+        from miao.dataset import _select_level_for_resolution as pick
+        iso = {0: np.array([1.0] * 3), 1: np.array([2.0] * 3), 2: np.array([4.0] * 3)}
+        for t in (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0):
+            assert pick(iso, np.full(3, t)) == self._old_rule(iso, np.full(3, t)), t
+        levels = {k: np.array(v, float) for k, v in self.CREMI.items()}
+        for t in (40.0, 50.0, 64.0, 80.0, 200.0):
+            assert pick(levels, np.full(3, t)) == self._old_rule(levels, np.full(3, t)), t
+
+    def test_dataset_reads_the_matching_level(self, tmp_path: Path):
+        """End to end: a 10x1x1 store whose pyramid halves y and x only reads level 1 for a
+        2-voxel target, and its samples come out at patch_size."""
+        from conftest import _create_ome_ngff_zarr2
+        path = tmp_path / "aniso.zarr"
+        _create_ome_ngff_zarr2(path, "raw", (16, 128, 128), num_scales=3, dtype="uint8",
+                               base_scale_factors=[10.0, 1.0, 1.0], downsample_axes=[False, True, True])
+        ds = VolumeDataset(MiaoConfig(
+            volumes=[{"name": "a", "path": str(path), "image_key": "raw"}],
+            resolutions=[[2.0, 2.0, 2.0]], output_axes="lzyx", patch_size=[8, 8, 8]))
+        np.random.seed(0)
+        for i in range(5):
+            s = ds[i]
+            assert s["meta"]["source_levels"] == [1]
+            assert s["img"].shape == (1, 8, 8, 8)
