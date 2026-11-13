@@ -85,7 +85,9 @@ Per sample, miao:
    coordinate in its finest-scale (level-0) space;
 2. for each requested resolution, picks the coarsest pyramid level whose effective voxel size is
    still ≤ the target on every axis, preferring downsampling — or the finest stored level,
-   upsampled, if the target is finer than anything on disk;
+   upsampled, if the target is finer than anything on disk. An axis already coarser than the
+   target at the finest level (the z of a 4×4×40 nm store asked for 8 nm) may stay as coarse as it
+   is there, so such a store reads its 8×8×40 level rather than shrinking 4×4 down;
 3. reads `ceil(patch_size × target_resolution / effective_level_voxel_size)` voxels centered on
    that coordinate and resamples them to `patch_size` — trilinear for images, nearest for labels.
 
