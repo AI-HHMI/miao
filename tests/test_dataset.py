@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from miao import collate_deferred, finish_images
 from miao.config import MiaoConfig
 from miao.dataset import VolumeDataset
 
@@ -1776,6 +1777,81 @@ class TestLabelTranslation:
         assert self._worst_anchor_gap(ds, 32) <= 0.5
 
 
+class TestResampledLabelsLineUpWithTheImage:
+    """After resampling to the target resolution, each label voxel must describe the place the
+    image voxel beside it shows.
+
+    Image and label carry one pattern, slabs along z four voxels thick holding their slab's index
+    (the label adds 1000). An image voxel interpolated across a boundary rounds to the slab under
+    its center, which makes `label == round(image) + 1000` exact at every voxel of a registered
+    sample, the voxels beside a boundary included; a voxel centered exactly on a boundary shows
+    both slabs, and either label is right there. Covers labels on the image's own voxel grid, whole
+    or a translated crop. Labels on a coarser grid are not covered: see the README's caveats.
+    """
+
+    SLAB = 4
+    # label shape (z, y, x), label translation along z, bounding box along z
+    CASES = {
+        "same_grid": ((96, 24, 24), 0.0, (0, 96)),
+        "label_crop": ((40, 24, 24), 20.0, (20, 60)),
+    }
+
+    def _build(self, root: Path, lbl_shape, lbl_translation: float) -> None:
+        from conftest import _create_ome_ngff_zarr2
+
+        def slabs(z):
+            return np.floor((np.asarray(z, dtype=np.float64) + 0.5) / self.SLAB)
+
+        _create_ome_ngff_zarr2(
+            root, "raw", (96, 24, 24), num_scales=1, base_scale_factors=[1.0, 1.0, 1.0],
+            data_fn=lambda shape, level: np.broadcast_to(
+                slabs(np.arange(shape[0]))[:, None, None], shape),
+        )
+        _create_ome_ngff_zarr2(
+            root, "labels/seg", lbl_shape, num_scales=1, dtype="uint16",
+            base_scale_factors=[1.0, 1.0, 1.0], base_translation=[lbl_translation, 0.0, 0.0],
+            data_fn=lambda shape, level: np.broadcast_to(
+                slabs(lbl_translation + np.arange(shape[0]))[:, None, None] + 1000, shape),
+        )
+
+    @pytest.mark.parametrize("defer", [False, True], ids=["worker", "deferred"])
+    @pytest.mark.parametrize("resolution", [1.0, 2.0, 1.5, 0.6])
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_every_label_voxel_matches_the_image_beside_it(
+        self, tmp_path: Path, case: str, resolution: float, defer: bool
+    ):
+        lbl_shape, lbl_translation, (z0, z1) = self.CASES[case]
+        self._build(tmp_path, lbl_shape, lbl_translation)
+        ds = VolumeDataset(MiaoConfig(
+            volumes=[{
+                "name": case, "path": str(tmp_path), "image_key": "raw",
+                "label_key": "labels/seg",
+                # output_axes order (x, y, z), image voxels
+                "bounding_box": [[0, 24], [0, 24], [z0, z1]],
+            }],
+            resolutions=[[resolution] * 3],
+            output_axes="lcxyz",
+            patch_size=[8, 8, 8],
+            samples_per_epoch=24,
+            defer_image_ops=defer,
+        ))
+        for i in range(24):
+            sample = ds[i]
+            if defer:  # the image is resampled later, in finish_images
+                batch = finish_images(collate_deferred([sample]))
+                sample = {"img": batch["img"][0], "label": batch["label"][0]}
+            image = sample["img"][0, 0].double().numpy()              # (x, y, z)
+            label = sample["label"][0].double().numpy() - 1000
+            tie = np.abs(image - np.floor(image) - 0.5) < 1e-6
+            right = (label == np.round(image)) | (
+                tie & ((label == np.floor(image)) | (label == np.ceil(image)))
+            )
+            assert right.all(), (
+                f"sample {i}: {(~right).mean():.0%} of label voxels name a different slab than "
+                "the image shows there"
+            )
+
+
 class TestFixedAxes:
     """fixed_axes pins a stored axis to one index and drops it from every patch."""
 
@@ -2035,18 +2111,19 @@ class TestLabelIds:
             samples_per_epoch=8,
         ))
 
-    def test_the_lookup_is_torchs_nearest(self):
-        """The lookup must pick what F.interpolate(mode="nearest") picks, or labels with small ids
-        would change."""
-        from miao.dataset import _nearest_lookup
+    def test_the_lookup_is_torchs_nearest_exact(self):
+        """The lookup must pick what F.interpolate(mode="nearest-exact") picks: the stored voxel
+        under each output voxel's center."""
+        from miao.dataset import _nearest_exact_lookup
 
         for target in (1, 2, 3, 7, 8, 16, 100, 144, 255, 256, 288, 316, 496):
             for source in range(1, 701):
                 ramp = torch.arange(source, dtype=torch.float32).reshape(1, 1, source, 1, 1)
                 torch_pick = torch.nn.functional.interpolate(
-                    ramp, size=(target, 1, 1), mode="nearest"
+                    ramp, size=(target, 1, 1), mode="nearest-exact"
                 ).reshape(-1).long().numpy()
-                assert np.array_equal(_nearest_lookup(source, target), torch_pick), (source, target)
+                ours = _nearest_exact_lookup(source, target)
+                assert np.array_equal(ours, torch_pick), (source, target)
 
     def test_ids_beyond_float32_survive_resampling(self, tmp_path: Path):
         root = self._build(tmp_path)
