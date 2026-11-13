@@ -121,22 +121,32 @@ def _label_window_roi(
     return c_lo - eff_half * rel, c_hi + (eff - eff_half) * rel
 
 
-def _nearest_exact_lookup(source: int, target: int) -> np.ndarray:
-    """Which stored voxel each output voxel takes when `source` voxels are resampled to `target`.
+def _nearest_exact_lookup(source: int, target: int, margin: int = 0) -> np.ndarray:
+    """Which stored voxel each output voxel takes when `source` voxels are resampled to `target`,
+    for the `target` window voxels plus `margin` more output voxels on each side.
 
-    The stored voxel under the output voxel's center, exactly torch's `nearest-exact`:
-    `floor((j + 0.5) * scale)` with torch's float32 `scale = source / target`, the product rounded
-    to float32 before the floor as its `floorf` does, and clamped to the last stored voxel. The
-    image is resampled at output voxel centers too (`align_corners=False`), so the labels stay on
-    it; torch's `nearest` takes `floor(j * scale)`, the first stored voxel an output voxel
-    overlaps, which shifts the labels against the image whenever the ratio is not a whole number.
+    Over the window this is the stored voxel under the output voxel's center, exactly torch's
+    `nearest-exact`: `floor((j + 0.5) * scale)` with torch's float32 `scale = source / target`, the
+    product rounded to float32 before the floor as its `floorf` does, and clamped to the last
+    stored voxel. The image is resampled at output voxel centers too (`align_corners=False`), so
+    the labels stay on it; torch's `nearest` takes `floor(j * scale)`, the first stored voxel an
+    output voxel overlaps, which shifts the labels against the image whenever the ratio is not a
+    whole number.
+
+    The margin continues the same grid past both ends of the window: it holds the stored voxels
+    that a longer window on this grid would take. A longer read resampled on its own would use a
+    different ratio and drift against the image.
+
     Indexing the stored ids, unlike interpolating them, keeps every id exact: a float32 resampling
-    merges ids beyond 2**24. Returns `(target,)` int64.
+    merges ids beyond 2**24. Returns `(target + 2 * margin,)` int64, relative to the read's first
+    stored voxel, so the margin's entries can be negative or greater than `source - 1`.
     """
     scale = np.float32(source) / np.float32(target)
-    j = np.arange(target, dtype=np.float64)
+    j = np.arange(-margin, target + margin, dtype=np.float64)
     index = np.floor(((j + 0.5) * np.float64(scale)).astype(np.float32)).astype(np.int64)
-    return np.minimum(index, source - 1)
+    window = slice(margin, margin + target)
+    index[window] = np.minimum(index[window], source - 1)
+    return index
 
 
 def _whole(value: float | np.ndarray) -> np.ndarray:
@@ -342,6 +352,8 @@ class VolumeInfo:
     # Smallest safe dtypes for label data (derived from on-disk dtype)
     label_np_dtype: np.dtype = np.dtype(np.int64)
     label_torch_dtype: torch.dtype = torch.int64
+    # MiaoConfig.label_margin in image spatial order (labels share it); zeros when unset
+    label_margin: np.ndarray | None = None
 
 
 def _label_dtypes(source_dtype: np.dtype) -> tuple[np.dtype, torch.dtype]:
@@ -411,8 +423,9 @@ class VolumeDataset(torch.utils.data.Dataset):
        Every spatial field in "meta" ("coordinate", "resolutions", and, in
        sequential mode, "grid_index") is reported in output_axes spatial order.
 
-    Tensor shapes are (1, L, *output_axes_dims) where L = number of scale levels.
-    Input axes are auto-detected from OME-NGFF metadata.
+    Tensor shapes are (1, L, *output_axes_dims) where L = number of scale levels; with a
+    ``label_margin``, the label's spatial dims are ``patch_size + 2 * label_margin``, centered on
+    the image's. Input axes are auto-detected from OME-NGFF metadata.
 
     ``augment_fn`` (optional) is called once per sample on the finished dict, as
     ``augment_fn(sample) -> sample``. It comes from either the constructor argument or
@@ -443,6 +456,12 @@ class VolumeDataset(torch.utils.data.Dataset):
             "image is a list of crops at their stored resolutions, which an augment_fn cannot "
             "transform, and its labels are already resampled so a geometric transform would "
             "de-register the two. Apply augmentation after miao.finish_images instead."
+        )
+        # The same refusal as `MiaoConfig.validate_label_margin`, for an augment_fn passed to the
+        # constructor, which the config validation cannot see.
+        assert not (config.label_margin and any(config.label_margin) and augment_fn is not None), (
+            "label_margin cannot be combined with an augment_fn: the label is larger than the "
+            "image, which the augmentations do not handle. Augment after collation instead."
         )
         if config.augment_fn is not None:
             # Validate the dotted path now (typos fail at construction); the factory call itself
@@ -575,6 +594,11 @@ class VolumeDataset(torch.utils.data.Dataset):
             print("\n".join(lines))
         dims = ", ".join(c.upper() for c in self.config.output_axes)
         print(f"  output: axes={self.config.output_axes!r}, tensor_shape=({dims})")
+        if self.config.label_margin and any(self.config.label_margin):
+            print(
+                f"  label_margin: {self.config.label_margin} voxels per side (output_axes order); "
+                f"off the label array: label_fill, else {self.config.label_margin_fill}"
+            )
 
     def _resolve_volume(self, vol_cfg: VolumeConfig) -> VolumeInfo:
         """Read OME-NGFF metadata and precompute sampling bounds for a volume.
@@ -714,6 +738,19 @@ class VolumeDataset(torch.utils.data.Dataset):
                     f"{lbl_np_dt} its labels are returned in (from the stored "
                     f"{label_meta.scales[0].dtype}), whose range is [{bounds.min}, {bounds.max}]"
                 )
+        margin = self.config.label_margin or [0] * len(output_spatial)
+        label_margin = np.array(
+            map_patch_size_to_input(list(margin), img_spatial, output_spatial), dtype=np.int64
+        )
+        margin_fill = self.config.label_margin_fill
+        if label_meta is not None and vol_cfg.label_fill is None and margin_fill is not None:
+            bounds = np.iinfo(lbl_np_dt)
+            if not bounds.min <= margin_fill <= bounds.max:
+                raise ValueError(
+                    f"Volume {vol_cfg.name!r}: label_margin_fill={margin_fill} does not fit the "
+                    f"{lbl_np_dt} its labels are returned in (from the stored "
+                    f"{label_meta.scales[0].dtype}), whose range is [{bounds.min}, {bounds.max}]"
+                )
 
         # bounding_box is specified in output_axes spatial order; reorder it to image storage
         # spatial order so it can be compared against storage-ordered read extents downstream.
@@ -748,6 +785,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             bounding_box=bounding_box,
             label_np_dtype=lbl_np_dt,
             label_torch_dtype=lbl_torch_dt,
+            label_margin=label_margin,
         )
 
         sampling_spec = self.config.resolution_sampling_for(vol_cfg)
@@ -1344,9 +1382,13 @@ class VolumeDataset(torch.utils.data.Dataset):
         # Phase 1: Compute slices and issue all reads concurrently via ts.Batch
         img_futures: list[ts.Future] = []
         lbl_futures: list[ts.Future | None] = []
-        # Per scale, for a label read that reaches past the label array (label_fill): where the
-        # part read sits in the full read, and the full read's shape. None for a read inside it.
+        # Per scale, for a label read that reaches past the label array (label_fill, label_margin):
+        # where the part read sits in the full read, and the full read's shape. None for a read
+        # inside it.
         lbl_pads: list[tuple[np.ndarray, np.ndarray] | None] = []
+        # Per scale and spatial axis, the stored voxel each output voxel takes, relative to the
+        # start of the full read (`_nearest_exact_lookup`). None without labels.
+        lbl_lookups: list[list[np.ndarray] | None] = []
 
         # Whether this sample reads labels at all; needed before the per-scale label block below
         # because the label extent also constrains where a sample_windows window may be placed.
@@ -1509,14 +1551,22 @@ class VolumeDataset(torch.utils.data.Dataset):
                         # Clamp into the label volume (same per-level rounding concern as the
                         # image).
                         lbl_origin = np.clip(lbl_origin, 0, lbl_sp_shape - lbl_eff_shape)
-                        read_lo, read_hi = lbl_origin, lbl_origin + lbl_eff_shape
-                        lbl_pads.append(None)
-                    else:
-                        # The window may reach past the label array: read the part on it, and
-                        # Phase 2 places that inside a read-shaped block of label_fill.
-                        read_lo = np.clip(lbl_origin, 0, lbl_sp_shape)
-                        read_hi = np.clip(lbl_origin + lbl_eff_shape, 0, lbl_sp_shape)
-                        lbl_pads.append((read_lo - lbl_origin, lbl_eff_shape))
+                    # For each axis, look up which stored voxel each output voxel takes (margin
+                    # included), relative to the window's read. Read the box these voxels span.
+                    lookup = [
+                        _nearest_exact_lookup(int(n), int(p), int(m))
+                        for n, p, m in zip(lbl_eff_shape, target_size, vol_info.label_margin)
+                    ]
+                    box_lo = lbl_origin + np.array([index[0] for index in lookup])
+                    box_hi = lbl_origin + np.array([index[-1] + 1 for index in lookup])
+                    lbl_lookups.append([index - index[0] for index in lookup])
+                    # The box can reach past the label array, with label_fill or because of the
+                    # margin. Then only the part on the array is read, and Phase 2 places it inside
+                    # a box-shaped block of the fill value.
+                    read_lo = np.clip(box_lo, 0, lbl_sp_shape)
+                    read_hi = np.clip(box_hi, 0, lbl_sp_shape)
+                    inside = np.array_equal(read_lo, box_lo) and np.array_equal(read_hi, box_hi)
+                    lbl_pads.append(None if inside else (read_lo - box_lo, box_hi - box_lo))
                     # Build label slices from label axes metadata:
                     # spatial dims get cropped; non-spatial dims (e.g. channel) take all.
                     lbl_slices = []
@@ -1531,9 +1581,12 @@ class VolumeDataset(torch.utils.data.Dataset):
                 else:
                     lbl_futures.append(None)
                     lbl_pads.append(None)
+                    lbl_lookups.append(None)
 
         # Phase 2: Collect results (all reads already completed when batch exited)
-        for img_future, lbl_future, lbl_pad in zip(img_futures, lbl_futures, lbl_pads):
+        for img_future, lbl_future, lbl_pad, lbl_lookup in zip(
+            img_futures, lbl_futures, lbl_pads, lbl_lookups
+        ):
             patch = np.asarray(img_future.result())
             if has_img_channel and not wants_channel:
                 c_idx = vol_info.img_axes.index("c")
@@ -1584,12 +1637,16 @@ class VolumeDataset(torch.utils.data.Dataset):
 
                 if lbl_pad is not None:
                     # A read that reached past the label array: its part on the array goes back
-                    # where it was cut from, everything else is label_fill. In the returned label
+                    # where it was cut from, everything else is the fill. In the returned label
                     # type, which a negative fill fits and the stored (e.g. uint8) type may not.
                     offset, full_shape = lbl_pad
+                    fill = (
+                        vol_info.config.label_fill
+                        if vol_info.config.label_fill is not None
+                        else self.config.label_margin_fill
+                    )
                     filled = np.full(
-                        tuple(int(n) for n in full_shape), vol_info.config.label_fill,
-                        dtype=vol_info.label_np_dtype,
+                        tuple(int(n) for n in full_shape), fill, dtype=vol_info.label_np_dtype
                     )
                     filled[tuple(
                         slice(int(o), int(o) + n) for o, n in zip(offset, lbl.shape)
@@ -1597,22 +1654,14 @@ class VolumeDataset(torch.utils.data.Dataset):
                     lbl = filled
 
                 # Resample labels with nearest-neighbor (the stored voxel under each output voxel's
-                # center) by looking the stored ids up, one axis at a time: interpolating them
-                # would round them through float32, which merges ids beyond 2**24 (connectomics
-                # segment ids are ~1e17).
-                if has_lbl_channel and vol_info.lbl_spatial_idx is not None and vol_info.lbl_axes is not None:
-                    # After squeeze, spatial indices shift left past removed channel.
-                    c_idx = vol_info.lbl_axes.index("c")
-                    shifted_spatial_idx = [i if i < c_idx else i - 1 for i in vol_info.lbl_spatial_idx]
-                    lbl_spatial_shape = tuple(int(lbl.shape[i]) for i in shifted_spatial_idx)
-                else:
-                    lbl_spatial_shape = tuple(int(s) for s in lbl.shape)
-                if lbl_spatial_shape != target_size:
-                    for axis, (n, p) in enumerate(zip(lbl.shape, target_size, strict=True)):
-                        if n != p:
-                            lbl = np.take(lbl, _nearest_exact_lookup(n, p), axis=axis)
-                    lbl = lbl.astype(vol_info.label_np_dtype, copy=False)
-                label_crops.append(lbl)
+                # center) by looking the stored ids up, one spatial axis at a time: interpolating
+                # them would round them through float32, which merges ids beyond 2**24
+                # (connectomics segment ids are ~1e17). The lookup includes the margin, on the
+                # window's own grid. An axis read at the target size with no margin is left alone.
+                for axis, index in enumerate(lbl_lookup):
+                    if len(index) != lbl.shape[axis] or index[-1] != len(index) - 1:
+                        lbl = np.take(lbl, index, axis=axis)
+                label_crops.append(lbl.astype(vol_info.label_np_dtype, copy=False))
 
         from miao.config import IMAGE_DTYPE_MAP
         _img_dtype = IMAGE_DTYPE_MAP[self.config.image_dtype]

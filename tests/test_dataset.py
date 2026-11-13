@@ -2101,6 +2101,173 @@ class TestLabelFill:
             VolumeConfig(name="v", path="/nowhere", image_key="raw", label_fill=-1)
 
 
+class TestLabelMargin:
+    """`label_margin` returns the label past the window's faces, on the window's own voxel grid.
+
+    The label stores its own position, `1 + x + 100 y + 10000 z` at stored voxel (z, y, x), so every
+    returned label voxel says which stored voxel it came from. Each must be the stored voxel under
+    its output voxel's center on the window's grid, continued past the window by the margin, or the
+    fill where that voxel is off the label array. The window's grid comes from `bbox`: its extent
+    over `patch_size` voxels.
+    """
+
+    MARGIN = [3, 4, 5]                      # output order: x, y, z
+    PATCH = [8, 8, 8]
+    RESOLUTIONS = [1.0, 2.0, 0.5, 1.5, 0.6]  # stored voxels are 1: same, finer, coarser, neither
+
+    @staticmethod
+    def _positions(shape, level):
+        z, y, x = np.indices(shape)
+        return 1 + x + 100 * y + 10000 * z
+
+    def _build(self, root: Path, image_shape=(24, 24, 24), label_shape=None,
+               label_translation=None) -> Path:
+        from conftest import _create_ome_ngff_zarr2
+
+        _create_ome_ngff_zarr2(
+            root, "raw", image_shape, num_scales=1, base_scale_factors=[1.0, 1.0, 1.0]
+        )
+        _create_ome_ngff_zarr2(
+            root, "labels/seg", label_shape or image_shape, num_scales=1, dtype="uint32",
+            base_scale_factors=[1.0, 1.0, 1.0], base_translation=label_translation,
+            data_fn=self._positions,
+        )
+        return root
+
+    def _config(self, root: Path, resolutions, margin=MARGIN, margin_fill=-1, **volume_extra):
+        extra = {k: volume_extra.pop(k) for k in ("defer_image_ops", "sampling", "overlap")
+                 if k in volume_extra}
+        volume = {"name": "v", "path": str(root), "image_key": "raw", "label_key": "labels/seg",
+                  **volume_extra}
+        if margin is not None:
+            extra.update(label_margin=margin, label_margin_fill=margin_fill)
+        return MiaoConfig(
+            volumes=[volume], resolutions=resolutions, output_axes="lcxyz",
+            patch_size=self.PATCH, samples_per_epoch=16, **extra,
+        )
+
+    def _check(self, sample: dict, level: int, label_shape, translation=(0.0, 0.0, 0.0),
+               fill: int = -1) -> None:
+        label = sample["label"][level].numpy().astype(np.int64)    # (X, Y, Z), margin included
+        bbox = sample["bbox"][level].double().numpy()              # [min, max] x [x, y, z]
+        extent = label_shape[::-1]                                 # stored z, y, x -> x, y, z
+        assert label.shape == tuple(p + 2 * m for p, m in zip(self.PATCH, self.MARGIN))
+        expected, ties, inside = [], [], []
+        for axis in range(3):
+            m, p = self.MARGIN[axis], self.PATCH[axis]
+            step = (bbox[1, axis] - bbox[0, axis]) / p             # the window's output voxel
+            center = bbox[0, axis] - translation[axis] + (np.arange(-m, p + m) + 0.5) * step
+            expected.append(np.floor(center).astype(np.int64))
+            ties.append(np.abs(center - np.round(center)) < 1e-6)
+            inside.append((expected[-1] >= 0) & (expected[-1] < extent[axis]))
+        on_array = inside[0][:, None, None] & inside[1][None, :, None] & inside[2][None, None, :]
+        assert on_array.any()
+        assert (label[~on_array] == fill).all(), "a voxel off the label array is not the fill"
+        stored = [(label - 1) % 100, (label - 1) // 100 % 100, (label - 1) // 10000]
+        for axis in range(3):
+            shape = [1, 1, 1]
+            shape[axis] = -1
+            want, tie = expected[axis].reshape(shape), ties[axis].reshape(shape)
+            right = (stored[axis] == want) | (tie & (stored[axis] == want - 1))
+            assert right[on_array].all(), (
+                f"axis {'xyz'[axis]}: {(~right[on_array]).mean():.0%} of label voxels are not the "
+                "stored voxel under their output voxel's center"
+            )
+
+    def test_the_window_part_of_the_lookup_is_torchs_nearest_exact(self):
+        """With a margin, the window part of the lookup must still pick what
+        F.interpolate(mode="nearest-exact") picks, or a margin would change the window's labels."""
+        from miao.dataset import _nearest_exact_lookup
+
+        for target in (1, 2, 3, 7, 8, 16, 100, 144, 255, 256, 288, 316, 496):
+            for source in range(1, 701):
+                ramp = torch.arange(source, dtype=torch.float32).reshape(1, 1, source, 1, 1)
+                torch_pick = torch.nn.functional.interpolate(
+                    ramp, size=(target, 1, 1), mode="nearest-exact"
+                ).reshape(-1).long().numpy()
+                ours = _nearest_exact_lookup(source, target, margin=5)[5 : 5 + target]
+                assert np.array_equal(ours, torch_pick), (source, target)
+
+    @pytest.mark.parametrize("defer", [False, True], ids=["worker", "deferred"])
+    @pytest.mark.parametrize("resolution", RESOLUTIONS)
+    def test_the_margin_continues_the_window_grid(self, tmp_path: Path, resolution, defer):
+        """A label array as large as the image: near its faces the margin runs off it."""
+        ds = VolumeDataset(self._config(
+            self._build(tmp_path), [[resolution] * 3], defer_image_ops=defer
+        ))
+        for i in range(16):
+            self._check(ds[i], 0, (24, 24, 24))
+
+    @pytest.mark.parametrize("resolution", RESOLUTIONS)
+    def test_the_window_part_is_a_read_without_margin(self, tmp_path: Path, resolution):
+        root = self._build(tmp_path)
+        plain = VolumeDataset(self._config(root, [[resolution] * 3], margin=None))
+        wide = VolumeDataset(self._config(root, [[resolution] * 3]))
+        window = tuple(slice(m, m + p) for m, p in zip(self.MARGIN, self.PATCH))
+        for i in range(16):
+            np.random.seed(i)
+            a = plain[0]
+            np.random.seed(i)
+            b = wide[0]
+            assert torch.equal(a["img"], b["img"]) and torch.equal(a["bbox"], b["bbox"])
+            assert torch.equal(a["label"], b["label"][(slice(None), *window)])
+
+    def test_a_label_crop_fills_with_its_label_fill(self, tmp_path: Path):
+        """A volume with label_fill fills its margin with that, not label_margin_fill."""
+        root = self._build(tmp_path, image_shape=(48, 16, 16), label_shape=(16, 16, 16),
+                           label_translation=[16.0, 0.0, 0.0])
+        ds = VolumeDataset(self._config(
+            root, [[1.0, 1.0, 1.0]], margin_fill=-1, label_fill=-7,
+            bounding_box=[[0, 16], [0, 16], [0, 48]],
+        ))
+        for i in range(16):
+            self._check(ds[i], 0, (16, 16, 16), translation=(0.0, 0.0, 16.0), fill=-7)
+
+    def test_every_scale_and_sequential_sampling(self, tmp_path: Path):
+        root = self._build(tmp_path, image_shape=(32, 32, 32))
+        for sampling in ("random", "sequential"):
+            ds = VolumeDataset(self._config(
+                root, [[1.0] * 3, [2.0] * 3], sampling=sampling, overlap=0,
+            ))
+            for i in range(min(len(ds), 8)):
+                sample = ds[i]
+                self._check(sample, 0, (32, 32, 32))
+                self._check(sample, 1, (32, 32, 32))
+
+    def test_configuration(self, tmp_path: Path):
+        from pydantic import ValidationError
+
+        root = self._build(tmp_path)
+        with pytest.raises(ValidationError, match="label_margin has 2 elements"):
+            self._config(root, [[1.0] * 3], margin=[1, 1])
+        with pytest.raises(ValidationError, match="must be >= 0"):
+            self._config(root, [[1.0] * 3], margin=[1, -1, 1])
+        with pytest.raises(ValidationError, match="set label_margin_fill"):
+            self._config(root, [[1.0] * 3], margin_fill=None)
+        with pytest.raises(ValidationError, match="nothing uses it"):
+            MiaoConfig(
+                volumes=[{"name": "v", "path": str(root), "image_key": "raw"}],
+                resolutions=[[1.0] * 3], output_axes="lcxyz", patch_size=self.PATCH,
+                label_margin_fill=-1,
+            )
+        with pytest.raises(ValidationError, match="cannot be combined with augment_fn"):
+            MiaoConfig(**{**self._config(root, [[1.0] * 3]).model_dump(),
+                          "augment_fn": {"factory": "miao.augment_std.em_default", "kwargs": {}}})
+        # An all-zero margin reaches nowhere, so it needs no fill.
+        VolumeDataset(self._config(root, [[1.0] * 3], margin=[0, 0, 0], margin_fill=None))
+        with pytest.raises(AssertionError, match="cannot be combined with an augment_fn"):
+            VolumeDataset(self._config(root, [[1.0] * 3]), augment_fn=lambda sample: sample)
+
+    def test_the_fill_must_fit_the_returned_label_type(self, tmp_path: Path):
+        from conftest import _create_ome_ngff_zarr2
+
+        _create_ome_ngff_zarr2(tmp_path, "raw", (24, 24, 24), num_scales=1)
+        _create_ome_ngff_zarr2(tmp_path, "labels/seg", (24, 24, 24), num_scales=1, dtype="uint8")
+        VolumeDataset(self._config(tmp_path, [[1.0] * 3]))
+        with pytest.raises(ValueError, match="label_margin_fill=40000 does not fit the int16"):
+            VolumeDataset(self._config(tmp_path, [[1.0] * 3], margin_fill=40000))
+
+
 class TestLabelIds:
     """Resampled labels keep every stored id, however large.
 

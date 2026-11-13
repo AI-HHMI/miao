@@ -310,6 +310,15 @@ class MiaoConfig(BaseModel):
     # size-proportional.
     size_weighting_exponent: float = 0.0
     overlap: Union[int, list[int]] = 0  # voxels; in output_axes spatial order (same as patch_size)
+    # Extra label voxels to return beyond each side of the window, per spatial axis in output_axes
+    # order (like patch_size), at each scale's output resolution. The label then covers the window
+    # plus this margin. The margin continues the window's own voxel grid, so the window part of the
+    # label is exactly what a read without a margin returns. Use it for targets that need labels
+    # beyond the window, such as affinities and local shape descriptors. Sampling, the image and
+    # `bbox` are unchanged. A margin voxel that falls off the label array takes the volume's
+    # `label_fill`, or `label_margin_fill` for a volume without one.
+    label_margin: Optional[list[int]] = None
+    label_margin_fill: Optional[int] = None
 
     # If True, each coarser scale's patch origin is sampled uniformly at random such that the patch
     # still covers the previous (finer) scale's patch in finest-index space. Requires scales in
@@ -589,6 +598,35 @@ class MiaoConfig(BaseModel):
                     f"Volume {vol.name!r}: fixed_axes {clash} also appear in output_axes "
                     f"{self.output_axes!r}; a fixed axis is removed, so drop it from output_axes"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_label_margin(self) -> "MiaoConfig":
+        if self.label_margin is None:
+            if self.label_margin_fill is not None:
+                raise ValueError("label_margin_fill is set but label_margin is not, so nothing uses it")
+            return self
+        if len(self.label_margin) != len(self.patch_size):
+            raise ValueError(
+                f"label_margin has {len(self.label_margin)} elements but patch_size has "
+                f"{len(self.patch_size)} — they must match (both in output_axes spatial order)"
+            )
+        if any(m < 0 for m in self.label_margin):
+            raise ValueError(f"label_margin must be >= 0 on every axis, got {self.label_margin}")
+        if not any(self.label_margin):
+            return self
+        unfilled = [v.name for v in self.volumes if v.label_key is not None and v.label_fill is None]
+        if unfilled and self.label_margin_fill is None:
+            raise ValueError(
+                f"label_margin can reach past the label arrays of {unfilled}, which set no "
+                "label_fill: set label_margin_fill to the value those margin voxels take (e.g. -1)"
+            )
+        if self.augment_fn is not None:
+            # miao's augmentations transform the image and the label as equal-sized arrays.
+            raise ValueError(
+                "label_margin cannot be combined with augment_fn: the label is larger than the "
+                "image, which the augmentations do not handle. Augment after collation instead."
+            )
         return self
 
     @model_validator(mode="after")
