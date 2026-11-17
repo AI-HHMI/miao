@@ -72,6 +72,27 @@ def test_deferred_finish_reproduces_the_worker_path(sample_config: dict, resolut
         torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_an_unclipped_window_is_the_same_linear_map_on_both_paths(sample_config: dict, device):
+    """`normalize_clip: false` reaches the deferred finish as it reaches the worker, and skips only
+    the clip: the clipped sample is the unclipped one clamped to [0, 1], to the bit.
+
+    The fixture's values are uniform in [0, 1), so a [0.25, 0.75] window leaves some past it."""
+    volume = {**sample_config["volumes"][0], "normalize_min": 0.25, "normalize_max": 0.75}
+    unclipped = {**sample_config, "resolutions": RES_2,
+                 "volumes": [{**volume, "normalize_clip": False}]}
+    plain, deferred = _pair(unclipped)
+    clipped, _ = _pair({**sample_config, "resolutions": RES_2, "volumes": [volume]})
+
+    for index in range(4):
+        expected = _draw(plain, index, seed=2000 + index)["img"]
+        raw = _draw(deferred, index, seed=2000 + index)
+        got = finish_images(collate_deferred([raw]), device=device)["img"][0].cpu()
+        torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+        assert expected.min() < 0 and expected.max() > 1
+        assert torch.equal(_draw(clipped, index, seed=2000 + index)["img"], expected.clamp(0, 1))
+
+
 def test_deferred_sample_is_raw_and_unstacked(sample_config: dict):
     """What the worker hands back: the volume's stored dtype, one entry per scale.
 

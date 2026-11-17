@@ -147,6 +147,10 @@ class VolumeConfig(BaseModel):
     # If both omitted: integer images use [0, dtype_max]; float images are unchanged.
     normalize_min: Optional[float] = None
     normalize_max: Optional[float] = None
+    # False: the window is a plain linear map, (x - normalize_min) / (normalize_max - normalize_min),
+    # with no clip, so values past it fall outside [0, 1] (percentile normalization without
+    # clipping). Needs normalize_min and normalize_max.
+    normalize_clip: bool = True
     # If True, additionally standardize each returned sample to zero mean / unit standard
     # deviation (applied after the `normalize` scaling above). With multiple scales, the
     # statistics are taken from the coarsest-resolution (largest physical extent) crop and
@@ -224,6 +228,11 @@ class VolumeConfig(BaseModel):
                 raise ValueError(
                     f"normalize_max must be greater than normalize_min, got {lo} and {hi}"
                 )
+        elif not self.normalize_clip:
+            raise ValueError(
+                f"Volume {self.name!r}: normalize_clip is false but there is no normalize_min / "
+                "normalize_max window for it to leave unclipped"
+            )
         return self
 
     def to_yaml(
