@@ -20,8 +20,9 @@ from miao.axes import (
     spatial_indices,
 )
 from miao.config import AugmentFnConfig, MiaoConfig, ResolutionSampling, VolumeConfig
+from miao.formats import read_metadata
 from miao.store import create_context, open_store
-from miao.zarr_meta import OmeMetadata, fix_axes, read_ome_metadata
+from miao.zarr_meta import OmeMetadata, fix_axes
 
 
 def _random_patch_origin_covering_fine_extent(
@@ -590,14 +591,14 @@ class VolumeDataset(torch.utils.data.Dataset):
         upsample). Patches are read at that level and resampled to ``patch_size``.
         """
         # Load all pyramid levels so resolution selection can choose among them.
-        image_meta = read_ome_metadata(
-            vol_cfg.path, vol_cfg.image_key, vol_cfg.zarr_version, None
+        image_meta = read_metadata(
+            vol_cfg.path, vol_cfg.image_key, vol_cfg.store_format, None
         )
 
         label_meta = None
         if vol_cfg.label_key:
-            label_meta = read_ome_metadata(
-                vol_cfg.path, vol_cfg.label_key, vol_cfg.zarr_version, None
+            label_meta = read_metadata(
+                vol_cfg.path, vol_cfg.label_key, vol_cfg.store_format, None
             )
 
         # Pinned axes are dropped here, so everything below sees an array without them.
@@ -1135,7 +1136,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             for vol_info in self._volumes:
                 vol_name = vol_info.config.name
                 zarr_path = Path(vol_info.config.path)
-                zarr_ver = vol_info.config.zarr_version
+                store_fmt = vol_info.config.store_format
                 stores[vol_name] = {"img": {}, "label": {}}
 
                 # Which pyramid levels to open: the union of cached chosen levels in fixed mode,
@@ -1162,7 +1163,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                         / vol_info.image_meta.scales[level].path
                     )
                     stores[vol_name]["img"][level] = open_store(
-                        img_array_path, zarr_ver, ctx,
+                        img_array_path, store_fmt, ctx,
                         vol_info.image_meta.scales[level].fixed_index,
                     )
 
@@ -1174,7 +1175,7 @@ class VolumeDataset(torch.utils.data.Dataset):
                             / vol_info.label_meta.scales[level].path
                         )
                         stores[vol_name]["label"][level] = open_store(
-                            lbl_array_path, zarr_ver, ctx,
+                            lbl_array_path, store_fmt, ctx,
                             vol_info.label_meta.scales[level].fixed_index,
                         )
 
