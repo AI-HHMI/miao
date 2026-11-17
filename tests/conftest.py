@@ -25,10 +25,13 @@ def _create_ome_ngff_zarr2(
     outer_translation: list[float] | None = None,
     half_voxel_shift: bool = False,
     data_fn=None,
+    downsample_axes: list[bool] | None = None,
 ) -> None:
     """Create an OME-NGFF compliant zarr2 multiscale group.
 
-    Each scale level is downsampled by 2x in all dimensions.
+    Each scale level is downsampled by 2x in all dimensions, or only in those `downsample_axes`
+    marks True (the others keep level 0's shape and voxel size, as the z of a serial-section
+    pyramid does).
     base_scale_factors sets the voxel size at level 0 (e.g., [5, 1, 1] for anisotropic).
     outer_scale writes a multiscale-level coordinateTransformations scale entry.
     base_translation writes a per-level translation, i.e. the physical position of the level's
@@ -60,12 +63,10 @@ def _create_ome_ngff_zarr2(
 
     datasets = []
     for level in range(num_scales):
-        scale_factor = 2**level
-        level_shape = tuple(s // scale_factor for s in base_shape)
-        if base_scale_factors is not None:
-            scale_factors = [sf * scale_factor for sf in base_scale_factors]
-        else:
-            scale_factors = [float(scale_factor)] * len(base_shape)
+        factors = [2**level if down else 1
+                   for down in (downsample_axes or [True] * len(base_shape))]
+        level_shape = tuple(s // f for s, f in zip(base_shape, factors))
+        scale_factors = [float(sf * f) for sf, f in zip(level0_scale_factors, factors)]
 
         # Create array with deterministic data
         rng = np.random.RandomState(42 + level)
