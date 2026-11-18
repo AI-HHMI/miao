@@ -616,13 +616,13 @@ class VolumeDataset(torch.utils.data.Dataset):
         """
         # Load all pyramid levels so resolution selection can choose among them.
         image_meta = read_metadata(
-            vol_cfg.path, vol_cfg.image_key, vol_cfg.store_format, None
+            vol_cfg.path, vol_cfg.image_key, vol_cfg.format, None
         )
 
         label_meta = None
         if vol_cfg.label_key:
             label_meta = read_metadata(
-                vol_cfg.path, vol_cfg.label_key, vol_cfg.store_format, None
+                vol_cfg.path, vol_cfg.label_key, vol_cfg.format, None
             )
 
         # Pinned axes are dropped here, so everything below sees an array without them.
@@ -1174,7 +1174,7 @@ class VolumeDataset(torch.utils.data.Dataset):
             for vol_info in self._volumes:
                 vol_name = vol_info.config.name
                 zarr_path = Path(vol_info.config.path)
-                store_fmt = vol_info.config.store_format
+                store_fmt = vol_info.config.format
                 stores[vol_name] = {"img": {}, "label": {}}
 
                 # Which pyramid levels to open: the union of cached chosen levels in fixed mode,

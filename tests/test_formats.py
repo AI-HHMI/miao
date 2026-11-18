@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tensorstore as ts
+import yaml
 from pydantic import ValidationError
 
 from conftest import _create_ome_ngff_zarr2
@@ -52,7 +53,7 @@ def _zarr(root: Path, imgs=IMGS, base_translation=None) -> dict:
             base_scale_factors=VOXEL, half_voxel_shift=True, base_translation=base_translation,
             data_fn=lambda shape, level, a=arrays: a[level],
         )
-    return {"path": str(root), "image_key": "raw", "label_key": "labels/seg"}
+    return {"path": str(root), "image_key": "raw", "format": "zarr2", "label_key": "labels/seg"}
 
 
 def _n5_array(path: Path, data: np.ndarray, attrs: dict) -> None:
@@ -137,7 +138,7 @@ COPIES = [*(f"n5-{c}" for c in N5_CONVENTIONS), "precomputed"]
 
 
 def _meta(entry: dict, key: str):
-    return read_metadata(entry["path"], entry[key], entry.get("format", "zarr2"))
+    return read_metadata(entry["path"], entry[key], entry["format"])
 
 
 def _dataset(entry: dict, **settings) -> VolumeDataset:
@@ -271,29 +272,36 @@ def test_precomputed_channels_are_pinned_with_fixed_axes(tmp_path):
 # --- config ---------------------------------------------------------------------------------------
 
 
-def test_format_is_optional_and_names_the_store_format():
+FORMATS = ["zarr2", "zarr3", "n5", "precomputed"]
+
+
+def test_format_is_required_and_takes_four_values():
     vol = {"name": "v", "path": "/x", "image_key": "raw"}
-    assert VolumeConfig(**vol).store_format == "zarr2"
-    assert VolumeConfig(**vol, zarr_version="zarr3").store_format == "zarr3"
-    assert VolumeConfig(**vol, format="n5").store_format == "n5"
-    assert VolumeConfig(**vol, format="precomputed").store_format == "precomputed"
-    with pytest.raises(ValidationError, match="zarr_version applies to zarr stores only"):
-        VolumeConfig(**vol, format="n5", zarr_version="zarr3")
+    for fmt in FORMATS:
+        assert VolumeConfig(**vol, format=fmt).format == fmt
+    with pytest.raises(ValidationError, match="format"):
+        VolumeConfig(**vol)
     with pytest.raises(ValidationError):
         VolumeConfig(**vol, format="hdf5")
 
 
-def test_a_volume_with_a_format_loads_from_its_own_dump():
-    """A dump writes every field, zarr_version's default included. The config must load from that
-    dump again."""
-    cfg = MiaoConfig(volumes=[{"name": "v", "path": "/x", "image_key": "raw", "format": "n5"}],
+def test_zarr_version_error_names_format():
+    """`zarr_version` was replaced by `format`. The error says what to write."""
+    vol = {"name": "v", "path": "/x", "image_key": "raw"}
+    with pytest.raises(ValidationError, match="Write `format: zarr3` instead"):
+        VolumeConfig(**vol, zarr_version="zarr3")
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_a_config_loads_from_its_own_dump(fmt):
+    cfg = MiaoConfig(volumes=[{"name": "v", "path": "/x", "image_key": "raw", "format": fmt}],
                      resolutions=[[8, 8, 8]], output_axes="lcxyz", patch_size=[8, 8, 8])
     for dump in (cfg.model_dump(), cfg.model_dump(mode="json")):
-        assert dump["volumes"][0]["zarr_version"] == "zarr2"
-        assert MiaoConfig(**dump).volumes[0].store_format == "n5"
+        assert MiaoConfig(**dump).volumes[0].format == fmt
 
 
-def test_a_zarr_volume_is_saved_without_a_format_key(stores):
-    cfg = MiaoConfig(volumes=[{"name": "v", **stores["zarr"]}], resolutions=[[8, 8, 8]],
-                     output_axes="lcxyz", patch_size=[8, 8, 8])
-    assert "format" not in cfg.model_dump(exclude_none=True)["volumes"][0]
+def test_a_saved_config_states_every_volumes_format(stores, tmp_path):
+    cfg = MiaoConfig(volumes=[{"name": k, **stores[k]} for k in ("zarr", "precomputed")],
+                     resolutions=[[8, 8, 8]], output_axes="lcxyz", patch_size=[8, 8, 8])
+    saved = yaml.safe_load(cfg.to_yaml(tmp_path / "config.yaml"))
+    assert [v["format"] for v in saved["volumes"]] == ["zarr2", "precomputed"]

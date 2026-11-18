@@ -312,7 +312,7 @@ def _sequential_cfg(zarr2_volume, resolutions=None, augment_fn=None):
         volumes=[{
             "name": "v",
             "path": str(zarr2_volume),
-            "image_key": "raw",
+            "image_key": "raw", "format": "zarr2",
             "label_key": "labels/seg",
         }],
         resolutions=resolutions or [[1, 1, 1]],
@@ -454,6 +454,7 @@ volumes:
   - name: v
     path: {zarr2_volume}
     image_key: raw
+    format: zarr2
 resolutions: [[1, 1, 1]]
 output_axes: lzyx
 patch_size: [8, 8, 8]
@@ -543,7 +544,8 @@ sampling: sequential
             }]}))
 
         cfg = MiaoConfig(
-            volumes=[{"name": "v", "path": str(zpath), "image_key": "raw", "label_key": "seg",
+            volumes=[{"name": "v", "path": str(zpath), "image_key": "raw", "format": "zarr2",
+                      "label_key": "seg",
                       "normalize": False}],
             resolutions=[[1, 1, 1]],
             output_axes="lzyx",
@@ -752,7 +754,7 @@ class TestSerialSectionRecipeIntegration:
 
     def _aniso_cfg(self, path):
         return MiaoConfig(
-            volumes=[{"name": "v", "path": str(path), "image_key": "raw"}],
+            volumes=[{"name": "v", "path": str(path), "image_key": "raw", "format": "zarr2"}],
             resolutions=[[5, 1, 1]],
             output_axes="lzyx",
             patch_size=[8, 8, 8],
@@ -763,7 +765,7 @@ class TestSerialSectionRecipeIntegration:
         return MiaoConfig(
             volumes=[{
                 "name": "v", "path": str(path),
-                "image_key": "raw", "label_key": "labels/seg",
+                "image_key": "raw", "format": "zarr2", "label_key": "labels/seg",
             }],
             resolutions=[[1, 1, 1]],
             output_axes="lzyx",

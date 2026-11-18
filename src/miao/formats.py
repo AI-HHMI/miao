@@ -185,7 +185,7 @@ def read_n5_metadata(
         axes=_space_axes(names),
         axis_names=names,
         scales=scales,
-        zarr_version="n5",
+        format="n5",
         outer_scale=[1.0] * ndim,
         outer_translation=[0.0] * ndim,
     )
@@ -227,7 +227,7 @@ def read_precomputed_metadata(
         axes=_space_axes(names),
         axis_names=names,
         scales=scales,
-        zarr_version="precomputed",
+        format="precomputed",
         outer_scale=[1.0] * len(names),
         outer_translation=[0.0] * len(names),
     )

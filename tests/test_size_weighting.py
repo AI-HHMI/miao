@@ -29,7 +29,7 @@ def _volume(
         num_scales=num_scales,
         base_scale_factors=base_scale_factors,
     )
-    return {"name": name, "path": str(root), "image_key": "raw", "zarr_version": "zarr2"}
+    return {"name": name, "path": str(root), "image_key": "raw", "format": "zarr2"}
 
 
 def _config(volumes: list[dict], **kwargs) -> MiaoConfig:

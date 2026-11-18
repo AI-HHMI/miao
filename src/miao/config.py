@@ -115,7 +115,7 @@ def _fixed_indices(name: str, spec: Union[int, list[int], str]) -> list[int]:
 
 
 class VolumeConfig(BaseModel):
-    """Configuration for a single zarr volume."""
+    """Configuration for a single volume: OME-NGFF zarr, N5 or Neuroglancer precomputed."""
 
     # Reject unknown keys so typos and removed fields (e.g. the old aug_rot) fail loudly.
     model_config = ConfigDict(extra="forbid")
@@ -123,18 +123,14 @@ class VolumeConfig(BaseModel):
     name: str
     path: str
     image_key: str
+    # How the volume is stored. "precomputed" is Neuroglancer precomputed.
+    format: Literal["zarr2", "zarr3", "n5", "precomputed"]
     # Optional per-volume override of the global MiaoConfig.resolutions. Each inner list is the
     # desired output voxel size per spatial axis (physical units, same unit as the zarr's OME
     # coordinateTransformations scale), in output_axes spatial order — like patch_size.
     resolutions: Optional[list[list[float]]] = None
     # Optional per-volume override of the global MiaoConfig.resolution_sampling.
     resolution_sampling: Optional[ResolutionSampling] = None
-    zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
-    # Set for a store that is not OME-NGFF zarr: "n5", or "precomputed" (Neuroglancer). `path` +
-    # `image_key` (and `label_key`) then name an N5 multiscale group or a precomputed volume
-    # directory. miao.formats describes where their voxel sizes come from. When unset, the store
-    # is zarr, read as `zarr_version` says.
-    format: Optional[Literal["n5", "precomputed"]] = None
     # Divides the voxel sizes read from the zarr's OME coordinateTransformations. Applied to the image and label pyramids
     # alike, before any level selection or resampling. Leave at 1.0 for unexpanded data.
     exp_factor: float = 1.0
@@ -212,22 +208,16 @@ class VolumeConfig(BaseModel):
             raise ValueError(f"exp_factor must be positive, got {v}")
         return v
 
-    @property
-    def store_format(self) -> str:
-        """How the store is read: "zarr2" / "zarr3" (zarr_version), or `format` when set."""
-        return self.format or self.zarr_version
-
-    @model_validator(mode="after")
-    def validate_format(self) -> "VolumeConfig":
-        # `zarr_version` applies to zarr stores only. A dump of a config writes its default
-        # ("zarr2") for every volume, and a config must load from its own dump, so only a
-        # `zarr_version` other than the default is refused here.
-        if self.format is not None and self.zarr_version != "zarr2":
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_zarr_version(cls, data):
+        # `zarr_version` was replaced by `format`: name the new key in the error.
+        if isinstance(data, dict) and "zarr_version" in data:
             raise ValueError(
-                f"Volume {self.name!r}: zarr_version applies to zarr stores only, and this "
-                f"volume is format {self.format!r}"
+                f"Volume {data.get('name')!r}: `zarr_version` was replaced by `format`. "
+                f"Write `format: {data['zarr_version']}` instead."
             )
-        return self
+        return data
 
     @model_validator(mode="after")
     def validate_label_fill(self) -> "VolumeConfig":

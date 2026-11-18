@@ -2,7 +2,7 @@ volumes:
   - name: "H01 Human Cortex"
     path: "/groups/miaai/miaai/lmd-v0.0.1/h01-human-cortex.zarr"
     image_key: "raw"
-    zarr_version: "zarr3"
+    format: "zarr3"
     scales: [0, 1, 2]
     weight: 1.0
     label_key: "labels/c3_seg"

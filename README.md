@@ -19,13 +19,13 @@ volumes:
     path: /data/sample_A.zarr
     image_key: raw
     label_key: labels/seg      # optional
-    zarr_version: zarr2        # or zarr3
+    format: zarr2              # zarr2, zarr3, n5 or precomputed
     weight: 0.5                # optional
 
   - name: sample_b
     path: /data/sample_B.zarr
     image_key: predictions
-    zarr_version: zarr3
+    format: zarr3
     weight: 0.5
 
 resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]   # output voxel size per scale
@@ -110,7 +110,7 @@ which is what lets one `resolutions` list mix expanded and unexpanded volumes. `
 ### N5 and Neuroglancer precomputed stores
 
 A volume can also be an N5 multiscale group or a Neuroglancer precomputed volume. miao reads both
-through tensorstore, like zarr. Set `format` and leave out `zarr_version`:
+through tensorstore, like zarr. The volume's `format` says which one it is:
 
 ```yaml
 volumes:
@@ -252,7 +252,7 @@ volumes:
   - name: fish
     path: /data/timeseries.zarr
     image_key: raw
-    zarr_version: zarr3
+    format: zarr3
     fixed_axes: {t: 10}        # one frame
     # fixed_axes: {t: [25, 40]}  # a list of frames
     # fixed_axes: {t: "1:25"}    # a range, stop exclusive: frames 1..24
@@ -523,8 +523,7 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | `image_key` | — | Group key within the zarr for image data |
 | `label_key` | `None` | Optional group key for labels in the same zarr |
 | `label_fill` | `None` | Set this (e.g. `-1`) to sample patches larger than the label array: the image is read around the labels, and label voxels outside the label array take this value. The patch center always lies inside the label array, and `bounding_box` still confines the read.  When unset (default), every patch must fit inside the label array |
-| `zarr_version` | `"zarr2"` | `"zarr2"` or `"zarr3"` |
-| `format` | `None` | `"n5"` or `"precomputed"` for a store that is not OME-NGFF zarr — see [N5 and Neuroglancer precomputed stores](#n5-and-neuroglancer-precomputed-stores) |
+| `format` | — | How the volume is stored: `"zarr2"`, `"zarr3"`, `"n5"` or `"precomputed"`. Required. For the last two, see [N5 and Neuroglancer precomputed stores](#n5-and-neuroglancer-precomputed-stores) |
 | `weight` | `1.0` | Sampling weight; multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` |
 | `exp_factor` | `1.0` | Divides the zarr's metadata voxel size to give the effective one, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
 | `resolutions` / `resolution_sampling` | — | Per-volume override of the global setting; set at most one |

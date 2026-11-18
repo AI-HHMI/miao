@@ -165,7 +165,7 @@ class TestAugmentFnWithLabelTargets:
             volumes=[{
                 "name": "v",
                 "path": str(zarr2_volume),
-                "image_key": "raw",
+                "image_key": "raw", "format": "zarr2",
                 "label_key": "labels/seg",
             }],
             resolutions=[[1, 1, 1]],

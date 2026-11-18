@@ -103,7 +103,7 @@ def build_corpus(root: Path, n_volumes: int, side: int, matched_fraction: float,
                     {"type": "scale", "scale": [voxel] * 3}]}],
             }]}))
         entries.append({
-            "name": f"vol_{i:03d}", "path": str(path), "image_key": "raw",
+            "name": f"vol_{i:03d}", "path": str(path), "image_key": "raw", "format": "zarr2",
             "normalize": True,
         })
     return entries
