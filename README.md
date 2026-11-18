@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/miao-io.svg)](https://pypi.org/project/miao-io/)
 
-Scalable PyTorch data loaders for OME-NGFF zarr datasets, powered by TensorStore.
+Scalable PyTorch data loaders for OME-NGFF zarr, n5 and precomputed datasets, powered by TensorStore.
 
 ## Installation
 
