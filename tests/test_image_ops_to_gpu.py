@@ -287,7 +287,8 @@ def test_deferred_handles_a_squeezed_channel_axis(tmp_path: Path, img_axes, reso
     """
     path = _axes_volume(tmp_path / f"{img_axes}_{len(resolutions)}.zarr", img_axes)
     config = dict(
-        volumes=[{"name": "v", "path": str(path), "image_key": "raw", "label_key": "seg"}],
+        volumes=[{"name": "v", "path": str(path), "image_key": "raw", "format": "zarr2",
+                  "label_key": "seg"}],
         resolutions=resolutions, output_axes="lzyx", patch_size=[4, 4, 4], samples_per_epoch=2,
     )
     plain, deferred = _pair(config)

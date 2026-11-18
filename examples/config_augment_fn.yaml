@@ -13,6 +13,7 @@ volumes:
   - name: raw
     path: /data/sample.zarr
     image_key: raw
+    format: zarr2
 
 resolutions: [[8, 8, 8]]
 output_axes: lzyx

@@ -2,7 +2,7 @@ volumes:
   - name: "Jiefu zarr2"
     path: "/groups/miaai/miaai/benchmark/jiefu-cerebellum-fibsem-zarr2.zarr"
     image_key: "raw"
-    zarr_version: "zarr2"
+    format: "zarr2"
     scales: [0, 1, 2]
     label_key: "labels/agglom_seg"
     bounding_box: [[1132, 12109], [1457, 4773], [1197, 5561]]

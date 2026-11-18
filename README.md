@@ -19,13 +19,13 @@ volumes:
     path: /data/sample_A.zarr
     image_key: raw
     label_key: labels/seg      # optional
-    zarr_version: zarr2        # or zarr3
+    format: zarr2              # zarr2, zarr3, n5 or precomputed
     weight: 0.5                # optional
 
   - name: sample_b
     path: /data/sample_B.zarr
     image_key: predictions
-    zarr_version: zarr3
+    format: zarr3
     weight: 0.5
 
 resolutions: [[8, 8, 8], [16, 16, 16], [32, 32, 32]]   # output voxel size per scale
@@ -106,6 +106,51 @@ Set `exp_factor` only for stores whose OME metadata lacks the correction. A mult
 Level selection, read extents, `pixel_size` and `meta["resolutions"]` are all in effective units,
 which is what lets one `resolutions` list mix expanded and unexpanded volumes. `bounding_box` and
 `meta["coordinate"]` are level-0 voxel *indices*, so `exp_factor` does not affect them.
+
+### N5 and Neuroglancer precomputed stores
+
+A volume can also be an N5 multiscale group or a Neuroglancer precomputed volume. miao reads both
+through tensorstore, like zarr. The volume's `format` says which one it is:
+
+```yaml
+volumes:
+  - name: fafb
+    path: /data/fafb_v14.n5
+    image_key: volumes/raw           # the multiscale group that holds s0, s1, ...
+    format: n5
+  - name: optic_lobe
+    path: /data/optic-lobe           # the directory that holds both volumes
+    image_key: grayscale             # a precomputed volume: a directory with an `info` file
+    label_key: segmentation
+    format: precomputed
+```
+
+Everything else works as it does for zarr: level choice, `bounding_box`, labels and resampling.
+
+Neither format records voxel sizes the way OME-NGFF does. miao therefore reads them the way the
+tools that write these formats do. All sizes are in nm.
+
+**N5.** A level's voxel size is a base voxel size times the level's downsampling factors.
+
+- The base is the group's `pixelResolution` (written by n5-viewer and render) or `resolution`. If
+  the group has neither, miao uses the first level's.
+- The factors are the level's `downsamplingFactors`. If the level has none, miao uses the group's
+  `scales` entry for that level.
+- If a level has no factors, miao uses the level's own `resolution`.
+- If a level has both a `resolution` and factors, the two must agree. Otherwise miao raises an
+  error.
+- A `pixelResolution` given in micrometers is converted. Sizes without a unit are read as nm.
+- A pyramid may start at `s1`.
+- The dimensions are x, y, z in the order N5 lists them, unless the group names them in `axes`.
+- miao refuses a level with a non-zero `offset`.
+
+**Precomputed.** Each level's `resolution`, `size` and `voxel_offset` come from the volume's `info`
+file. The axes are x, y, z. miao drops the channel dimension when there is one channel. With
+several channels it is axis `c`.
+
+**Position of the levels.** miao assumes that both kinds of pyramid were built by block averaging.
+It therefore places level k at half the difference between its voxel size and level 0's, plus the
+level's offset. Most OME-NGFF pyramids record the same per-level translation.
 
 ### Random resolution sampling
 
@@ -207,7 +252,7 @@ volumes:
   - name: fish
     path: /data/timeseries.zarr
     image_key: raw
-    zarr_version: zarr3
+    format: zarr3
     fixed_axes: {t: 10}        # one frame
     # fixed_axes: {t: [25, 40]}  # a list of frames
     # fixed_axes: {t: "1:25"}    # a range, stop exclusive: frames 1..24
@@ -474,11 +519,11 @@ dimensions are picked up automatically when present. Unknown keys are rejected, 
 | Field | Default | Description |
 |---|---|---|
 | `name` | — | Unique name for the volume |
-| `path` | — | Path to the OME-NGFF zarr container |
+| `path` | — | Path to the OME-NGFF zarr container (an N5 container, or the directory holding precomputed volumes) |
 | `image_key` | — | Group key within the zarr for image data |
 | `label_key` | `None` | Optional group key for labels in the same zarr |
 | `label_fill` | `None` | Set this (e.g. `-1`) to sample patches larger than the label array: the image is read around the labels, and label voxels outside the label array take this value. The patch center always lies inside the label array, and `bounding_box` still confines the read.  When unset (default), every patch must fit inside the label array |
-| `zarr_version` | `"zarr2"` | `"zarr2"` or `"zarr3"` |
+| `format` | — | How the volume is stored: `"zarr2"`, `"zarr3"`, `"n5"` or `"precomputed"`. Required. For the last two, see [N5 and Neuroglancer precomputed stores](#n5-and-neuroglancer-precomputed-stores) |
 | `weight` | `1.0` | Sampling weight; multiplies the size term, so `p ∝ weight * size ** size_weighting_exponent` |
 | `exp_factor` | `1.0` | Divides the zarr's metadata voxel size to give the effective one, before level selection — see [Effective voxel sizes](#effective-voxel-sizes) |
 | `resolutions` / `resolution_sampling` | — | Per-volume override of the global setting; set at most one |

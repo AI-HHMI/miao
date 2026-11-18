@@ -115,7 +115,7 @@ def _fixed_indices(name: str, spec: Union[int, list[int], str]) -> list[int]:
 
 
 class VolumeConfig(BaseModel):
-    """Configuration for a single zarr volume."""
+    """Configuration for a single volume: OME-NGFF zarr, N5 or Neuroglancer precomputed."""
 
     # Reject unknown keys so typos and removed fields (e.g. the old aug_rot) fail loudly.
     model_config = ConfigDict(extra="forbid")
@@ -123,13 +123,14 @@ class VolumeConfig(BaseModel):
     name: str
     path: str
     image_key: str
+    # How the volume is stored. "precomputed" is Neuroglancer precomputed.
+    format: Literal["zarr2", "zarr3", "n5", "precomputed"]
     # Optional per-volume override of the global MiaoConfig.resolutions. Each inner list is the
     # desired output voxel size per spatial axis (physical units, same unit as the zarr's OME
     # coordinateTransformations scale), in output_axes spatial order — like patch_size.
     resolutions: Optional[list[list[float]]] = None
     # Optional per-volume override of the global MiaoConfig.resolution_sampling.
     resolution_sampling: Optional[ResolutionSampling] = None
-    zarr_version: Literal["zarr2", "zarr3"] = "zarr2"
     # Divides the voxel sizes read from the zarr's OME coordinateTransformations. Applied to the image and label pyramids
     # alike, before any level selection or resampling. Leave at 1.0 for unexpanded data.
     exp_factor: float = 1.0
@@ -206,6 +207,17 @@ class VolumeConfig(BaseModel):
         if v <= 0:
             raise ValueError(f"exp_factor must be positive, got {v}")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_zarr_version(cls, data):
+        # `zarr_version` was replaced by `format`: name the new key in the error.
+        if isinstance(data, dict) and "zarr_version" in data:
+            raise ValueError(
+                f"Volume {data.get('name')!r}: `zarr_version` was replaced by `format`. "
+                f"Write `format: {data['zarr_version']}` instead."
+            )
+        return data
 
     @model_validator(mode="after")
     def validate_label_fill(self) -> "VolumeConfig":

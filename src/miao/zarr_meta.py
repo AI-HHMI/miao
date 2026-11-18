@@ -12,6 +12,8 @@ import numpy as np
 import tensorstore as ts
 
 ZarrVersion = Literal["zarr2", "zarr3"]
+# Every store miao reads: OME-NGFF zarr, or N5 / Neuroglancer precomputed (see miao.formats).
+StoreFormat = Literal["zarr2", "zarr3", "n5", "precomputed"]
 
 
 @dataclass
@@ -41,7 +43,7 @@ class OmeMetadata:
     axes: list[dict]  # [{"name": "z", "type": "space", "unit": "micrometer"}, ...]
     axis_names: list[str]
     scales: dict[int, ScaleMetadata]  # level index -> metadata
-    zarr_version: ZarrVersion
+    format: StoreFormat  # how the store is saved on disk
     outer_scale: list[float]  # multiscale-level coordinateTransformations scale; identity if absent
     # multiscale-level coordinateTransformations translation; zeros if absent
     outer_translation: list[float] = field(default_factory=list)
@@ -232,7 +234,7 @@ def read_ome_metadata(
         axes=axes,
         axis_names=axis_names,
         scales=scales,
-        zarr_version=zarr_version,
+        format=zarr_version,
         outer_scale=outer_scale,
         outer_translation=outer_translation,
     )
@@ -301,7 +303,7 @@ def fix_axes(meta: OmeMetadata, fixed: dict[str, int], where: str = "") -> OmeMe
         axes=_keep(meta.axes),
         axis_names=_keep(meta.axis_names),
         scales=scales,
-        zarr_version=meta.zarr_version,
+        format=meta.format,
         outer_scale=_keep(meta.outer_scale),
         outer_translation=_keep(meta.outer_translation),
     )

@@ -22,7 +22,7 @@ class TestReadOmeMetadata:
     def test_read_image_metadata(self, zarr2_volume: Path):
         meta = read_ome_metadata(zarr2_volume, "raw", "zarr2")
         assert meta.axis_names == ["z", "y", "x"]
-        assert meta.zarr_version == "zarr2"
+        assert meta.format == "zarr2"
         assert len(meta.scales) == 3
 
         # Scale 0: full resolution

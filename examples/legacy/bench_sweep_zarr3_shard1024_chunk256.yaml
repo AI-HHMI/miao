@@ -2,7 +2,7 @@ volumes:
   - name: "zarr3-shard1024-chunk256"
     path: "/groups/miaai/miaai/benchmark/sweep/zarr3-shard1024-chunk256.zarr"
     image_key: "raw"
-    zarr_version: "zarr3"
+    format: "zarr3"
     scales: [0, 1, 2]
     weight: 1.0
     normalize: true

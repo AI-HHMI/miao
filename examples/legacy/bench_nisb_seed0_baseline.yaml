@@ -2,7 +2,7 @@ volumes:
   - name: "NISB Base Train Seed 0"
     path: "/groups/troidl/troidllab/nisb/base/train/seed0/data.zarr"
     image_key: "img"
-    zarr_version: "zarr2"
+    format: "zarr2"
     scales: [0, 1, 2]
     label_key: "labels/seg"
     weight: 1.0

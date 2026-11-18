@@ -7,7 +7,7 @@ from miao.config import AugmentFnConfig, MiaoConfig, ResolutionSampling, VolumeC
 
 
 def _vol(name="a", **kw):
-    return {"name": name, "path": "/data/test.zarr", "image_key": "raw", **kw}
+    return {"name": name, "path": "/data/test.zarr", "image_key": "raw", "format": "zarr2", **kw}
 
 
 SAMPLING = {
@@ -67,6 +67,7 @@ class TestVolumeConfig:
             name="raw",
             path="/data/test.zarr",
             image_key="raw",
+            format="zarr2",
         )
         assert v.weight == 1.0
         assert v.label_key is None
@@ -78,6 +79,7 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 weight=-1.0,
             )
 
@@ -88,6 +90,7 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 exp_factor=bad,
             )
 
@@ -97,6 +100,7 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 normalize_min=0.0,
             )
         with pytest.raises(ValueError, match="both be set or both omitted"):
@@ -104,6 +108,7 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 normalize_max=1.0,
             )
 
@@ -113,6 +118,7 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 normalize_min=1.0,
                 normalize_max=1.0,
             )
@@ -123,12 +129,14 @@ class TestVolumeConfig:
                 name="raw",
                 path="/data/test.zarr",
                 image_key="raw",
+                format="zarr2",
                 normalize_clip=False,
             )
         windowed = VolumeConfig(
             name="raw",
             path="/data/test.zarr",
             image_key="raw",
+            format="zarr2",
             normalize_min=0.0,
             normalize_max=1.0,
             normalize_clip=False,
@@ -348,7 +356,9 @@ class TestSaveConfig:
         assert loaded_cfg == cfg
 
     def test_volume_config_to_yaml(self):
-        v = VolumeConfig(name="vol1", path="/data/v1.zarr", image_key="raw", weight=2.0)
+        v = VolumeConfig(
+            name="vol1", path="/data/v1.zarr", image_key="raw", format="zarr2", weight=2.0
+        )
         yaml_str = v.to_yaml()
         loaded = VolumeConfig(**yaml.safe_load(yaml_str))
         assert loaded == v
